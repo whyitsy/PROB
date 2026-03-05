@@ -113,7 +113,7 @@ def get_args_parser():
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--viz', action='store_true')
     parser.add_argument('--eval_every', default=5, type=int)
-    parser.add_argument('--num_workers', default=3, type=int)
+    parser.add_argument('--num_workers', default=16, type=int)
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
     
     ################ OW-DETR ################
@@ -132,7 +132,7 @@ def get_args_parser():
     parser.add_argument('--num_classes', default=81, type=int)
     parser.add_argument('--nc_epoch', default=0, type=int)
     parser.add_argument('--dataset', default='OWDETR', help='defines which dataset is used. Built for: {TOWOD, OWDETR, VOC2007}')
-    parser.add_argument('--data_root', default='./data/OWOD', type=str)
+    parser.add_argument('--data_root', default='/mnt/data/kky/datasets/owdetr/data/OWOD', type=str)
     parser.add_argument('--unk_conf_w', default=1.0, type=float)
 
     ################ PROB OWOD ################
@@ -157,14 +157,16 @@ def get_args_parser():
     parser.add_argument('--exemplar_replay_prev_file', default='', type=str, help="path to previous ft file")
     parser.add_argument('--exemplar_replay_cur_file', default='', type=str, help="path to current ft file")
     parser.add_argument('--exemplar_replay_random', default=False, action='store_true', help='make selection random')
+    
+    # 
     return parser
 
 def main(args):
     if len(args.wandb_project)>0:
         if len(args.wandb_name)>0:
-            wandb.init(project=args.wandb_project, entity="marvl", group=args.wandb_name)
+            wandb.init(mode="offline", project=args.wandb_project, entity="kakoyo-chengdu-university-of-technology", group=args.wandb_name)
         else:
-            wandb.init(project=args.wandb_project, entity="marvl")
+            wandb.init(mode="offline", project=args.wandb_project, entity="kakoyo-chengdu-university-of-technology")
         wandb.config = args
     #else:
     #    wandb=None
@@ -188,7 +190,7 @@ def main(args):
     model.to(device)
 
     model_without_ddp = model
-    print(model_without_ddp)
+    print("model_without_ddp:", model_without_ddp)
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
@@ -267,7 +269,7 @@ def main(args):
 
     if args.pretrain:
         print('Initialized from the pre-training model')
-        checkpoint = torch.load(args.pretrain, map_location='cpu')
+        checkpoint = torch.load(args.pretrain, map_location='cpu', weights_only=False)
         state_dict = checkpoint['model']
         msg = model_without_ddp.load_state_dict(state_dict, strict=False)
         print(msg)
@@ -282,13 +284,15 @@ def main(args):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
-        if len(missing_keys) > 0:
-            print('Missing Keys: {}'.format(missing_keys))
-        if len(unexpected_keys) > 0:
-            print('Unexpected Keys: {}'.format(unexpected_keys))
+        # 只在主进程打印
+        if utils.is_main_process():
+            if len(missing_keys) > 0:
+                print('Missing Keys: {}'.format(missing_keys))
+            if len(unexpected_keys) > 0:
+                print('Unexpected Keys: {}'.format(unexpected_keys))
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             import copy
             p_groups = copy.deepcopy(optimizer.param_groups)
@@ -296,12 +300,16 @@ def main(args):
             for pg, pg_old in zip(optimizer.param_groups, p_groups):
                 pg['lr'] = pg_old['lr']
                 pg['initial_lr'] = pg_old['initial_lr']
-            print(optimizer.param_groups)
+            # 只在主进程打印优化器信息
+            # if utils.is_main_process():
+            #     print(optimizer.param_groups)   # 或者只打印关键字段
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             # todo: this is a hack for doing experiment that resume from checkpoint and also modify lr scheduler (e.g., decrease lr in advance).
             args.override_resumed_lr_drop = True
             if args.override_resumed_lr_drop:
-                print('Warning: (hack) args.override_resumed_lr_drop is set to True, so args.lr_drop would override lr_drop in resumed lr_scheduler.')
+                 # 警告也只在主进程打印
+                if utils.is_main_process():
+                    print('Warning: (hack) args.override_resumed_lr_drop is set to True, so args.lr_drop would override lr_drop in resumed lr_scheduler.')
                 lr_scheduler.step_size = args.lr_drop
                 lr_scheduler.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
             lr_scheduler.step(lr_scheduler.last_epoch)

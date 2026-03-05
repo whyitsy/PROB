@@ -3,12 +3,17 @@
 echo running training of prob-detr, M-OWODB dataset
 
 set -x
+set -e
 
-EXP_DIR=exps/MOWODB/PROB
+EXP_DIR=/mnt/data/kky/output/PROB/exps/MOWODB/PROB
 PY_ARGS=${@:1}
 WANDB_NAME=PROB_V1
 
+export WANDB_MODE=offline
+export WANDB_DIR=$EXP_DIR
+
 python -u main_open_world.py \
+    --resume "${EXP_DIR}/t1/checkpoint.pth" \
     --output_dir "${EXP_DIR}/t1" --dataset TOWOD --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 20\
     --train_set 'owod_t1_train' --test_set 'owod_all_task_test' --epochs 41\
     --model_type 'prob' --obj_loss_coef 8e-4 --obj_temp 1.3\

@@ -66,7 +66,7 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
 class ProbObjectnessHead(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
-        self.flatten = nn.Flatten(0,1)
+        self.flatten = nn.Flatten(0,1)  # 将输入张量展平，从第0维到第1维-[bs, num_queries, hidden_dim] -> [bs*num_queries, hidden_dim]
         self.objectness_bn = nn.BatchNorm1d(hidden_dim, affine=False)
 
     def freeze_prob_model(self):
@@ -79,6 +79,7 @@ class ProbObjectnessHead(nn.Module):
     
     
 class FullProbObjectnessHead(nn.Module):
+    """没有使用这个Head, 而是使用简单的L2距离替换马氏距离的计算, 发现计算量降低速度增加, 性能差不多, 更稳定. """
     def __init__(self, hidden_dim=256, device='cpu'):
         super().__init__()
         self.flatten = nn.Flatten(0, 1)
