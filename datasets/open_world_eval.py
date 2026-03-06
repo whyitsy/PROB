@@ -9,7 +9,9 @@ import torch
 import logging
 from util.misc import all_gather
 from collections import OrderedDict, defaultdict
+from tabulate import tabulate
 
+logger = logging.getLogger(__name__)   # 模块级 logger
 
 class OWEvaluator:
     def __init__(self, voc_gt, iou_types, args=None, use_07_metric=True, ovthresh=list(range(50, 100, 5))):
@@ -36,6 +38,7 @@ class OWEvaluator:
         self.img_ids = []
         self.lines = []
         self.lines_cls = []
+        self.pred_counts = []
         if args is not None:
             self.prev_intro_cls = args.PREV_INTRODUCED_CLS
             self.curr_intro_cls = args.CUR_INTRODUCED_CLS
@@ -43,11 +46,14 @@ class OWEvaluator:
             self.unknown_class_index = self.total_num_class - 1
             self.num_seen_classes = self.prev_intro_cls + self.curr_intro_cls
             self.known_classes = self._class_names[:self.num_seen_classes]
-            print("testing data details")
-            print(self.total_num_class)
-            print(self.unknown_class_index)
-            print(self.known_classes)
-            print(self.voc_gt.CLASS_NAMES)
+            # print("testing data details")
+            # print(self.total_num_class)
+            # print(self.unknown_class_index)
+            # print(self.known_classes)
+            # print(self.voc_gt.CLASS_NAMES)
+            logger.info("Testing data details")
+            logger.info("total classes, unknown index, known classes, all classes")
+            logger.info(self.total_num_class, self.unknown_class_index, self.known_classes, self.voc_gt.CLASS_NAMES)
 
 
     def update(self, predictions):
@@ -128,7 +134,8 @@ class OWEvaluator:
             lines_by_class = [l + '\n' for l, c in zip(self.lines, self.lines_cls.tolist()) if c == class_label_ind]
             if len(lines_by_class) == 0:
                 lines_by_class = []
-            print(class_label + " has " + str(len(lines_by_class)) + " predictions.")
+            # print(class_label + " has " + str(len(lines_by_class)) + " predictions.")
+            self.pred_counts.append(len(lines_by_class))
             ovthresh = 50
             ovthresh_ind, _ = map(self.ovthresh.index, [50, 75])
            
@@ -154,21 +161,92 @@ class OWEvaluator:
         o50, _ = map(self.ovthresh.index, [50, 75])
         mAP = float(self.AP.mean())
         mAP50 = float(self.AP[:, o50].mean())
-        print('detection mAP50:', fmt.format(mAP50))
-        print('detection mAP:', fmt.format(mAP))
-        print('---AP50---')
+        # print('detection mAP50:', fmt.format(mAP50))
+        # print('detection mAP:', fmt.format(mAP))
+        # print('---AP50---')
         wi = self.compute_WI_at_many_recall_level(self.all_recs, self.tp_plus_fp_cs, self.fp_os)
-        print('Wilderness Impact: ' + str(wi))
+        # print('Wilderness Impact: ' + str(wi))
         avg_precision_unk = self.compute_avg_precision_at_many_recall_level_for_unk(self.all_precs, self.all_recs)
-        print('avg_precision: ' + str(avg_precision_unk))
-        total_num_unk_det_as_known = {iou: np.sum(x) for iou, x in self.unk_det_as_knowns.items()} #torch.sum(self.unk_det_as_knowns[:, o50]) #[np.sum(x) for x in self.unk_det_as_knowns[:, o50]]
+        # print('avg_precision: ' + str(avg_precision_unk))
+        # total_num_unk_det_as_known = {iou: np.sum(x) for iou, x in self.unk_det_as_knowns.items()} #torch.sum(self.unk_det_as_knowns[:, o50]) #[np.sum(x) for x in self.unk_det_as_knowns[:, o50]]
         total_num_unk = self.num_unks[50][0]
-        print('Absolute OSE (total_num_unk_det_as_known): ' + str(total_num_unk_det_as_known))
-        print('total_num_unk ' + str(total_num_unk))
-        print("AP50: " + str(['%.1f' % x for x in self.AP[:, o50]]))
-        print("Precisions50: " + str(['%.1f' % x for x in self.precs[50]]))
-        print("Recall50: " + str(['%.1f' % x for x in self.recs[50]]))
-
+        total_ose = {iou: np.sum(x) for iou, x in self.unk_det_as_knowns.items()}
+        # print('Absolute OSE (total_num_unk_det_as_known): ' + str(total_num_unk_det_as_known))
+        # print('total_num_unk ' + str(total_num_unk))
+        # print("AP50: " + str(['%.1f' % x for x in self.AP[:, o50]]))
+        # print("Precisions50: " + str(['%.1f' % x for x in self.precs[50]]))
+        # print("Recall50: " + str(['%.1f' % x for x in self.recs[50]]))
+        logger.info("========== Evaluation Results ==========")
+        logger.info(f"mAP50: {fmt.format(mAP50)}")
+        logger.info(f"mAP: {fmt.format(mAP)}")
+        logger.info(f"Total unknown objects: {total_num_unk}")
+        for iou, ose in total_ose.items():
+            logger.info(f"Absolute OSE (IoU={iou}): {ose}")
+            
+        # WI 表格
+        recalls = sorted(wi.keys())
+        ious = sorted(wi[recalls[0]].keys())
+        wi_table = [[r] + [wi[r][iou] for iou in ious] for r in recalls]
+        logger.info("\nWilderness Impact (WI):\n" + tabulate(
+            wi_table, headers=["Recall"] + [f"IoU{i}" for i in ious], floatfmt=".4f"))
+        
+        # 未知平均精度表格
+        avg_prec_table = [[r] + [avg_precision_unk[r][iou] for iou in ious] for r in recalls]
+        logger.info("\nUnknown Average Precision:\n" + tabulate(
+            avg_prec_table, headers=["Recall"] + [f"IoU{i}" for i in ious], floatfmt=".4f"))
+        
+        # 类别级指标表格
+        class_names = self.voc_gt.CLASS_NAMES
+        ap50_vals = self.AP[:, o50].cpu().tolist()
+        prec50_vals = self.precs[50]
+        recall50_vals = self.recs[50]
+        class_table = []
+        for i, name in enumerate(class_names):
+            class_table.append([
+                name,
+                f"{ap50_vals[i]:.2f}",
+                f"{prec50_vals[i]:.2f}",
+                f"{recall50_vals[i]:.2f}"
+            ])
+        logger.info("\nPer-class metrics (IoU=50):\n" + tabulate(
+            class_table, headers=["Class", "AP50", "Precision50", "Recall50"], tablefmt="grid"))
+        
+        # 分组统计表格
+        groups = []
+        if self.prev_intro_cls > 0:
+            groups.append({
+                "Group": "Prev",
+                "AP50": np.mean(ap50_vals[:self.prev_intro_cls]),
+                "Prec50": np.mean(prec50_vals[:self.prev_intro_cls]),
+                "Recall50": np.mean(recall50_vals[:self.prev_intro_cls])
+            })
+        groups.append({
+            "Group": "Current",
+            "AP50": np.mean(ap50_vals[self.prev_intro_cls:self.prev_intro_cls+self.curr_intro_cls]),
+            "Prec50": np.mean(prec50_vals[self.prev_intro_cls:self.prev_intro_cls+self.curr_intro_cls]),
+            "Recall50": np.mean(recall50_vals[self.prev_intro_cls:self.prev_intro_cls+self.curr_intro_cls])
+        })    
+        groups.append({
+            "Group": "Known",
+            "AP50": np.mean(ap50_vals[:self.prev_intro_cls+self.curr_intro_cls]),
+            "Prec50": np.mean(prec50_vals[:self.prev_intro_cls+self.curr_intro_cls]),
+            "Recall50": np.mean(recall50_vals[:self.prev_intro_cls+self.curr_intro_cls])
+        })    
+        groups.append({
+            "Group": "Unknown",
+            "AP50": ap50_vals[-1],
+            "Prec50": prec50_vals[-1],
+            "Recall50": recall50_vals[-1]
+        })    
+        group_table = [[g["Group"], f"{g['AP50']:.2f}", f"{g['Prec50']:.2f}", f"{g['Recall50']:.2f}"] for g in groups]
+        logger.info("\nGroup-wise metrics (IoU=50):\n" + tabulate(
+            group_table, headers=["Group", "AP50", "Precision50", "Recall50"], tablefmt="grid"))
+        
+        if hasattr(self, 'pred_counts') and len(self.pred_counts) == len(class_names):
+            count_table = [[class_names[i], self.pred_counts[i]] for i in range(len(class_names))]
+            logger.info("\nDetection counts per class:\n" + tabulate(count_table, headers=["Class", "Predictions"]))
+        
+        '''
         if self.prev_intro_cls > 0:
             print("Prev class AP50: " + str(self.AP[:, o50][:self.prev_intro_cls].mean()))
             print("Prev class Precisions50: " + str(np.mean(self.precs[50][:self.prev_intro_cls])))
@@ -191,10 +269,11 @@ class OWEvaluator:
         self.coco_eval['bbox'].stats = torch.cat(
             [self.AP[:, o50].mean(dim=0, keepdim=True),
              self.AP.flatten().mean(dim=0, keepdim=True), self.AP.flatten()])
+        '''
         
         Res  = {
             "WI":wi[0.8][50],
-            "AOSA": total_num_unk_det_as_known[50],
+            "AOSA": total_ose[50],
             
             "CK_AP50": float(self.AP[:, o50][self.prev_intro_cls:self.prev_intro_cls + self.curr_intro_cls].mean().detach().cpu()),
             "CK_P50": np.mean(self.precs[50][self.prev_intro_cls:self.prev_intro_cls + self.curr_intro_cls]),
@@ -214,6 +293,7 @@ class OWEvaluator:
             Res["PK_R50"]=np.mean(self.recs[50][:self.prev_intro_cls])
         
         return Res
+    
 
 
 def voc_ap(rec, prec, use_07_metric=False):

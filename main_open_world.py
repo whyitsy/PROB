@@ -29,7 +29,8 @@ from datasets.torchvision_datasets.open_world import OWDetection
 from engine import evaluate, train_one_epoch, get_exemplar_replay
 from models import build_model
 import wandb
-
+import logging
+from util.log import setup_logging
 
 
 def get_args_parser():
@@ -49,8 +50,8 @@ def get_args_parser():
                         help='gradient clipping max norm')
     parser.add_argument('--sgd', action='store_true')
     # Variants of Deformable DETR
-    parser.add_argument('--with_box_refine', default=False, action='store_true')
-    parser.add_argument('--two_stage', default=False, action='store_true')
+    parser.add_argument('--with_box_refine', default=True, action='store_true') # 默认未开启
+    parser.add_argument('--two_stage', default=True, action='store_true') # 默认没有开启
     parser.add_argument('--masks', default=False, action='store_true', help="Train segmentation head if the flag is provided")
     parser.add_argument('--backbone', default='dino_resnet50', type=str, help="Name of the convolutional backbone to use")
 
@@ -172,11 +173,14 @@ def main(args):
     #    wandb=None
 
     utils.init_distributed_mode(args)
-    print("git:\n  {}\n".format(utils.get_sha()))
+    # print("git:\n  {}\n".format(utils.get_sha()))
+    setup_logging(output=args.output_dir, distributed_rank=utils.get_rank())
+    logging.info("git:\n  {}\n".format(utils.get_sha()))
 
     if args.frozen_weights is not None:
         assert args.masks, "Frozen training is meant for segmentation only"
-    print(args)
+    # print(args)
+    logging.info("args:\n  {}\n".format(args))
 
     device = torch.device(args.device)
 
@@ -190,9 +194,9 @@ def main(args):
     model.to(device)
 
     model_without_ddp = model
-    print("model_without_ddp:", model_without_ddp)
+    logging.info("model_without_ddp: {}".format(model_without_ddp))
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('number of params:', n_parameters)
+    logging.info('number of params: {}'.format(n_parameters))
 
     dataset_train, dataset_val = get_datasets(args)
     
@@ -268,11 +272,12 @@ def main(args):
     output_dir = Path(args.output_dir)
 
     if args.pretrain:
-        print('Initialized from the pre-training model')
-        checkpoint = torch.load(args.pretrain, map_location='cpu', weights_only=False)
+        # print('Initialized from the pre-training model')
+        logging.info('Initialized from the pre-training model')
+        checkpoint = torch.load(args.pretrain, map_location='cpu', weights_only=False) # 需要使用自定义的epoch对象, 需要关闭安全模式。不然加载不了epoch信息。
         state_dict = checkpoint['model']
         msg = model_without_ddp.load_state_dict(state_dict, strict=False)
-        print(msg)
+        logging.info("InCompatible keys: {}".format(msg))
         args.start_epoch = checkpoint['epoch'] + 1
         if args.eval:
             test_stats, coco_evaluator = evaluate(model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args)
@@ -284,15 +289,15 @@ def main(args):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False) # resume需要加载自定义的对象, 需要关闭安全模式。不然加载不了lr、optimizer等信息。
         missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
         # 只在主进程打印
-        if utils.is_main_process():
+        if utils.is_main_process(): 
             if len(missing_keys) > 0:
-                print('Missing Keys: {}'.format(missing_keys))
+                logging.info('Missing Keys: {}'.format(missing_keys))
             if len(unexpected_keys) > 0:
-                print('Unexpected Keys: {}'.format(unexpected_keys))
+                logging.info('Unexpected Keys: {}'.format(unexpected_keys))
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             import copy
             p_groups = copy.deepcopy(optimizer.param_groups)
@@ -302,14 +307,14 @@ def main(args):
                 pg['initial_lr'] = pg_old['initial_lr']
             # 只在主进程打印优化器信息
             # if utils.is_main_process():
-            #     print(optimizer.param_groups)   # 或者只打印关键字段
+            #     logging.info('Optimizer param groups: {}'.format(optimizer.param_groups))
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             # todo: this is a hack for doing experiment that resume from checkpoint and also modify lr scheduler (e.g., decrease lr in advance).
             args.override_resumed_lr_drop = True
             if args.override_resumed_lr_drop:
                  # 警告也只在主进程打印
                 if utils.is_main_process():
-                    print('Warning: (hack) args.override_resumed_lr_drop is set to True, so args.lr_drop would override lr_drop in resumed lr_scheduler.')
+                    logging.info('Warning: (hack) args.override_resumed_lr_drop is set to True, so args.lr_drop would override lr_drop in resumed lr_scheduler.')
                 lr_scheduler.step_size = args.lr_drop
                 lr_scheduler.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
             lr_scheduler.step(lr_scheduler.last_epoch)
@@ -334,7 +339,7 @@ def main(args):
             
         obj_bn_mean_before=model_without_ddp.prob_obj_head[0].objectness_bn.running_mean
     
-    print(f'Start training from epoch {args.start_epoch} to {args.epochs}')
+    logging.info(f'Start training from epoch {args.start_epoch} to {args.epochs}')
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -396,27 +401,32 @@ def main(args):
             
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    # print('Training time {}'.format(total_time_str))
+    logging.info('Training time {}'.format(total_time_str))
     return
 
 def get_datasets(args):
-    print(args.dataset)
-
+    # print(args.dataset)
+    logging.info(f"Dataset: {args.dataset}")
+    
     train_set = args.train_set
     test_set = args.test_set
     dataset_train = OWDetection(args, args.data_root, image_set=args.train_set, transforms=make_coco_transforms(args.train_set), dataset = args.dataset)
     dataset_val = OWDetection(args, args.data_root, image_set=args.test_set, dataset = args.dataset, transforms=make_coco_transforms(args.test_set))
 
-    print(args.train_set)
-    print(args.test_set)
-    print(dataset_train)
-    print(dataset_val)
+    # print(args.train_set)
+    # print(args.test_set)
+    # print(dataset_train)
+    # print(dataset_val)
+    logging.info(f"Train dataset: {dataset_train}, Test dataset: {dataset_val}")
+    logging.info(f"dataset_train: {dataset_train}")
+    logging.info(f"dataset_val: {dataset_val}")
 
     return dataset_train, dataset_val
 
 
 def create_ft_dataset(args, image_sorted_scores):
-    print(f'found a total of {len(image_sorted_scores.keys())} images')
+    logging.info(f'found a total of {len(image_sorted_scores.keys())} images')
     tmp_dir=args.data_root +'/ImageSets/'+args.dataset+"/"+args.exemplar_replay_dir+"/"
     #tmp_dir=args.data_root +'/ImageSets/'+args.exemplar_replay_dir+"/"
 
@@ -441,9 +451,9 @@ def create_ft_dataset(args, image_sorted_scores):
             min_val = tmp[args.num_inst_per_class//2]
         else:
             if args.exemplar_replay_random:
-                print('using random exemplar selection')
+                logging.info('using random exemplar selection')
             else:
-                print(f'only found {len(tmp)} imgs in class {i}')
+                logging.info(f'only found {len(tmp)} imgs in class {i}')
             max_val = tmp.min()
             min_val = tmp.max()
             
@@ -457,7 +467,7 @@ def create_ft_dataset(args, image_sorted_scores):
                 save_imgs.append(k)
                 imgs_per_class[label].append(k)
                         
-    print(f'found {len(np.unique(save_imgs))} images in run')
+    logging.info(f'found {len(np.unique(save_imgs))} images in run')
     if len(args.exemplar_replay_prev_file)>0:
         previous_ft = open(tmp_dir+args.exemplar_replay_prev_file,'r').read().splitlines()
         save_imgs+=previous_ft

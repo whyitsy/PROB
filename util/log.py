@@ -1,10 +1,29 @@
 import logging
 import sys
 import os
+from termcolor import colored
 
+class _ColorfulFormatter(logging.Formatter):
+    def __init__(self, *args, **kwargs):
+        self._root_name = kwargs.pop("root_name", "") + "."
+        self._abbrev_name = kwargs.pop("abbrev_name", "")
+        if len(self._abbrev_name):
+            self._abbrev_name = self._abbrev_name + "."
+        super(_ColorfulFormatter, self).__init__(*args, **kwargs)
 
-
-def setup_logging(output=None, distributed_rank=0):
+    def formatMessage(self, record):
+        record.name = record.name.replace(self._root_name, self._abbrev_name)
+        log = super(_ColorfulFormatter, self).formatMessage(record)
+        if record.levelno == logging.WARNING:
+            prefix = colored("WARNING", "red", attrs=["blink"])
+        elif record.levelno == logging.ERROR or record.levelno == logging.CRITICAL:
+            prefix = colored("ERROR", "red", attrs=["blink", "underline"])
+        else:
+            return log
+        return prefix + " " + log
+    
+    
+def setup_logging(output=None, distributed_rank=0, abbrev_name="PROB"):
     """初始化时传入distributed_rank, 只在rank 0 输出 INFO 及以上日志，其他 rank 输出 ERROR 及以上日志；所有 rank 都记录 DEBUG 及以上日志到文件"""
     # file logging: all workers
     if output is not None:
@@ -15,7 +34,7 @@ def setup_logging(output=None, distributed_rank=0):
         if distributed_rank > 0:
             filename = filename + ".rank{}".format(distributed_rank)
         os.makedirs(os.path.dirname(filename), exist_ok=True)
-
+        
     # 配置根日志器
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
@@ -30,9 +49,13 @@ def setup_logging(output=None, distributed_rank=0):
     # 控制台处理器：仅 rank 0 输出 INFO 及以上，其他输出 WARNING 及以上
     console = logging.StreamHandler(sys.stdout)
     if distributed_rank == 0:
+        formatter = _ColorfulFormatter(
+                colored("[%(asctime)s %(name)s]: ", "green") + "%(message)s",
+                abbrev_name=str(abbrev_name),
+            )
+        console.setFormatter(formatter)
         console.setLevel(logging.INFO)
     else:
         console.setLevel(logging.ERROR)
-    console_formatter = logging.Formatter('[%(asctime)s] - %(levelname)s - %(message)s')  # 可简化
-    console.setFormatter(console_formatter)
     logger.addHandler(console)
+

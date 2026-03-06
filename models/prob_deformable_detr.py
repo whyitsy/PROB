@@ -499,6 +499,9 @@ class SetCriterion(nn.Module):
                 if loss == 'labels':
                     # Logging is enabled only for the last layer
                     kwargs['log'] = False
+                if loss == 'obj_likelihood':
+                    # Objectness loss is only applied to the decoder outputs, not the encoder outputs.
+                    continue
                 l_dict = self.get_loss(loss, enc_outputs, bin_targets, indices, num_boxes, **kwargs)
                 l_dict = {k + f'_enc': v for k, v in l_dict.items()}
                 losses.update(l_dict)
