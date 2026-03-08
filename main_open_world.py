@@ -145,7 +145,7 @@ def get_args_parser():
     parser.add_argument('--wandb_project', default='PROB_OWOD', type=str)
     
     # model hyperparameters
-    parser.add_argument('--obj_loss_coef', default=1, type=float)
+    parser.add_argument('--obj_loss_coef', default=100, type=float)
     parser.add_argument('--obj_temp', default=1, type=float)
     parser.add_argument('--freeze_prob_model', default=False, action='store_true', help='freeze model probabistic estimation')
 
@@ -159,7 +159,13 @@ def get_args_parser():
     parser.add_argument('--exemplar_replay_cur_file', default='', type=str, help="path to current ft file")
     parser.add_argument('--exemplar_replay_random', default=False, action='store_true', help='make selection random')
     
-    # 
+    # 伪样本挖掘
+    parser.add_argument('--enable_unk_label_obj', default=False, action='store_true', help='使用基于物体性分数的自适应伪标签筛选')
+    parser.add_argument('--unk_label_obj_score_thresh', default=0.8, type=float, help='自适应筛选阈值, 基于匹配上的query的obj的平均值乘以该系数')
+    parser.add_argument('--unk_label_start_epoch', default=2, type=int, help='从哪个epoch开始使用基于物体性分数的自适应伪标签筛选')
+    parser.add_argument('--obj_loss_dummy_pos_cofe', default=4e-4, type=float, help='伪正样本损失权重系数')
+    parser.add_argument('--obj_loss_dummy_neg_cofe', default=4e-4, type=float, help='伪负样本损失权重系数')
+    
     return parser
 
 def main(args):

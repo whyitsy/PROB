@@ -11,8 +11,10 @@ Deformable DETR model and criterion classes.
 """
 import torch
 import torch.nn.functional as F
+from torchvision.ops import sigmoid_focal_loss as sigmoid_focal_loss_torch
 from torch import nn
 import math
+import logging
 
 from util import box_ops
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
@@ -27,6 +29,8 @@ from .segmentation import sigmoid_focal_loss as seg_sigmoid_focal_loss
 from .deformable_transformer import build_deforamble_transformer
 import copy
 
+# import pydevd_pycharm
+# pydevd_pycharm.settrace('localhost', port=43215, stdout_to_server=True, stderr_to_server=True)
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
@@ -75,8 +79,8 @@ class ProbObjectnessHead(nn.Module):
     def forward(self, x):
         out=self.flatten(x)
         out=self.objectness_bn(out).unflatten(0, x.shape[:2])
-        return out.norm(dim=-1)**2
-    
+        return out.norm(dim=-1)**2 / x.shape[-1]  # 计算每个query的特征向量的L2范数平方，并归一化 ### 重要的归一化
+     
     
 class FullProbObjectnessHead(nn.Module):
     """没有使用这个Head, 而是使用简单的L2距离替换马氏距离的计算, 发现计算量降低速度增加, 性能差不多, 更稳定. """
@@ -250,7 +254,6 @@ class DeformableDETR(nn.Module):
         outputs_classes = []
         outputs_coords = []
         outputs_objectnesses = []
-
         for lvl in range(hs.shape[0]):
             if lvl == 0:
                 reference = init_reference
@@ -291,7 +294,7 @@ class DeformableDETR(nn.Module):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_obj': b, 'pred_boxes': c}
+        return [{'pred_logits': a, 'pred_obj': b, 'pred_boxes': c,}
                 for a, b, c in zip(outputs_class[:-1], objectness[:-1], outputs_coord[:-1])]
 
 
@@ -301,7 +304,7 @@ class SetCriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, losses, invalid_cls_logits, hidden_dim, focal_alpha=0.25, empty_weight=0.1):
+    def __init__(self, args, num_classes, matcher, weight_dict, losses, invalid_cls_logits, hidden_dim, focal_alpha=0.25, empty_weight=0.1):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -320,9 +323,14 @@ class SetCriterion(nn.Module):
         self.empty_weight=empty_weight
         self.invalid_cls_logits = invalid_cls_logits
         self.min_obj=-hidden_dim*math.log(0.9)
+        
+        # 基于物体性(分数)的自适应伪标签筛选
+        self.enable_unk_label_obj = args.enable_unk_label_obj
+        self.unk_label_obj_score_thresh = args.unk_label_obj_score_thresh
+        self.unk_label_start_epoch = args.unk_label_start_epoch
 
 
-    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
+    def loss_labels(self, outputs, targets, indices, num_boxes, log=True, **kwargs):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
@@ -352,7 +360,7 @@ class SetCriterion(nn.Module):
         return losses
 
     @torch.no_grad()
-    def loss_cardinality(self, outputs, targets, indices, num_boxes):
+    def loss_cardinality(self, outputs, targets, indices, num_boxes, **kwargs):
         """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
         This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
         """
@@ -365,7 +373,7 @@ class SetCriterion(nn.Module):
         losses = {'cardinality_error': card_err}
         return losses
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes):
+    def loss_boxes(self, outputs, targets, indices, num_boxes, **kwargs):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
            The target boxes are expected in format (center_x, center_y, h, w), normalized by the image size.
@@ -386,7 +394,7 @@ class SetCriterion(nn.Module):
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
-    def loss_masks(self, outputs, targets, indices, num_boxes):
+    def loss_masks(self, outputs, targets, indices, num_boxes, **kwargs):
         """Compute the losses related to the masks: the focal loss and the dice loss.
            targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
         """
@@ -415,12 +423,82 @@ class SetCriterion(nn.Module):
         }
         return losses
     
-    def loss_obj_likelihood(self, outputs, targets, indices, num_boxes):
-        assert "pred_obj" in outputs
-        idx = self._get_src_permutation_idx(indices)
-        pred_obj = outputs["pred_obj"][idx]
-        return  {'loss_obj_ll': torch.clamp(pred_obj, min=self.min_obj).sum()/ num_boxes}
+    def loss_obj_likelihood(self, outputs, targets, indices, num_boxes,
+                        dummy_pos_indices=None, dummy_neg_indices=None):
+        
+        logits = outputs["pred_obj"].squeeze(-1)  # [bs, query_num]
+        device = logits.device
 
+        # ---------- 收集所有参与计算的样本索引及标签 ----------
+        batch_idx_list = []
+        query_idx_list = []
+        label_list = []
+        
+        # 1. 已知正样本（匈牙利匹配）
+        if indices is not None:
+            src_idx = self._get_src_permutation_idx(indices)  # (batch_idx, query_idx)
+            if len(src_idx[0]) > 0:
+                batch_idx_list.append(src_idx[0].to(device))
+                query_idx_list.append(src_idx[1].to(device))
+                label_list.append(torch.ones_like(src_idx[0], dtype=logits.dtype, device=device))
+
+        # 2. 伪正样本（标签为1）
+        if dummy_pos_indices is not None:
+            for b_idx, q_list in enumerate(dummy_pos_indices):
+                if len(q_list) > 0:
+                    batch_idx_list.append(torch.full((len(q_list),), b_idx, dtype=torch.long, device=device))
+                    query_idx_list.append(torch.tensor(q_list, dtype=torch.long, device=device))
+                    label_list.append(torch.ones(len(q_list), dtype=logits.dtype, device=device))
+
+        # 3. 伪负样本（标签为0）
+        if dummy_neg_indices is not None:
+            for b_idx, q_list in enumerate(dummy_neg_indices):
+                if len(q_list) > 0:
+                    batch_idx_list.append(torch.full((len(q_list),), b_idx, dtype=torch.long, device=device))
+                    query_idx_list.append(torch.tensor(q_list, dtype=torch.long, device=device))
+                    label_list.append(torch.zeros(len(q_list), dtype=logits.dtype, device=device))
+
+        # 如果没有样本参与，返回0损失（需要梯度，因此创建requires_grad的零张量）
+        if len(batch_idx_list) == 0:
+            zero_loss = torch.tensor(0.0, device=device, dtype=logits.dtype, requires_grad=True)
+            return {'loss_obj': zero_loss}
+
+        # 合并所有索引和标签
+        batch_idx = torch.cat(batch_idx_list)
+        query_idx = torch.cat(query_idx_list)
+        labels = torch.cat(label_list)  # [N]
+
+        # 提取对应的logits
+        selected_logits = logits[batch_idx, query_idx]  # [N]
+
+        # 扩展为 [N, 1] 以适应 sigmoid_focal_loss 的输入格式
+        selected_logits = selected_logits.unsqueeze(1)  # [N, 1]
+        selected_labels = labels.unsqueeze(1)           # [N, 1]
+
+        # # --- Debug Log Start ---
+        # with torch.no_grad():
+        #     prob = selected_logits.sigmoid()
+        #     logging.info(f"--- Loss Diagnosis ---")
+        #     logging.info(f"Logits range: [{selected_logits.min():.4f}, {selected_logits.max():.4f}]") # 之前的logits范围没有经过归一化, 导致非常大. 
+        #     logging.info(f"Prob range: [{prob.min():.4f}, {prob.max():.4f}]")
+        #     logging.info(f"Labels unique: {torch.unique(selected_labels).tolist()}, Dtype: {selected_labels.dtype}")
+        #     logging.info(f"Alpha: {self.focal_alpha}, Num Samples: {len(selected_labels)}")
+            
+        #     # 模拟计算一个不带 Focal 权重的标准 BCE
+        #     standard_bce = F.binary_cross_entropy_with_logits(selected_logits, selected_labels, reduction="sum")
+        #     logging.info(f"Standard BCE (Sum): {standard_bce.item():.6f}")
+        # # --- Debug Log End ---
+        
+        total_loss = sigmoid_focal_loss_torch(
+            inputs=selected_logits,   # [N, 1], 原始 logits
+            targets=selected_labels,  # [N, 1], 0 或 1
+            alpha=self.focal_alpha,   # 默认 0.25
+            gamma=2.0,                # 默认 2
+            reduction="sum"           # 先求和，方便后面除以 num_boxes
+        )
+        # logging.info(f"loss_obj_likelihood: total_loss={total_loss.item():.4f}, num_boxes={num_boxes}, avg_loss={total_loss.item() / num_boxes:.4f}")
+        return {'loss_obj': total_loss / num_boxes}
+        
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -444,18 +522,64 @@ class SetCriterion(nn.Module):
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
-    def forward(self, outputs, targets):
+    def forward(self, outputs, targets, epoch):
         """ This performs the loss computation.
         Parameters:
              outputs: dict of tensors, see the output specification of the model for the format
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
+             epoch: 当前训练的epoch数, 用于控制某些损失的启用
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs' and k != 'enc_outputs' and k !='pred_obj'}
 
         # Retrieve the matching between the outputs of the last layer and the targets
-        indices = self.matcher(outputs_without_aux, targets)
+        indices = self.matcher(outputs_without_aux, targets) # bs,(src_query_idx, tgt_instance_idx)
+        
+        dummy_pos_indices = []  # 每个 batch 的伪正样本 query 索引
+        dummy_neg_indices = []  # 每个 batch 的伪负样本 query 索引
+        
+        if self.enable_unk_label_obj and self.unk_label_start_epoch <= epoch:
+            # Add a dummy target for unknown objects
+            # 1. 计算匹配上的query的objectness的平均值乘以系数得到阈值. 
+            #    未匹配上的query的objectness高于阈值为高置信度未知伪正样本, 远低于阈值为高置信度负样本.
+            obj_scores = outputs['pred_obj'] # bs, num_queries, 1
+            num_queries = obj_scores.shape[1]
+            
+            for i, (src_idx, _) in enumerate(indices):
+                # 1. 计算当前 batch 的阈值：匹配 query 得分的均值 * 系数
+                matched_scores = obj_scores[i, src_idx]  # GPU
+                act_matched_scores = matched_scores.sigmoid()
+                thresh = act_matched_scores.mean().item() * self.unk_label_obj_score_thresh # item()得到python数据类型, 与设备无关, 始终在CPU上, 运算时框架会处理.
+                # logging.info(f"act_matched_scores.mean(): {act_matched_scores.mean().item():.4f}, thresh: {thresh:.4f}")
+                # 2. 找出未匹配的 query 索引
+                all_queries = set(range(num_queries))
+                matched_set = set(src_idx.tolist())
+                unmatched = list(all_queries - matched_set)
 
+                if not unmatched:
+                    dummy_pos_indices.append([])
+                    dummy_neg_indices.append([])
+                    continue
+
+                # 3. 根据 objectness 得分筛选伪正/负样本
+                unmatched_scores = obj_scores[i, unmatched]  # (num_unmatched, 1)
+                act_unmatched_scores = unmatched_scores.sigmoid()
+                # 伪正样本：得分 > thresh，取最高的1个
+                pos_candidates = [unmatched[j] for j, s in enumerate(act_unmatched_scores) if s > thresh]
+                pos_candidates_sorted = sorted(pos_candidates, key=lambda idx: obj_scores[i, idx].item(), reverse=True)
+                dummy_pos = pos_candidates_sorted[:1]  # 最多取一个
+                dummy_pos_indices.append(dummy_pos)
+
+                # 伪负样本：得分 < (1 - thresh)，取最低的两个
+                neg_candidates = [unmatched[j] for j, s in enumerate(act_unmatched_scores) if s < (1 - thresh)]
+                neg_candidates_sorted = sorted(neg_candidates, key=lambda idx: obj_scores[i, idx].item())
+                dummy_neg = neg_candidates_sorted[:2]
+                if len(dummy_neg) > 0:
+                    logging.info(f"Epoch {epoch}: Batch {i}, thresh={thresh:.4f}, taking {len(dummy_pos)} dummy pos and {len(dummy_neg)} dummy neg samples.")
+                dummy_neg_indices.append(dummy_neg)
+                
+
+        
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
@@ -467,6 +591,8 @@ class SetCriterion(nn.Module):
         losses = {}
         for loss in self.losses:
             kwargs = {}
+            kwargs['dummy_pos_indices'] = dummy_pos_indices
+            kwargs['dummy_neg_indices'] = dummy_neg_indices
             losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes, **kwargs))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
@@ -597,8 +723,8 @@ class ExemplarSelection(nn.Module):
 
 def build(args):
     num_classes = args.num_classes
-    invalid_cls_logits = list(range(args.PREV_INTRODUCED_CLS+args.CUR_INTRODUCED_CLS, num_classes-1))
-    print("Invalid class range: " + str(invalid_cls_logits))
+    invalid_cls_logits = list(range(args.PREV_INTRODUCED_CLS + args.CUR_INTRODUCED_CLS, num_classes-1))
+    logging.info("Invalid class range: " + str(invalid_cls_logits))
     
     device = torch.device(args.device)
     
@@ -620,7 +746,13 @@ def build(args):
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
         
     matcher = build_matcher(args)
-    weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef, 'loss_giou': args.giou_loss_coef, 'loss_obj_ll': args.obj_loss_coef}
+    ####### 这里添加损失权重, 在engine中可以通过epoch控制是否启用该Loss #########
+    weight_dict = {
+        'loss_ce': args.cls_loss_coef, 
+        'loss_bbox': args.bbox_loss_coef, 
+        'loss_giou': args.giou_loss_coef, 
+        'loss_obj': args.obj_loss_coef,
+        }
     
     if args.masks:
         weight_dict["loss_mask"] = args.mask_loss_coef
@@ -638,7 +770,7 @@ def build(args):
         losses += ["masks"]
 
         
-    criterion = SetCriterion(num_classes, matcher, weight_dict, losses, invalid_cls_logits, args.hidden_dim, focal_alpha=args.focal_alpha)
+    criterion = SetCriterion(args, num_classes, matcher, weight_dict, losses, invalid_cls_logits, args.hidden_dim, focal_alpha=args.focal_alpha)
     criterion.to(device)
     postprocessors = {'bbox': PostProcess(invalid_cls_logits, temperature=args.obj_temp/args.hidden_dim)}
     exemplar_selection = ExemplarSelection(args, num_classes, matcher, invalid_cls_logits, temperature=args.obj_temp/args.hidden_dim)

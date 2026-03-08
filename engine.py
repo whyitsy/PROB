@@ -29,7 +29,7 @@ from copy import deepcopy
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, nc_epoch: int, max_norm: float = 0, wandb: object = None):
+                    device: torch.device, epoch: int, nc_epoch: int, max_norm: float = 0, wandb: object = None, unk_label_start_epoch=2):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -43,7 +43,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
     for _ in metric_logger.log_every(range(len(data_loader)), print_freq, header):
         outputs = model(samples)
-        loss_dict = criterion(outputs, targets) 
+        loss_dict = criterion(outputs, targets, epoch) 
         weight_dict = deepcopy(criterion.weight_dict)
         
         ## condition for starting nc loss computation after certain epoch so that the F_cls branch has the time
@@ -51,6 +51,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if epoch < nc_epoch: 
             for k,v in weight_dict.items():
                 if 'NC' in k:
+                    weight_dict[k] = 0
+        if epoch < unk_label_start_epoch:
+            for k,v in weight_dict.items():
+                if 'loss_obj' in k:
                     weight_dict[k] = 0
          
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)

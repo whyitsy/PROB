@@ -5,7 +5,7 @@ echo running training of prob-detr, M-OWODB dataset
 set -x
 set -e
 
-EXP_DIR=/mnt/data/kky/output/PROB/exps/MOWODB/PROB
+EXP_DIR=/mnt/data/kky/output/PROB/exps/MOWODB/PROB_DUMMY_LABEL
 PY_ARGS=${@:1}
 WANDB_NAME=PROB_V1
 
@@ -18,6 +18,7 @@ python -u main_open_world.py \
     --model_type 'prob'  --obj_temp 1.3\
     --wandb_name "${WANDB_NAME}_t1" --exemplar_replay_selection --exemplar_replay_max_length 850\
     --exemplar_replay_dir ${WANDB_NAME} --exemplar_replay_cur_file "learned_owod_t1_ft.txt"\
+    --enable_unk_label_obj 
     ${PY_ARGS}
     
 
@@ -30,6 +31,7 @@ python -u main_open_world.py \
     --exemplar_replay_selection --exemplar_replay_max_length 1743 --exemplar_replay_dir ${WANDB_NAME}\
     --exemplar_replay_prev_file "learned_owod_t1_ft.txt" --exemplar_replay_cur_file "learned_owod_t2_ft.txt"\
     --pretrain "${EXP_DIR}/t1/checkpoint0040.pth" --lr 2e-5\
+    --enable_unk_label_obj
     ${PY_ARGS}
     
 
@@ -40,6 +42,7 @@ python -u main_open_world.py \
     --model_type 'prob'  --obj_temp 1.3\
     --wandb_name "${WANDB_NAME}_t2_ft"\
     --pretrain "${EXP_DIR}/t2/checkpoint0050.pth"\
+    --enable_unk_label_obj
     ${PY_ARGS}
     
     
@@ -52,6 +55,7 @@ python -u main_open_world.py \
     --exemplar_replay_selection --exemplar_replay_max_length 2361 --exemplar_replay_dir ${WANDB_NAME}\
     --exemplar_replay_prev_file "learned_owod_t2_ft.txt" --exemplar_replay_cur_file "learned_owod_t3_ft.txt"\
     --pretrain "${EXP_DIR}/t2_ft/checkpoint0110.pth" --lr 2e-5 \
+    --enable_unk_label_obj
     ${PY_ARGS}
     
     
@@ -62,6 +66,7 @@ python -u main_open_world.py \
     --model_type 'prob'  --obj_temp 1.3\
     --wandb_name "${WANDB_NAME}_t3_ft"\
     --pretrain "${EXP_DIR}/t3/checkpoint0120.pth"\
+    --enable_unk_label_obj
     ${PY_ARGS}
     
     
@@ -75,6 +80,7 @@ python -u main_open_world.py \
     --exemplar_replay_prev_file "learned_owod_t3_ft.txt" --exemplar_replay_cur_file "learned_owod_t4_ft.txt"\
     --num_inst_per_class 40\
     --pretrain "${EXP_DIR}/t3_ft/checkpoint0180.pth" --lr 2e-5\
+    --enable_unk_label_obj
     ${PY_ARGS}
     
     
@@ -85,4 +91,5 @@ python -u main_open_world.py \
     --model_type 'prob'  --obj_temp 1.3\
     --wandb_name "${WANDB_NAME}_t4_ft"\
     --pretrain "${EXP_DIR}/t4/checkpoint0190.pth" \
+    --enable_unk_label_obj
     ${PY_ARGS}

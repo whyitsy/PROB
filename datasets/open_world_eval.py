@@ -52,8 +52,8 @@ class OWEvaluator:
             # print(self.known_classes)
             # print(self.voc_gt.CLASS_NAMES)
             logger.info("Testing data details")
-            logger.info("total classes, unknown index, known classes, all classes")
-            logger.info(self.total_num_class, self.unknown_class_index, self.known_classes, self.voc_gt.CLASS_NAMES)
+            logger.info("total classes, unknown index, known classes, all classes: ")
+            logger.info(f"{self.total_num_class}, {self.unknown_class_index}, {self.known_classes}, {self.voc_gt.CLASS_NAMES}")
 
 
     def update(self, predictions):
@@ -130,6 +130,9 @@ class OWEvaluator:
         return all_img_ids, all_lines, all_lines_cls
 
     def accumulate(self):
+        unique_cls = set(self.lines_cls.tolist())
+        logger.info(f"Unique classes in predictions: {unique_cls}")
+        
         for class_label_ind, class_label in enumerate(self.voc_gt.CLASS_NAMES):
             lines_by_class = [l + '\n' for l, c in zip(self.lines, self.lines_cls.tolist()) if c == class_label_ind]
             if len(lines_by_class) == 0:
@@ -187,13 +190,28 @@ class OWEvaluator:
         recalls = sorted(wi.keys())
         ious = sorted(wi[recalls[0]].keys())
         wi_table = [[r] + [wi[r][iou] for iou in ious] for r in recalls]
-        logger.info("\nWilderness Impact (WI):\n" + tabulate(
-            wi_table, headers=["Recall"] + [f"IoU{i}" for i in ious], floatfmt=".4f"))
-        
-        # 未知平均精度表格
         avg_prec_table = [[r] + [avg_precision_unk[r][iou] for iou in ious] for r in recalls]
-        logger.info("\nUnknown Average Precision:\n" + tabulate(
-            avg_prec_table, headers=["Recall"] + [f"IoU{i}" for i in ious], floatfmt=".4f"))
+        combined_table = []
+        for i, row_wi in enumerate(wi_table):
+            row_unk = avg_prec_table[i]
+            # row_wi 和 row_unk 的第一个元素都是 recall，只保留一个
+            combined_row = [row_wi[0]] + row_wi[1:] + row_unk[1:]
+            combined_table.append(combined_row)
+
+        # 构建合并后的表头，为两边列添加前缀
+        headers = ["Recall"] + [f"WI-IoU{iou}" for iou in ious] + [f"Unk-IoU{iou}" for iou in ious]
+
+        # 一次性输出
+        logger.info("Wilderness Impact (WI) and Unknown Average Precision:\n" + 
+                    tabulate(combined_table, headers=headers, floatfmt=".4f"))
+        
+        # logger.info("Wilderness Impact (WI):\n" + tabulate(
+        #     wi_table, headers=["Recall"] + [f"IoU{i}" for i in ious], floatfmt=".4f"))
+        
+        # # 未知平均精度表格
+        # avg_prec_table = [[r] + [avg_precision_unk[r][iou] for iou in ious] for r in recalls]
+        # logger.info("\nUnknown Average Precision:\n" + tabulate(
+        #     avg_prec_table, headers=["Recall"] + [f"IoU{i}" for i in ious], floatfmt=".4f"))
         
         # 类别级指标表格
         class_names = self.voc_gt.CLASS_NAMES
@@ -208,8 +226,8 @@ class OWEvaluator:
                 f"{prec50_vals[i]:.2f}",
                 f"{recall50_vals[i]:.2f}"
             ])
-        logger.info("\nPer-class metrics (IoU=50):\n" + tabulate(
-            class_table, headers=["Class", "AP50", "Precision50", "Recall50"], tablefmt="grid"))
+        logger.info("Per-class metrics (IoU=50):\n" + tabulate(
+            class_table, headers=["Class", "AP50", "Precision50", "Recall50"], tablefmt="pipe", numalign="left"))
         
         # 分组统计表格
         groups = []
@@ -239,12 +257,24 @@ class OWEvaluator:
             "Recall50": recall50_vals[-1]
         })    
         group_table = [[g["Group"], f"{g['AP50']:.2f}", f"{g['Prec50']:.2f}", f"{g['Recall50']:.2f}"] for g in groups]
-        logger.info("\nGroup-wise metrics (IoU=50):\n" + tabulate(
-            group_table, headers=["Group", "AP50", "Precision50", "Recall50"], tablefmt="grid"))
+        logger.info("Group-wise metrics (IoU=50):\n" + tabulate(
+            group_table, headers=["Group", "AP50", "Precision50", "Recall50"], tablefmt="pipe", numalign="left"))
         
         if hasattr(self, 'pred_counts') and len(self.pred_counts) == len(class_names):
-            count_table = [[class_names[i], self.pred_counts[i]] for i in range(len(class_names))]
-            logger.info("\nDetection counts per class:\n" + tabulate(count_table, headers=["Class", "Predictions"]))
+            # count_table = [[class_names[i], self.pred_counts[i]] for i in range(len(class_names))]
+            # logger.info("Detection counts per class:\n" + tabulate(count_table, headers=["Class", "Predictions"]))
+            paired = list(zip(class_names, self.pred_counts))
+            # 按每 classes_per_row 对进行分组，每组内展平为列表
+            classes_per_row = 3
+            rows = [ [item for pair in paired[i:i+classes_per_row] for item in pair] 
+                for i in range(0, len(paired), classes_per_row) ]
+
+            # 填充最后一行为空（可选）
+            if rows and len(rows[-1]) < classes_per_row * 2:
+                rows[-1] += ["", ""] * (classes_per_row - len(rows[-1])//2)
+
+            headers = ["Class", "Pred"] * classes_per_row
+            logger.info("Detection counts per class:\n" + tabulate(rows, headers=headers, tablefmt="pipe"))
         
         '''
         if self.prev_intro_cls > 0:
