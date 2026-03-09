@@ -10,6 +10,7 @@
 import copy
 from typing import Optional, List
 import math
+import logging
 
 import torch
 import torch.nn.functional as F
@@ -127,10 +128,10 @@ class DeformableTransformer(nn.Module):
     def to_4d(self, x,h,w):
         return rearrange(x, 'b (h w) c -> b c h w',h=h,w=w)
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None):
-
+    def forward(self, srcs, masks, pos_embeds, query_embed=None, **kwargs):
         assert self.two_stage or query_embed is not None
-
+        tdqi = kwargs.get('tdqi', False)
+        tdqi_query_num = kwargs.get('tdqi_query_num', 0)
         # prepare input for encoder
         src_flatten = []
         mask_flatten = []
@@ -168,13 +169,23 @@ class DeformableTransformer(nn.Module):
             enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
 
             topk = self.two_stage_num_proposals
-            topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1] ##TODO?? Why only based on first dimension??
+            topk_proposals = torch.topk(enc_outputs_class.max(-1)[0], topk, dim=1)[1] # topk proposals
             topk_coords_unact = torch.gather(enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
             topk_coords_unact = topk_coords_unact.detach()
             reference_points = topk_coords_unact.sigmoid()
             init_reference_out = reference_points
             pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
-            query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
+            if tdqi:
+                query_embed_init_all, tgt_init_all = torch.split(pos_trans_out, c, dim=2)
+                # 只使用前tdqi_query_num个查询进行任务解耦查询初始化
+                query_embed, tgt = torch.split(query_embed, c, dim=1)
+                query_embed = query_embed.unsqueeze(0).repeat(bs, 1, 1)
+                tgt = tgt.unsqueeze(0).repeat(bs, 1, 1)
+                query_embed[:, :tdqi_query_num, :] = query_embed_init_all[:, :tdqi_query_num, :]
+                tgt[:, :tdqi_query_num, :] = tgt_init_all[:, :tdqi_query_num, :]
+            else:
+                query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
+            
         else:
             query_embed, tgt = torch.split(query_embed, c, dim=1)
             query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)

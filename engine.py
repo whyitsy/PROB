@@ -29,7 +29,7 @@ from copy import deepcopy
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, nc_epoch: int, max_norm: float = 0, wandb: object = None, unk_label_start_epoch=2):
+                    device: torch.device, epoch: int, nc_epoch: int, max_norm: float = 0, wandb: object = None, args=None):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -52,7 +52,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             for k,v in weight_dict.items():
                 if 'NC' in k:
                     weight_dict[k] = 0
-        if epoch < unk_label_start_epoch:
+        if epoch < args.unk_label_start_epoch:
             for k,v in weight_dict.items():
                 if 'loss_obj' in k:
                     weight_dict[k] = 0

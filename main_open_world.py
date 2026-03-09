@@ -165,6 +165,14 @@ def get_args_parser():
     parser.add_argument('--unk_label_start_epoch', default=2, type=int, help='从哪个epoch开始使用基于物体性分数的自适应伪标签筛选')
     parser.add_argument('--obj_loss_dummy_pos_cofe', default=4e-4, type=float, help='伪正样本损失权重系数')
     parser.add_argument('--obj_loss_dummy_neg_cofe', default=4e-4, type=float, help='伪负样本损失权重系数')
+    ## 目标性预测的提前终止 (ETOP, Early Termination of Objectness Prediction)
+    parser.add_argument('--etop', default=False, action='store_true', help='启用目标性预测的提前终止')
+    parser.add_argument('--etop_layer', default=1, type=int, help='目标性预测的提前终止层')
+    ## 任务解耦查询初始化 (TDQI, Task-Decoupled Query Initialization)
+    parser.add_argument('--tdqi', default=False, action='store_true', help='使用任务解耦查询初始化')
+    parser.add_argument('--tdqi_query_num', default=20, type=int, help='负责已知目标的查询数量, 默认值参考decoupled PROB论文') 
+    
+    
     
     return parser
 
@@ -352,7 +360,7 @@ def main(args):
             sampler_train.set_epoch(epoch)
             
         train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer, device, epoch, args.nc_epoch, args.clip_max_norm, wandb)
+            model, criterion, data_loader_train, optimizer, device, epoch, args.nc_epoch, args.clip_max_norm, wandb, args)
             
         lr_scheduler.step()
         if args.output_dir:

@@ -11,7 +11,8 @@
 set -x
 
 GPUS=$1
-RUN_COMMAND=${@:2}
+MASTER_PORT=$2
+RUN_COMMAND=${@:3}
 if [ $GPUS -lt 8 ]; then
     GPUS_PER_NODE=${GPUS_PER_NODE:-$GPUS}
 else
