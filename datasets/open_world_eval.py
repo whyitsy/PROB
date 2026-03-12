@@ -11,7 +11,8 @@ from util.misc import all_gather
 from collections import OrderedDict, defaultdict
 from tabulate import tabulate
 
-logger = logging.getLogger(__name__)   # 模块级 logger
+logger = logging.getLogger(__name__)  
+
 
 class OWEvaluator:
     def __init__(self, voc_gt, iou_types, args=None, use_07_metric=True, ovthresh=list(range(50, 100, 5))):

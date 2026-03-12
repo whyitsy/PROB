@@ -194,7 +194,9 @@ class DeformableTransformer(nn.Module):
             init_reference_out = reference_points
 
         # decoder
-        hs, inter_references = self.decoder(tgt, reference_points, memory, spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten)
+        semantic_mask = kwargs.get('semantic_mask', None)
+        clip_text_features = kwargs.get('clip_text_features', None)
+        hs, inter_references = self.decoder(tgt, reference_points, memory, spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten, clip_text_features, semantic_mask)
 
         inter_references_out = inter_references
 
@@ -272,7 +274,7 @@ class DeformableTransformerEncoder(nn.Module):
         output = src
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
         for _, layer in enumerate(self.layers):
-            output = layer(output, pos, reference_points, spatial_shapes, level_start_index, padding_mask)
+            output = layer(output, pos, reference_points, spatial_shapes, level_start_index, padding_mask, )
 
         return output
 
@@ -292,7 +294,13 @@ class DeformableTransformerDecoderLayer(nn.Module):
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
-
+        
+        # 跨模态语义-视觉融合 SVCF
+        self.semantic_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.dropout_semantic = nn.Dropout(dropout)
+        self.norm_semantic = nn.LayerNorm(d_model)
+        self.semantic_proj = nn.Linear(512, d_model)
+        
         # ffn
         self.linear1 = nn.Linear(d_model, d_ffn)
         self.activation = _get_activation_fn(activation)
@@ -311,7 +319,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = self.norm3(tgt)
         return tgt
 
-    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask=None):
+    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask=None, clip_text_features=None, semantic_mask=None):
         # self attention
         q = k = self.with_pos_embed(tgt, query_pos)
         tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1))[0].transpose(0, 1)
@@ -325,7 +333,42 @@ class DeformableTransformerDecoderLayer(nn.Module):
         
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
-
+        
+        # Semantic Cross Attention (用视觉特征与大模型文本库做深度融合)
+        if clip_text_features is not None:
+            # 将 [num_classes + 1, 512] 的 CLIP 特征投影到 [num_classes + 1, d_model]
+            clip_text_features = clip_text_features.to(self.semantic_proj.weight.dtype)
+            semantic_memory = self.semantic_proj(clip_text_features)
+            # 扩展到 Batch Size: [num_classes + 1, bs, d_model]
+            bs = tgt.shape[1]
+            semantic_memory = semantic_memory.unsqueeze(1).repeat(1, bs, 1)
+            key_padding_mask = None
+            if semantic_mask is not None:
+                key_padding_mask = semantic_mask.unsqueeze(0).expand(bs, -1)
+                
+            # Query 主动提取最匹配的语义概念
+            tgt2 = self.semantic_attn(
+                query=tgt, 
+                key=semantic_memory, 
+                value=semantic_memory,
+                key_padding_mask=key_padding_mask # [NEW] 阻断信息泄露
+                )[0]
+            tgt = tgt + self.dropout_semantic(tgt2)
+            tgt = self.norm_semantic(tgt)
+        else:
+            # [FIX] DDP Dummy Pass: 确保在没有 CLIP 特征时，这些新增模块的参数也不会闲置
+            bs = tgt.shape[1]
+            dummy_clip = torch.zeros((1, 512), device=tgt.device, dtype=self.semantic_proj.weight.dtype)
+            dummy_mem = self.semantic_proj(dummy_clip).unsqueeze(1).repeat(1, bs, 1)
+            
+            dummy_tgt2 = self.semantic_attn(query=tgt, key=dummy_mem, value=dummy_mem)[0]
+            
+            # 乘以 0.0 消除对 tgt 实际数值的影响，但确保梯度图连通
+            tgt = tgt + self.dropout_semantic(dummy_tgt2) * 0.0
+            
+            # LayerNorm 也必须参与一次计算
+            dummy_norm = self.norm_semantic(tgt)
+            tgt = tgt + dummy_norm * 0.0
         # ffn
         tgt = self.forward_ffn(tgt)
 
@@ -343,7 +386,7 @@ class DeformableTransformerDecoder(nn.Module):
         self.class_embed = None
 
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
-                query_pos=None, src_padding_mask=None):
+                query_pos=None, src_padding_mask=None, clip_text_features=None, semantic_mask=None):
         output = tgt
 
         intermediate = []
@@ -356,7 +399,7 @@ class DeformableTransformerDecoder(nn.Module):
             else:
                 assert reference_points.shape[-1] == 2
                 reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
-            output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask)
+            output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask, clip_text_features, semantic_mask)
 
             # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:

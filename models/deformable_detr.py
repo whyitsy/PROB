@@ -679,7 +679,6 @@ def build(args):
     curr_intro_cls = args.CUR_INTRODUCED_CLS
     seen_classes = prev_intro_cls + curr_intro_cls
     invalid_cls_logits = list(range(seen_classes, num_classes-1)) #unknown class indx will not be included in the invalid class range
-    print("Invalid class rangw: " + str(invalid_cls_logits))
 
     model = DeformableDETR(
         backbone,

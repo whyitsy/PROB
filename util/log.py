@@ -37,6 +37,8 @@ def setup_logging(output=None, distributed_rank=0, abbrev_name="PROB"):
         
     # 配置根日志器
     logger = logging.getLogger()
+    if logger.hasHandlers():
+        logger.handlers.clear()
     logger.setLevel(logging.DEBUG)
     
     # 文件处理器：所有进程记录 DEBUG 及以上

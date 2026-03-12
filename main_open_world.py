@@ -163,14 +163,18 @@ def get_args_parser():
     parser.add_argument('--enable_unk_label_obj', default=False, action='store_true', help='使用基于物体性分数的自适应伪标签筛选')
     parser.add_argument('--unk_label_obj_score_thresh', default=0.8, type=float, help='自适应筛选阈值, 基于匹配上的query的obj的平均值乘以该系数')
     parser.add_argument('--unk_label_start_epoch', default=2, type=int, help='从哪个epoch开始使用基于物体性分数的自适应伪标签筛选')
-    parser.add_argument('--obj_loss_dummy_pos_cofe', default=4e-4, type=float, help='伪正样本损失权重系数')
-    parser.add_argument('--obj_loss_dummy_neg_cofe', default=4e-4, type=float, help='伪负样本损失权重系数')
     ## 目标性预测的提前终止 (ETOP, Early Termination of Objectness Prediction)
     parser.add_argument('--etop', default=False, action='store_true', help='启用目标性预测的提前终止')
     parser.add_argument('--etop_layer', default=1, type=int, help='目标性预测的提前终止层')
     ## 任务解耦查询初始化 (TDQI, Task-Decoupled Query Initialization)
     parser.add_argument('--tdqi', default=False, action='store_true', help='使用任务解耦查询初始化')
-    parser.add_argument('--tdqi_query_num', default=20, type=int, help='负责已知目标的查询数量, 默认值参考decoupled PROB论文') 
+    parser.add_argument('--tdqi_query_num', default=20, type=int, help='负责已知目标的查询数量, 默认值参考decoupled PROB论文')
+    # CLIP特征融合
+    parser.add_argument('--use_clip_align', default=False, action='store_true', help='使用CLIP特征对齐')
+    parser.add_argument('--vlm_tau', default=0.1, type=float, help='多模态置信度（$\omega$）计算时的温度系数（Temperature）。')
+    parser.add_argument('--clip_text_features', default=None, type=str, help='CLIP文本特征的路径, 仅在创新2中使用')
+    parser.add_argument('--clip_dim', default=512, type=int, help='CLIP 特征的维度, 仅在创新2中使用')
+    parser.add_argument('--align_loss_coef', default=1.0, type=float, help='对齐损失权重系数, 仅在创新2中使用')
     
     
     
@@ -203,7 +207,9 @@ def main(args):
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-
+    
+    dataset_train, dataset_val, class_names = get_datasets(args)
+    args.class_names = class_names
     model, criterion, postprocessors, exemplar_selection = build_model(args, mode = args.model_type)
     model.to(device)
 
@@ -212,7 +218,7 @@ def main(args):
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logging.info('number of params: {}'.format(n_parameters))
 
-    dataset_train, dataset_val = get_datasets(args)
+
     
     if args.distributed:
         if args.cache_mode:
@@ -436,7 +442,7 @@ def get_datasets(args):
     logging.info(f"dataset_train: {dataset_train}")
     logging.info(f"dataset_val: {dataset_val}")
 
-    return dataset_train, dataset_val
+    return dataset_train, dataset_val, dataset_train.CLASS_NAMES
 
 
 def create_ft_dataset(args, image_sorted_scores):

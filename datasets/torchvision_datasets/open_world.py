@@ -100,7 +100,7 @@ VOC_COCO_CLASS_NAMES["TOWOD"] = tuple(itertools.chain(VOC_CLASS_NAMES, T2_CLASS_
 VOC_COCO_CLASS_NAMES["VOC2007"] = tuple(itertools.chain(VOC_CLASS_NAMES, T2_CLASS_NAMES, T3_CLASS_NAMES, T4_CLASS_NAMES, UNK_CLASS))
 
 
-print("VOC_COCO_CLASS_NAMES:", VOC_COCO_CLASS_NAMES)
+logging.info("VOC_COCO_CLASS_NAMES:", VOC_COCO_CLASS_NAMES)
 
 class OWDetection(VisionDataset):
     """`OWOD in Pascal VOC format <http://host.robots.ox.ac.uk/pascal/VOC/>`_ Detection Dataset.
@@ -146,7 +146,7 @@ class OWDetection(VisionDataset):
 
         file_names = self.extract_fns(image_set, self.root)
         if image_set == 'voc2007_trainval':
-            print('PASCAL-VOC2007 dataset used; clearing images with missing object classes')
+            logging.info('PASCAL-VOC2007 dataset used; clearing images with missing object classes')
             prev_intro_cls = self.args.PREV_INTRODUCED_CLS
             curr_intro_cls = self.args.CUR_INTRODUCED_CLS
             valid_classes = range(prev_intro_cls, prev_intro_cls + curr_intro_cls)
