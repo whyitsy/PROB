@@ -161,6 +161,7 @@ def get_args_parser():
     
     # 伪样本挖掘
     parser.add_argument('--enable_unk_label_obj', default=False, action='store_true', help='使用基于物体性分数的自适应伪标签筛选')
+    parser.add_argument('--use_valid_mask', default=False, action='store_true', help='使用有效掩码')
     parser.add_argument('--unk_label_obj_score_thresh', default=0.8, type=float, help='自适应筛选阈值, 基于匹配上的query的obj的平均值乘以该系数')
     parser.add_argument('--unk_label_start_epoch', default=2, type=int, help='从哪个epoch开始使用基于物体性分数的自适应伪标签筛选')
     ## 目标性预测的提前终止 (ETOP, Early Termination of Objectness Prediction)
@@ -170,11 +171,13 @@ def get_args_parser():
     parser.add_argument('--tdqi', default=False, action='store_true', help='使用任务解耦查询初始化')
     parser.add_argument('--tdqi_query_num', default=20, type=int, help='负责已知目标的查询数量, 默认值参考decoupled PROB论文')
     # CLIP特征融合
-    parser.add_argument('--use_clip_align', default=False, action='store_true', help='使用CLIP特征对齐')
+    parser.add_argument('--use_feature_align', default=False, action='store_true', help='使用CLIP特征对齐')
+    parser.add_argument('--use_vlm_distill', default=False, action='store_true', help='使用基于视觉语言模型的蒸馏')
     parser.add_argument('--vlm_tau', default=0.1, type=float, help='多模态置信度（$\omega$）计算时的温度系数（Temperature）。')
-    parser.add_argument('--clip_text_features', default=None, type=str, help='CLIP文本特征的路径, 仅在创新2中使用')
-    parser.add_argument('--clip_dim', default=512, type=int, help='CLIP 特征的维度, 仅在创新2中使用')
-    parser.add_argument('--align_loss_coef', default=1.0, type=float, help='对齐损失权重系数, 仅在创新2中使用')
+    parser.add_argument('--clip_text_features', default=None, type=str, help='CLIP文本特征的路径')
+    parser.add_argument('--clip_dim', default=512, type=int, help='CLIP 特征的维度')
+    parser.add_argument('--align_loss_coef', default=1.0, type=float, help='对齐损失权重系数')
+    parser.add_argument('--pred_per_im', default=100, type=int, help='每张图片预测的框数')
     
     
     
@@ -448,7 +451,7 @@ def get_datasets(args):
 def create_ft_dataset(args, image_sorted_scores):
     logging.info(f'found a total of {len(image_sorted_scores.keys())} images')
     tmp_dir=args.data_root +'/ImageSets/'+args.dataset+"/"+args.exemplar_replay_dir+"/"
-    #tmp_dir=args.data_root +'/ImageSets/'+args.exemplar_replay_dir+"/"
+    
 
     class_sorted_scores={}
     imgs_per_class={}

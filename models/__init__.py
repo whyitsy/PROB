@@ -10,15 +10,13 @@
 import logging
 
 def build_model(args, mode='owdetr'):
+    logging.info(f'Building model with mode: {mode}')
     if mode == 'prob':
-        logging.info("Building PROB model...")
         from .prob_deformable_detr import build
     elif mode == 'innov_1':
-        logging.info("Building PROB_INNOV_1 model...")
         from .prob_deformable_detr_innov_1 import build
     elif mode == 'innov_2':
         from .prob_deformable_detr_innov_2 import build
     else:
-        logging.info("Building OWDetr model...")
         from .deformable_detr import build
     return build(args)
