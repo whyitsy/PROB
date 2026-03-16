@@ -14,22 +14,17 @@ import math
 import os
 import sys
 from typing import Iterable
- 
 import torch
 import util.misc as utils
-from datasets.coco_eval import CocoEvaluator
 from datasets.open_world_eval import OWEvaluator
 from datasets.panoptic_eval import PanopticEvaluator
 from datasets.data_prefetcher import data_prefetcher
-from util.box_ops import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy
-from util.plot_utils import plot_prediction
-import matplotlib.pyplot as plt
 from copy import deepcopy
-
+from util.visual.visual import *
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, nc_epoch: int, max_norm: float = 0, wandb: object = None, args=None):
+                    device: torch.device, epoch: int, nc_epoch: int, max_norm: float = 0, writer=None, args=None):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -53,8 +48,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 if 'NC' in k:
                     weight_dict[k] = 0
         if epoch < args.unk_label_start_epoch:
-            for k,v in weight_dict.items():
-                if 'loss_obj' in k:
+            for k, v in weight_dict.items():
+                if 'loss_obj' in k or 'loss_unk' in k:
                     weight_dict[k] = 0
          
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
@@ -83,11 +78,79 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
         optimizer.step()
         
-        if wandb is not None:
-            wandb.log({"total_loss":loss_value})
-            wandb.log(loss_dict_reduced_scaled)
-            wandb.log(loss_dict_reduced_unscaled)
- 
+        if writer is not None:
+            global_step = epoch * len(data_loader) + _
+            writer.add_scalar('train/total_loss', loss_value, global_step)
+            for k, v in loss_dict_reduced_scaled.items():
+                writer.add_scalar(f'train_scaled/{k}', v, global_step)
+            for k, v in loss_dict_reduced_unscaled.items():
+                writer.add_scalar(f'train_unscaled/{k}', v, global_step)
+
+            # 每 200 step 画一次图，避免TensorBoard过大
+            if global_step % 200 == 0:
+                try:
+                    log_debug_visualizations(
+                        writer=writer,
+                        samples=samples,
+                        targets=targets,
+                        outputs=outputs,
+                        criterion=criterion,
+                        epoch=epoch,
+                        global_step=global_step,
+                        max_images=2,
+                        prefix='train_vis'
+                    )
+                except Exception as e:
+                    print(f'[warn] visualization failed at step {global_step}: {e}')
+
+            # 重点监控 objectness / 伪标签统计
+            stat_keys = [
+                'stat_num_dummy_pos',
+                'stat_num_dummy_neg',
+                'stat_pos_energy_mean',
+                'stat_neg_energy_mean',
+                'stat_matched_energy_mean',
+                'stat_pos_thresh_mean',
+                'stat_neg_thresh_mean',
+            ]
+            for k in stat_keys:
+                if k in loss_dict_reduced:
+                    v = loss_dict_reduced[k]
+                    writer.add_scalar(f'train_stats/{k}', v.item() if torch.is_tensor(v) else v, global_step)
+
+            # 记录 pred_obj energy 直方图
+            if 'pred_obj' in outputs:
+                writer.add_histogram('train_hist/pred_obj_energy_all',
+                                    outputs['pred_obj'].detach().float().cpu(),
+                                    global_step)
+
+                # matched / unmatched 分开画，更有用
+                try:
+                    outputs_without_aux = {k: v for k, v in outputs.items()
+                                        if k not in ['aux_outputs', 'enc_outputs', 'pred_obj', 'samples', 'pred_proj']}
+                    indices_for_hist = criterion.matcher(outputs_without_aux, targets)
+
+                    batch_size, num_queries = outputs['pred_obj'].shape[:2]
+                    obj_energy = outputs['pred_obj'].detach()
+
+                    matched_mask = torch.zeros((batch_size, num_queries), dtype=torch.bool, device=obj_energy.device)
+                    for b_idx, (src, _) in enumerate(indices_for_hist):
+                        if len(src) > 0:
+                            matched_mask[b_idx, src] = True
+
+                    matched_energy = obj_energy[matched_mask]
+                    unmatched_energy = obj_energy[~matched_mask]
+
+                    if matched_energy.numel() > 0:
+                        writer.add_histogram('train_hist/pred_obj_energy_matched',
+                                            matched_energy.float().cpu(),
+                                            global_step)
+                    if unmatched_energy.numel() > 0:
+                        writer.add_histogram('train_hist/pred_obj_energy_unmatched',
+                                            unmatched_energy.float().cpu(),
+                                            global_step)
+                except Exception:
+                    pass
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])

@@ -33,33 +33,6 @@ import logging
 from util.log import setup_logging
 
 
-def _sanitize_for_checkpoint(obj):
-    """Convert runtime objects attached to args into pickle-safe values."""
-    if obj is None or isinstance(obj, (bool, int, float, str)):
-        return obj
-    if isinstance(obj, Path):
-        return str(obj)
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize_for_checkpoint(v) for v in obj]
-    if isinstance(obj, dict):
-        return {k: _sanitize_for_checkpoint(v) for k, v in obj.items()}
-    if isinstance(obj, argparse.Namespace):
-        return {k: _sanitize_for_checkpoint(v) for k, v in vars(obj).items() if not k.startswith('_')}
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if torch.is_tensor(obj):
-        return obj.detach().cpu().tolist()
-
-    # Runtime-only objects such as SummaryWriter / CLIP model / device handles are
-    # not needed for resuming training from checkpoints. Store a readable fallback
-    # instead of the live object itself.
-    return repr(obj)
-
-
-def _build_checkpoint_args(args):
-    return _sanitize_for_checkpoint(args)
-
-
 def get_args_parser():
     parser = argparse.ArgumentParser('Deformable DETR Detector', add_help=False)
     ################ Deformable DETR ################
@@ -208,16 +181,7 @@ def get_args_parser():
     parser.add_argument('--clip_dim', default=512, type=int, help='CLIP 特征的维度')
     parser.add_argument('--align_loss_coef', default=1.0, type=float, help='对齐损失权重系数')
     parser.add_argument('--pred_per_im', default=100, type=int, help='每张图片预测的框数')
-    # innov2的gpt修复
-    # Unknownness branch
-    parser.add_argument('--enable_unk_head', default=True, action='store_true', help='启用独立 unknownness 分支')
-    parser.add_argument('--unk_loss_coef', default=1.0, type=float, help='unknownness loss 权重')
-    parser.add_argument('--unk_cls_reject_thresh', default=0.25, type=float, help='unknown候选的已知类置信上限')
-    parser.add_argument('--unk_pos_per_img', default=1, type=int, help='每张图最多选多少个 unknown 正候选')
-    parser.add_argument('--unk_neg_per_img', default=2, type=int, help='每张图最多选多少个 background 负候选')
-    parser.add_argument('--unk_temp', default=1.0, type=float, help='postprocess 中 unknownness sigmoid 温度')
-    parser.add_argument('--postproc_known_thresh', default=0.05, type=float, help='后处理已知类最小分数阈值')
-    parser.add_argument('--postproc_unknown_thresh', default=0.05, type=float, help='后处理unknown最小分数阈值')
+    
     
     
     return parser
@@ -431,14 +395,13 @@ def main(args):
             else:
                  test_stats = {}
                     
-            checkpoint_args = _build_checkpoint_args(args)
             for checkpoint_path in checkpoint_paths:
                 utils.save_on_master({
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
-                    'args': checkpoint_args,
+                    'args': args,
                 }, checkpoint_path)
             
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},

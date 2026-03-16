@@ -129,5 +129,3 @@ dmypy.json
 .pyre/
 
 clip_text_feature/
-
-.util/plot/plot_log_metrics/

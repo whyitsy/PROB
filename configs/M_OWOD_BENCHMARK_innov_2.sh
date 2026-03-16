@@ -5,7 +5,12 @@ echo running training of prob-detr, M-OWODB dataset
 set -x
 set -e
 
-EXP_DIR=/mnt/data/kky/output/PROB/exps/MOWODB/INNOV_3/
+if [ $# -ge 1 ]; then
+    EXP_DIR="$1"
+    shift
+else
+    EXP_DIR="/gemini/output/INNOV_2/"
+fi
 PY_ARGS=${@:1}
 WANDB_NAME=INNOV_3
 
@@ -18,7 +23,7 @@ python -u main_open_world.py \
     --wandb_name "${WANDB_NAME}_t1" --exemplar_replay_selection --exemplar_replay_max_length 850\
     --exemplar_replay_dir ${WANDB_NAME} --exemplar_replay_cur_file "learned_owod_t1_ft.txt"\
     --enable_unk_label_obj  --obj_loss_coef 10 --etop --tdqi --model_type 'innov_2'\
-    --lr 1e-4 --use_feature_align --use_vlm_distill
+    --use_feature_align --use_vlm_distill 
     ${PY_ARGS}
     
 
