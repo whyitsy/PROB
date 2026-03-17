@@ -167,12 +167,9 @@ def get_args_parser():
     # model config
     parser.add_argument('--model_type', default='prob', type=str)
     
-    # logging
-    parser.add_argument('--wandb_name', default='', type=str)
-    parser.add_argument('--wandb_project', default='PROB_OWOD', type=str)
     
     # model hyperparameters
-    parser.add_argument('--obj_loss_coef', default=100, type=float)
+    parser.add_argument('--obj_loss_coef', default=1, type=float)
     parser.add_argument('--obj_temp', default=1, type=float)
     parser.add_argument('--freeze_prob_model', default=False, action='store_true', help='freeze model probabistic estimation')
 
@@ -186,11 +183,13 @@ def get_args_parser():
     parser.add_argument('--exemplar_replay_cur_file', default='', type=str, help="path to current ft file")
     parser.add_argument('--exemplar_replay_random', default=False, action='store_true', help='make selection random')
     
-    # 伪样本挖掘
+    # 基础参数
     parser.add_argument('--enable_unk_label_obj', default=False, action='store_true', help='使用基于物体性分数的自适应伪标签筛选')
     parser.add_argument('--use_valid_mask', default=False, action='store_true', help='使用有效掩码')
-    parser.add_argument('--unk_label_obj_score_thresh', default=0.8, type=float, help='自适应筛选阈值, 基于匹配上的query的obj的平均值乘以该系数')
+    parser.add_argument('--unk_label_obj_score_thresh', default=0.8, type=float, help='自适应筛选阈值, 基于匹配上的query的obj统计量乘以该系数')
+    parser.add_argument('--unk_label_pos_quantile', default=0.5, type=float, help='用 matched energy 的哪个分位数来定义伪正阈值基准')
     parser.add_argument('--unk_label_start_epoch', default=2, type=int, help='从哪个epoch开始使用基于物体性分数的自适应伪标签筛选')
+    parser.add_argument('--unk_label_obj_warmup_epochs', default=3, type=int, help='启动伪标签后，前多少个epoch只使用 dummy_neg，不使用 dummy_pos 进入 loss_obj')
     parser.add_argument('--obj_neg_margin', default=1.0, type=float, help='energy-based objectness loss中负样本的最小margin')
     parser.add_argument('--default_pos_energy_thresh', default=1.0, type=float, help='无matched query时的默认伪正energy阈值')
     parser.add_argument('--unk_label_neg_margin', default=0.5, type=float, help='伪负样本阈值 = 伪正阈值 + margin')
@@ -200,7 +199,7 @@ def get_args_parser():
     ## 任务解耦查询初始化 (TDQI, Task-Decoupled Query Initialization)
     parser.add_argument('--tdqi', default=False, action='store_true', help='使用任务解耦查询初始化')
     parser.add_argument('--tdqi_query_num', default=20, type=int, help='负责已知目标的查询数量, 默认值参考decoupled PROB论文')
-    # CLIP特征融合
+    ## CLIP多模态
     parser.add_argument('--use_feature_align', default=False, action='store_true', help='使用CLIP特征对齐')
     parser.add_argument('--use_vlm_distill', default=False, action='store_true', help='使用基于视觉语言模型的蒸馏')
     parser.add_argument('--vlm_tau', default=0.1, type=float, help='多模态置信度（$\omega$）计算时的温度系数（Temperature）。')
@@ -208,9 +207,8 @@ def get_args_parser():
     parser.add_argument('--clip_dim', default=512, type=int, help='CLIP 特征的维度')
     parser.add_argument('--align_loss_coef', default=1.0, type=float, help='对齐损失权重系数')
     parser.add_argument('--pred_per_im', default=100, type=int, help='每张图片预测的框数')
-    # innov2的gpt修复
-    # Unknownness branch
-    parser.add_argument('--enable_unk_head', default=True, action='store_true', help='启用独立 unknownness 分支')
+    # innov2的参数. Unknownness branch
+    parser.add_argument('--enable_unk_head', default=False, action='store_true', help='启用独立 unknownness 分支')
     parser.add_argument('--unk_loss_coef', default=1.0, type=float, help='unknownness loss 权重')
     parser.add_argument('--unk_cls_reject_thresh', default=0.25, type=float, help='unknown候选的已知类置信上限')
     parser.add_argument('--unk_pos_per_img', default=1, type=int, help='每张图最多选多少个 unknown 正候选')
@@ -223,16 +221,21 @@ def get_args_parser():
     return parser
 
 def main(args):
-    writer = None
-    if utils.is_main_process():   # 只在主进程创建 writer，避免多进程重复写入
-        log_dir = os.path.join(args.output_dir, 'tensorboard_logs')
-        writer = SummaryWriter(log_dir=log_dir)
-        # 如果需要记录超参数，可以将 args 保存为文本
-        if writer is not None:
-            writer.add_text('args', str(args), 0)
-            args.writer = writer  # 将 writer 传递给 args，以便在其他地方使用
-
     utils.init_distributed_mode(args)
+    
+    writer = None
+    if utils.is_main_process():
+        run_name = datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
+
+        tb_log_dir = os.path.join(args.output_dir, 'tensorboard_logs', run_name)
+        os.makedirs(tb_log_dir, exist_ok=True)
+
+        writer = SummaryWriter(log_dir=tb_log_dir)
+        writer.add_text('args', str(args), 0)
+        print(f"TensorBoard log dir: {tb_log_dir}")
+
+    args.writer = writer
+
     # print("git:\n  {}\n".format(utils.get_sha()))
     setup_logging(output=args.output_dir, distributed_rank=utils.get_rank())
     logging.info("git:\n  {}\n".format(utils.get_sha()))

@@ -139,10 +139,7 @@ def get_args_parser():
     ################ PROB OWOD ################
     # model config
     parser.add_argument('--model_type', default='prob', type=str)
-    
-    # logging
-    parser.add_argument('--wandb_name', default='', type=str)
-    parser.add_argument('--wandb_project', default='PROB_OWOD', type=str)
+
     
     # model hyperparameters
     parser.add_argument('--obj_loss_coef', default=100, type=float)

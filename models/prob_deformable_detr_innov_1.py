@@ -9,7 +9,6 @@
 
 import torch
 import torch.nn.functional as F
-from torchvision.ops import sigmoid_focal_loss as sigmoid_focal_loss_torch
 from torch import nn
 import math
 import logging
@@ -364,8 +363,27 @@ class SetCriterion(nn.Module):
             "loss_dice": dice_loss(src_masks, target_masks, num_boxes),
         }
     
+    def _get_known_max_scores(self, logits):
+        """
+        logits: [num_queries, num_classes]
+        return: [num_queries]
+        """
+        probs = logits.sigmoid().detach().clone()
+
+        if hasattr(self, 'invalid_cls_logits') and self.invalid_cls_logits is not None:
+            probs[:, self.invalid_cls_logits] = 0
+
+        # 已知类范围：默认排除最后一个 unknown 类
+        known_probs = probs[:, :self.num_classes - 1]
+
+        if known_probs.numel() == 0:
+            return torch.zeros(probs.shape[0], device=probs.device)
+
+        return known_probs.max(dim=-1)[0]
+    
     def loss_obj_likelihood(self, outputs, targets, indices, num_boxes,
-                        dummy_pos_indices=None, dummy_neg_indices=None, dummy_vlm_weights=None):
+                        dummy_pos_indices=None, dummy_neg_indices=None,
+                        dummy_vlm_weights=None, epoch=0):
 
         energy = outputs["pred_obj"]   # 越小越像物体
         device = energy.device
@@ -374,7 +392,9 @@ class SetCriterion(nn.Module):
         pos_batch_idx, pos_query_idx, pos_weight_list = [], [], []
         neg_batch_idx, neg_query_idx = [], []
 
-        # 1) 已知正样本：希望 energy 小
+        zero = energy.sum() * 0.0
+
+        # 1) 已知 matched 正样本：始终压低 energy
         if indices is not None:
             src_idx = self._get_src_permutation_idx(indices)
             if len(src_idx[0]) > 0:
@@ -382,49 +402,57 @@ class SetCriterion(nn.Module):
                 pos_query_idx.append(src_idx[1].to(device))
                 pos_weight_list.append(torch.ones_like(src_idx[0], dtype=dtype, device=device))
 
-        # 2) 伪正样本：也希望 energy 小
-        if dummy_pos_indices is not None:
-            for b_idx, q_list in enumerate(dummy_pos_indices):
-                if len(q_list) > 0:
-                    pos_batch_idx.append(torch.full((len(q_list),), b_idx, dtype=torch.long, device=device))
-                    pos_query_idx.append(torch.tensor(q_list, dtype=torch.long, device=device))
-                    if self.use_vlm_distill and dummy_vlm_weights:
-                        w = torch.tensor(dummy_vlm_weights[b_idx], dtype=dtype, device=device)
-                    else:
-                        w = torch.ones(len(q_list), dtype=dtype, device=device)
-                    pos_weight_list.append(w)
+        # 2) dummy_pos：加入 warmup，避免 unk_label_start_epoch 后立刻自举崩塌
+        use_dummy_pos_loss = (
+            epoch >= self.unk_label_start_epoch + getattr(self.args, 'unk_label_obj_warmup_epochs', 0)
+        )
 
-        # 3) 伪负样本：希望 energy 大
+        if use_dummy_pos_loss and dummy_pos_indices is not None:
+            for b_idx, q_list in enumerate(dummy_pos_indices):
+                if len(q_list) == 0:
+                    continue
+
+                pos_batch_idx.append(torch.full((len(q_list),), b_idx, dtype=torch.long, device=device))
+                pos_query_idx.append(torch.tensor(q_list, dtype=torch.long, device=device))
+
+                if (
+                    self.use_vlm_distill
+                    and dummy_vlm_weights is not None
+                    and len(dummy_vlm_weights) > b_idx
+                    and len(dummy_vlm_weights[b_idx]) == len(q_list)
+                ):
+                    w = torch.tensor(dummy_vlm_weights[b_idx], dtype=dtype, device=device)
+                else:
+                    w = torch.ones(len(q_list), dtype=dtype, device=device)
+
+                pos_weight_list.append(w)
+
+        # 3) dummy_neg：始终可用，用 hinge 往高 energy 推
         if dummy_neg_indices is not None:
             for b_idx, q_list in enumerate(dummy_neg_indices):
-                if len(q_list) > 0:
-                    neg_batch_idx.append(torch.full((len(q_list),), b_idx, dtype=torch.long, device=device))
-                    neg_query_idx.append(torch.tensor(q_list, dtype=torch.long, device=device))
+                if len(q_list) == 0:
+                    continue
+                neg_batch_idx.append(torch.full((len(q_list),), b_idx, dtype=torch.long, device=device))
+                neg_query_idx.append(torch.tensor(q_list, dtype=torch.long, device=device))
 
-        zero = energy.sum() * 0.0
         loss_pos = zero
         loss_neg = zero
 
-        # 正样本: 压低 energy
         if len(pos_batch_idx) > 0:
             pos_b = torch.cat(pos_batch_idx)
             pos_q = torch.cat(pos_query_idx)
             pos_w = torch.cat(pos_weight_list)
             pos_energy = energy[pos_b, pos_q]
-
-            # 直接最小化 energy，软权重用于 VLM 蒸馏
             loss_pos = (pos_w * pos_energy).sum() / (pos_w.sum() + 1e-6)
 
-        # 负样本: 用 hinge 把 energy 推高到 margin 以上
         if len(neg_batch_idx) > 0:
             neg_b = torch.cat(neg_batch_idx)
             neg_q = torch.cat(neg_query_idx)
             neg_energy = energy[neg_b, neg_q]
-
             neg_margin = getattr(self.args, 'obj_neg_margin', 1.0)
             loss_neg = F.relu(neg_margin - neg_energy).mean()
 
-        loss_obj = (loss_pos + loss_neg)
+        loss_obj = loss_pos + loss_neg
         return {'loss_obj': loss_obj}    
     
     
@@ -499,14 +527,29 @@ class SetCriterion(nn.Module):
         stats = {
             'num_dummy_pos': 0.0,
             'num_dummy_neg': 0.0,
+            'num_valid_unmatched': 0.0,
+            'num_pos_candidates': 0.0,
+            'num_neg_candidates': 0.0,
+
             'pos_energy_sum': 0.0,
             'neg_energy_sum': 0.0,
             'matched_energy_sum': 0.0,
+
+            'dummy_pos_known_max_sum': 0.0,
+            'dummy_neg_known_max_sum': 0.0,
+            'dummy_pos_iou_sum': 0.0,
+            'dummy_neg_iou_sum': 0.0,
+
             'pos_thresh_sum': 0.0,
             'neg_thresh_sum': 0.0,
+
             'num_pos_energy': 0,
             'num_neg_energy': 0,
             'num_matched_energy': 0,
+            'num_dummy_pos_known': 0,
+            'num_dummy_neg_known': 0,
+            'num_dummy_pos_iou': 0,
+            'num_dummy_neg_iou': 0,
             'num_thresh': 0,
         }
         # 在每张图上把 matched / dummy_pos / dummy_neg / threshold 都累计进 stats
@@ -514,11 +557,20 @@ class SetCriterion(nn.Module):
             obj_scores = outputs['pred_obj']   # [B, Q], energy，越小越像物体
             num_queries = obj_scores.shape[1]
 
+            max_pos_per_img = getattr(self.args, 'unk_pos_per_img', 1)
+            max_neg_per_img = getattr(self.args, 'unk_neg_per_img', 2)
+            known_reject_thresh = getattr(self.args, 'unk_cls_reject_thresh', 0.25)
+            pos_quantile = getattr(self.args, 'unk_label_pos_quantile', 0.5)
+
+            pred_probs = outputs['pred_logits'].detach().sigmoid().clone()
+            pred_probs[:, :, self.invalid_cls_logits] = 0.0
+
             for i, (src_idx, _) in enumerate(indices):
                 matched_scores = obj_scores[i, src_idx]
 
                 if len(matched_scores) > 0:
-                    pos_thresh = matched_scores.mean().item() * self.unk_label_obj_score_thresh
+                    base_thresh = torch.quantile(matched_scores.detach(), pos_quantile).item()
+                    pos_thresh = base_thresh * self.unk_label_obj_score_thresh
                     stats['matched_energy_sum'] += matched_scores.sum().item()
                     stats['num_matched_energy'] += matched_scores.numel()
                 else:
@@ -547,19 +599,43 @@ class SetCriterion(nn.Module):
                     ious = box_ops.box_iou(box_xyxy_all[unmatched], gt_boxes_xyxy)[0]
                     max_ious = ious.max(dim=1)[0]
                     valid_unmatched = [unmatched[j] for j, max_iou in enumerate(max_ious) if max_iou < 0.3]
+                    unmatched_iou_map = {unmatched[j]: max_ious[j].item() for j in range(len(unmatched))}
                 else:
                     valid_unmatched = unmatched
+                    unmatched_iou_map = {q: 0.0 for q in unmatched}
 
-                # energy越小越像物体 -> 伪正
-                pos_candidates = [q for q in valid_unmatched if obj_scores[i, q].item() < pos_thresh]
+                stats['num_valid_unmatched'] += len(valid_unmatched)
+
+                if len(valid_unmatched) == 0:
+                    dummy_pos_indices.append([])
+                    dummy_neg_indices.append([])
+                    dummy_vlm_weights.append([])
+                    continue
+
+                cur_known_prob = pred_probs[i, :, :self.num_classes - 1]
+                known_max = cur_known_prob.max(dim=-1)[0]
+
+                pos_candidates = [
+                    q for q in valid_unmatched
+                    if obj_scores[i, q].item() < pos_thresh
+                    and known_max[q].item() < known_reject_thresh
+                ]
+                neg_candidates = [
+                    q for q in valid_unmatched
+                    if obj_scores[i, q].item() > neg_thresh
+                    and known_max[q].item() < known_reject_thresh
+                ]
+
+                stats['num_pos_candidates'] += len(pos_candidates)
+                stats['num_neg_candidates'] += len(neg_candidates)
+
                 pos_candidates_sorted = sorted(pos_candidates, key=lambda q: obj_scores[i, q].item())
-                dummy_pos = pos_candidates_sorted[:1]
-                dummy_pos_indices.append(dummy_pos)
-
-                # energy越大越不像物体 -> 伪负
-                neg_candidates = [q for q in valid_unmatched if obj_scores[i, q].item() > neg_thresh]
                 neg_candidates_sorted = sorted(neg_candidates, key=lambda q: obj_scores[i, q].item(), reverse=True)
-                dummy_neg = neg_candidates_sorted[:2]
+
+                dummy_pos = pos_candidates_sorted[:max_pos_per_img]
+                dummy_neg = neg_candidates_sorted[:max_neg_per_img]
+
+                dummy_pos_indices.append(dummy_pos)
                 dummy_neg_indices.append(dummy_neg)
 
                 stats['num_dummy_pos'] += len(dummy_pos)
@@ -570,10 +646,26 @@ class SetCriterion(nn.Module):
                     stats['pos_energy_sum'] += pos_energy_vals.sum().item()
                     stats['num_pos_energy'] += pos_energy_vals.numel()
 
+                    pos_known_vals = known_max[dummy_pos]
+                    stats['dummy_pos_known_max_sum'] += pos_known_vals.sum().item()
+                    stats['num_dummy_pos_known'] += pos_known_vals.numel()
+
+                    pos_iou_vals = [unmatched_iou_map[q] for q in dummy_pos]
+                    stats['dummy_pos_iou_sum'] += sum(pos_iou_vals)
+                    stats['num_dummy_pos_iou'] += len(pos_iou_vals)
+
                 if len(dummy_neg) > 0:
                     neg_energy_vals = obj_scores[i, dummy_neg]
                     stats['neg_energy_sum'] += neg_energy_vals.sum().item()
                     stats['num_neg_energy'] += neg_energy_vals.numel()
+
+                    neg_known_vals = known_max[dummy_neg]
+                    stats['dummy_neg_known_max_sum'] += neg_known_vals.sum().item()
+                    stats['num_dummy_neg_known'] += neg_known_vals.numel()
+
+                    neg_iou_vals = [unmatched_iou_map[q] for q in dummy_neg]
+                    stats['dummy_neg_iou_sum'] += sum(neg_iou_vals)
+                    stats['num_dummy_neg_iou'] += len(neg_iou_vals)
 
                 if self.use_vlm_distill and len(dummy_pos) > 0 and has_clip and samples is not None:
                     box_cxcywh = outputs['pred_boxes'][i, dummy_pos]
@@ -604,7 +696,8 @@ class SetCriterion(nn.Module):
             kwargs = {
                 'dummy_pos_indices': dummy_pos_indices,
                 'dummy_neg_indices': dummy_neg_indices,
-                'dummy_vlm_weights': dummy_vlm_weights
+                'dummy_vlm_weights': dummy_vlm_weights,
+                'epoch': epoch,
             }
             losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes, **kwargs))
 
@@ -623,6 +716,7 @@ class SetCriterion(nn.Module):
                         'dummy_pos_indices': None,
                         'dummy_neg_indices': None,
                         'dummy_vlm_weights': None,
+                        'epoch': epoch,
                     }
 
                     l_dict = self.get_loss(loss, aux_outputs, targets, aux_indices, num_boxes, **aux_kwargs)
@@ -645,6 +739,9 @@ class SetCriterion(nn.Module):
 
         stat_num_dummy_pos = torch.tensor(stats['num_dummy_pos'], dtype=torch.float32, device=device)
         stat_num_dummy_neg = torch.tensor(stats['num_dummy_neg'], dtype=torch.float32, device=device)
+        stat_num_valid_unmatched = torch.tensor(stats['num_valid_unmatched'], dtype=torch.float32, device=device)
+        stat_num_pos_candidates = torch.tensor(stats['num_pos_candidates'], dtype=torch.float32, device=device)
+        stat_num_neg_candidates = torch.tensor(stats['num_neg_candidates'], dtype=torch.float32, device=device)
 
         stat_pos_energy_mean = torch.tensor(
             stats['pos_energy_sum'] / max(stats['num_pos_energy'], 1),
@@ -658,6 +755,24 @@ class SetCriterion(nn.Module):
             stats['matched_energy_sum'] / max(stats['num_matched_energy'], 1),
             dtype=torch.float32, device=device
         )
+
+        stat_dummy_pos_known_max_mean = torch.tensor(
+            stats['dummy_pos_known_max_sum'] / max(stats['num_dummy_pos_known'], 1),
+            dtype=torch.float32, device=device
+        )
+        stat_dummy_neg_known_max_mean = torch.tensor(
+            stats['dummy_neg_known_max_sum'] / max(stats['num_dummy_neg_known'], 1),
+            dtype=torch.float32, device=device
+        )
+        stat_dummy_pos_iou_mean = torch.tensor(
+            stats['dummy_pos_iou_sum'] / max(stats['num_dummy_pos_iou'], 1),
+            dtype=torch.float32, device=device
+        )
+        stat_dummy_neg_iou_mean = torch.tensor(
+            stats['dummy_neg_iou_sum'] / max(stats['num_dummy_neg_iou'], 1),
+            dtype=torch.float32, device=device
+        )
+
         stat_pos_thresh_mean = torch.tensor(
             stats['pos_thresh_sum'] / max(stats['num_thresh'], 1),
             dtype=torch.float32, device=device
@@ -670,9 +785,19 @@ class SetCriterion(nn.Module):
         losses.update({
             'stat_num_dummy_pos': stat_num_dummy_pos,
             'stat_num_dummy_neg': stat_num_dummy_neg,
+            'stat_num_valid_unmatched': stat_num_valid_unmatched,
+            'stat_num_pos_candidates': stat_num_pos_candidates,
+            'stat_num_neg_candidates': stat_num_neg_candidates,
+
             'stat_pos_energy_mean': stat_pos_energy_mean,
             'stat_neg_energy_mean': stat_neg_energy_mean,
             'stat_matched_energy_mean': stat_matched_energy_mean,
+
+            'stat_dummy_pos_known_max_mean': stat_dummy_pos_known_max_mean,
+            'stat_dummy_neg_known_max_mean': stat_dummy_neg_known_max_mean,
+            'stat_dummy_pos_iou_mean': stat_dummy_pos_iou_mean,
+            'stat_dummy_neg_iou_mean': stat_dummy_neg_iou_mean,
+
             'stat_pos_thresh_mean': stat_pos_thresh_mean,
             'stat_neg_thresh_mean': stat_neg_thresh_mean,
         })

@@ -29,17 +29,9 @@ COMMON_T1_ARGS="\
     --exemplar_replay_max_length 850"
 
 CONFIGS=(
-    "A0_Baseline_PROB|ABLT_A0_BASE|--model_type prob"
+    "B1_Innov2_NoUnkHead|ABLT_B1_I2_NOHEAD|--model_type innov_2 --enable_unk_label_obj --use_valid_mask --etop --tdqi --use_feature_align --align_loss_coef 2.0 --use_vlm_distill --unk_loss_coef 0.0"
 
-    "A1_Innov1_MiningOnly|ABLT_A1_MINING|--model_type innov_1 --enable_unk_label_obj"
-
-    "A2_Innov1_Mining_ValidMask|ABLT_A2_VALIDMASK|--model_type innov_1 --enable_unk_label_obj --use_valid_mask"
-
-    "A3_Innov1_Mining_ValidMask_ETOP|ABLT_A3_ETOP|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --etop"
-
-    "A4_Innov1_FullCore|ABLT_A4_FULLCORE|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --etop --tdqi"
-
-    "A5_Innov1_Full|ABLT_A5_FULL|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --etop --tdqi --use_feature_align --align_loss_coef 2.0 --use_vlm_distill"
+    "B2_Innov2_Full|ABLT_B2_I2_FULL|--model_type innov_2 --enable_unk_label_obj --use_valid_mask --etop --tdqi --use_feature_align --align_loss_coef 2.0 --use_vlm_distill --enable_unk_head --unk_loss_coef 1.0 --unk_pos_per_img 1 --unk_neg_per_img 2 --unk_cls_reject_thresh 0.25 --postproc_known_thresh 0.05 --postproc_unknown_thresh 0.05"
 )
 
 for CONFIG in "${CONFIGS[@]}"; do
@@ -69,4 +61,4 @@ for CONFIG in "${CONFIGS[@]}"; do
     echo "----------------------------------------------------------"
 done
 
-echo "All Innov1 T1 ablation experiments completed."
+echo "All Innov2 T1 ablation experiments completed."

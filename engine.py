@@ -97,7 +97,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                         criterion=criterion,
                         epoch=epoch,
                         global_step=global_step,
-                        max_images=2,
+                        max_images=4,
                         prefix='train_vis'
                     )
                 except Exception as e:
@@ -107,9 +107,19 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             stat_keys = [
                 'stat_num_dummy_pos',
                 'stat_num_dummy_neg',
+                'stat_num_valid_unmatched',
+                'stat_num_pos_candidates',
+                'stat_num_neg_candidates',
+
                 'stat_pos_energy_mean',
                 'stat_neg_energy_mean',
                 'stat_matched_energy_mean',
+
+                'stat_dummy_pos_known_max_mean',
+                'stat_dummy_neg_known_max_mean',
+                'stat_dummy_pos_iou_mean',
+                'stat_dummy_neg_iou_mean',
+
                 'stat_pos_thresh_mean',
                 'stat_neg_thresh_mean',
             ]
