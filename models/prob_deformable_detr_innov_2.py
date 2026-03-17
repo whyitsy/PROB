@@ -78,7 +78,7 @@ class DeformableDETR(nn.Module):
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.prob_obj_head = ProbObjectnessHead(hidden_dim)
         self.unk_head = MLP(hidden_dim, hidden_dim, 1, 2) # 未知物体分类头, 只优化未知物体与背景, 不优化已知类.
-        self.enable_unk_head = getattr(args, 'enable_unk_head', True)
+        self.enable_unk_head = getattr(args, 'enable_unk_head', False)
         if self.enable_unk_head:
             self.unk_head = MLP(hidden_dim, hidden_dim, 1, 2)
         else:
@@ -295,7 +295,7 @@ class SetCriterion(nn.Module):
         self.use_feature_align = getattr(args, 'use_feature_align', False)
         self.use_vlm_distill = getattr(args, 'use_vlm_distill', False)
         self.args = args
-        self.enable_unk_head = getattr(args, 'enable_unk_head', True)
+        self.enable_unk_head = getattr(args, 'enable_unk_head', False)
         self.unk_cls_reject_thresh = getattr(args, 'unk_cls_reject_thresh', 0.25)
         self.unk_pos_per_img = getattr(args, 'unk_pos_per_img', 1)
         self.unk_neg_per_img = getattr(args, 'unk_neg_per_img', 2)
@@ -997,7 +997,7 @@ class SetCriterion(nn.Module):
 
 class PostProcess(nn.Module):
     def __init__(self, invalid_cls_logits, num_classes, temperature=1, pred_per_im=100,
-                 known_thresh=0.05, unknown_thresh=0.05, unk_temp=1.0, enable_unk_head=True):
+                 known_thresh=0.05, unknown_thresh=0.05, unk_temp=1.0, enable_unk_head=False):
         super().__init__()
         self.temperature = temperature
         self.invalid_cls_logits = invalid_cls_logits
