@@ -77,7 +77,6 @@ class DeformableDETR(nn.Module):
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.prob_obj_head = ProbObjectnessHead(hidden_dim)
-        self.unk_head = MLP(hidden_dim, hidden_dim, 1, 2) # 未知物体分类头, 只优化未知物体与背景, 不优化已知类.
         self.enable_unk_head = getattr(args, 'enable_unk_head', False)
         if self.enable_unk_head:
             self.unk_head = MLP(hidden_dim, hidden_dim, 1, 2)
@@ -196,7 +195,7 @@ class DeformableDETR(nn.Module):
         outputs_coords = []
         outputs_objectnesses = []
         outputs_projs = []
-        outputs_unknownnesses = []
+        outputs_unknownnesses = [] if self.enable_unk_head else None
 
         for lvl in range(hs.shape[0]):
             if lvl == 0:
@@ -221,9 +220,11 @@ class DeformableDETR(nn.Module):
                 outputs_projs.append(outputs_proj)
 
             tmp = self.bbox_embed[lvl](hs[lvl])
+            
             if self.enable_unk_head:
                 outputs_unknownness = self.unk_head[lvl](hs[lvl]).squeeze(-1)
                 outputs_unknownnesses.append(outputs_unknownness)
+                
             if reference.shape[-1] == 4:
                 tmp += reference
             else:
@@ -249,9 +250,10 @@ class DeformableDETR(nn.Module):
             'pred_obj': outputs_objectness[obj_layer], 
             'samples': samples
         }
+        
+        outputs_unknownness = None
         if self.enable_unk_head:
             outputs_unknownness = torch.stack(outputs_unknownnesses)
-            unk_layer = obj_layer
             out['pred_unk'] = outputs_unknownness[unk_layer]
                
         if self.use_feature_align:
@@ -259,21 +261,50 @@ class DeformableDETR(nn.Module):
             out['pred_proj'] = outputs_proj[-1]
         
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_objectness, outputs_projs if self.use_feature_align else None, outputs_unknownness)
-
+            out['aux_outputs'] = self._set_aux_loss(
+                outputs_class,
+                outputs_coord,
+                outputs_objectness,
+                outputs_projs if self.use_feature_align else None,
+                outputs_unknownness
+            )
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
             out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord, objectness, outputs_proj, unknownness):
-        if outputs_proj is not None:
-            return [{'pred_logits': a, 'pred_obj': b, 'pred_boxes': c, 'pred_proj': d, 'pred_unk': e}
-                    for a, b, c, d, e in zip(outputs_class[:-1], objectness[:-1], outputs_coord[:-1], outputs_proj[:-1], unknownness[:-1])]
+    def _set_aux_loss(self, outputs_class, outputs_coord, objectness, outputs_proj, unknownness=None):
+        if unknownness is not None:
+            if outputs_proj is not None:
+                return [
+                    {'pred_logits': a, 'pred_obj': b, 'pred_boxes': c, 'pred_proj': d, 'pred_unk': e}
+                    for a, b, c, d, e in zip(
+                        outputs_class[:-1], objectness[:-1], outputs_coord[:-1], outputs_proj[:-1], unknownness[:-1]
+                    )
+                ]
+            else:
+                return [
+                    {'pred_logits': a, 'pred_obj': b, 'pred_boxes': c, 'pred_unk': d}
+                    for a, b, c, d in zip(
+                        outputs_class[:-1], objectness[:-1], outputs_coord[:-1], unknownness[:-1]
+                    )
+                ]
         else:
-            return [{'pred_logits': a, 'pred_obj': b, 'pred_boxes': c, 'pred_unk': d}
-                    for a, b, c, d in zip(outputs_class[:-1], objectness[:-1], outputs_coord[:-1], unknownness[:-1])]
+            if outputs_proj is not None:
+                return [
+                    {'pred_logits': a, 'pred_obj': b, 'pred_boxes': c, 'pred_proj': d}
+                    for a, b, c, d in zip(
+                        outputs_class[:-1], objectness[:-1], outputs_coord[:-1], outputs_proj[:-1]
+                    )
+                ]
+            else:
+                return [
+                    {'pred_logits': a, 'pred_obj': b, 'pred_boxes': c}
+                    for a, b, c in zip(
+                        outputs_class[:-1], objectness[:-1], outputs_coord[:-1]
+                    )
+                ]
 
 class SetCriterion(nn.Module):
     def __init__(self, args, num_classes, matcher, weight_dict, losses, invalid_cls_logits, hidden_dim, focal_alpha=0.25, empty_weight=0.1):
@@ -467,7 +498,6 @@ class SetCriterion(nn.Module):
       
     
     def loss_unknownness(self, outputs, targets, indices, num_boxes, dummy_pos_indices=None, dummy_neg_indices=None, dummy_vlm_weights=None, epoch=0, **kwargs):
-        
         if (not getattr(self, 'enable_unk_head', True)) or ('pred_unk' not in outputs):
             zero = outputs['pred_logits'].sum() * 0.0
             return {'loss_unk': zero}
@@ -477,10 +507,6 @@ class SetCriterion(nn.Module):
         dtype = unk_logits.dtype
         zero = unk_logits.sum() * 0.0
 
-        # ---------------------------------
-        # warmup: 先只用 dummy_neg，延迟引入 dummy_pos
-        # 与 loss_obj_likelihood 的节奏对齐
-        # ---------------------------------
         use_dummy_pos_loss = (
             epoch >= self.unk_label_start_epoch + getattr(self.args, 'unk_label_obj_warmup_epochs', 0)
         )
@@ -492,6 +518,18 @@ class SetCriterion(nn.Module):
 
         num_pos = 0
         num_neg = 0
+        num_known_neg = 0
+
+        # 0) matched known -> target = 0
+        # 这是“显式三分支解耦”最关键的补充
+        if indices is not None:
+            src_idx = self._get_src_permutation_idx(indices)
+            if len(src_idx[0]) > 0:
+                sel_batch.append(src_idx[0].to(device))
+                sel_query.append(src_idx[1].to(device))
+                sel_target.append(torch.zeros_like(src_idx[0], dtype=dtype, device=device))
+                sel_weight.append(torch.ones_like(src_idx[0], dtype=dtype, device=device))
+                num_known_neg += len(src_idx[0])
 
         # 1) dummy_pos -> target = 1
         if use_dummy_pos_loss and dummy_pos_indices is not None:
@@ -510,9 +548,7 @@ class SetCriterion(nn.Module):
                     and len(dummy_vlm_weights) > b_idx
                     and len(dummy_vlm_weights[b_idx]) == len(q_list)
                 ):
-                    # VLM soft weight: 越像 unknown，权重越高
                     w = torch.tensor(dummy_vlm_weights[b_idx], dtype=dtype, device=device)
-                    # 建议给一个下界，避免权重过小导致几乎不学习
                     w = torch.clamp(w, min=0.2, max=1.0)
                 else:
                     w = torch.ones(len(q_list), dtype=dtype, device=device)
@@ -530,10 +566,7 @@ class SetCriterion(nn.Module):
                 sel_batch.append(torch.full((len(q_list),), b_idx, dtype=torch.long, device=device))
                 sel_query.append(q_tensor)
                 sel_target.append(torch.zeros(len(q_list), dtype=dtype, device=device))
-
-                # 负样本统一权重 1
-                w = torch.ones(len(q_list), dtype=dtype, device=device)
-                sel_weight.append(w)
+                sel_weight.append(torch.ones(len(q_list), dtype=dtype, device=device))
                 num_neg += len(q_list)
 
         if len(sel_batch) == 0:
@@ -546,12 +579,10 @@ class SetCriterion(nn.Module):
 
         sel_logits = unk_logits[sel_b, sel_q]
 
-        # ---------------------------------
-        # 正负样本不平衡修正
-        # pos_weight > 1 时，提升正样本梯度
-        # ---------------------------------
-        if num_pos > 0 and num_neg > 0:
-            pos_weight_value = float(num_neg) / float(max(num_pos, 1))
+        # 正负不平衡修正：负样本包含 dummy_neg + matched_known
+        total_neg = num_neg + num_known_neg
+        if num_pos > 0 and total_neg > 0:
+            pos_weight_value = float(total_neg) / float(max(num_pos, 1))
             pos_weight_value = max(1.0, min(pos_weight_value, 5.0))
         else:
             pos_weight_value = 1.0
@@ -569,8 +600,11 @@ class SetCriterion(nn.Module):
             'loss_unk': loss_unk,
             'stat_unk_num_pos': torch.tensor(float(num_pos), dtype=torch.float32, device=device),
             'stat_unk_num_neg': torch.tensor(float(num_neg), dtype=torch.float32, device=device),
+            'stat_unk_num_known_neg': torch.tensor(float(num_known_neg), dtype=torch.float32, device=device),
             'stat_unk_pos_weight': torch.tensor(float(pos_weight_value), dtype=torch.float32, device=device),
         }
+        
+        
     def _get_src_permutation_idx(self, indices):
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
@@ -650,16 +684,29 @@ class SetCriterion(nn.Module):
         stats = {
             'num_dummy_pos': 0.0,
             'num_dummy_neg': 0.0,
+            'num_valid_unmatched': 0.0,
+            'num_pos_candidates': 0.0,
+            'num_neg_candidates': 0.0,
+
             'pos_energy_sum': 0.0,
             'neg_energy_sum': 0.0,
             'matched_energy_sum': 0.0,
+
+            'dummy_pos_known_max_sum': 0.0,
+            'dummy_neg_known_max_sum': 0.0,
+            'dummy_pos_iou_sum': 0.0,
+            'dummy_neg_iou_sum': 0.0,
+
             'pos_thresh_sum': 0.0,
             'neg_thresh_sum': 0.0,
-            'pos_knownprob_sum': 0.0,
+
             'num_pos_energy': 0,
             'num_neg_energy': 0,
             'num_matched_energy': 0,
-            'num_pos_knownprob': 0,
+            'num_dummy_pos_known': 0,
+            'num_dummy_neg_known': 0,
+            'num_dummy_pos_iou': 0,
+            'num_dummy_neg_iou': 0,
             'num_thresh': 0,
         }
 
@@ -1199,13 +1246,6 @@ def build(args):
         'loss_obj': args.obj_loss_coef,
     }
 
-    if args.aux_loss:
-        aux_weight_dict = {}
-        for i in range(args.dec_layers - 1):
-            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
-        aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
-        weight_dict.update(aux_weight_dict)
-
     losses = ['labels', 'boxes', 'cardinality', 'obj_likelihood']
     
     if getattr(args, 'use_feature_align', False):
@@ -1215,6 +1255,14 @@ def build(args):
     if getattr(args, 'enable_unk_head', True):
         weight_dict['loss_unk'] = args.unk_loss_coef
         losses.append('unknownness')
+        
+    if args.aux_loss:
+        aux_weight_dict = {}
+        for i in range(args.dec_layers - 1):
+            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
+        aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
+        weight_dict.update(aux_weight_dict)
+
 
     criterion = SetCriterion(args, num_classes, matcher, weight_dict, losses, invalid_cls_logits, args.hidden_dim, focal_alpha=args.focal_alpha)
     criterion.to(device)

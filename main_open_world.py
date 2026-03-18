@@ -199,7 +199,7 @@ def get_args_parser():
     ## 任务解耦查询初始化 (TDQI, Task-Decoupled Query Initialization)
     parser.add_argument('--tdqi', default=False, action='store_true', help='使用任务解耦查询初始化')
     parser.add_argument('--tdqi_query_num', default=20, type=int, help='负责已知目标的查询数量, 默认值参考decoupled PROB论文')
-    ## CLIP多模态
+    ## CLIP多模态信号
     parser.add_argument('--use_feature_align', default=False, action='store_true', help='使用CLIP特征对齐')
     parser.add_argument('--use_vlm_distill', default=False, action='store_true', help='使用基于视觉语言模型的蒸馏')
     parser.add_argument('--vlm_tau', default=0.1, type=float, help='多模态置信度（$\omega$）计算时的温度系数（Temperature）。')

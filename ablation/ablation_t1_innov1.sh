@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-echo "Starting T1 ablation study for Innov1 and Innov2"
+echo "Starting T1 ablation study for Innov1"
 
 set -x
 set -e
@@ -24,35 +24,32 @@ COMMON_T1_ARGS="\
     --obj_temp 1.3 \
     --lr 2e-4 \
     --lr_drop 35 \
-    --batch_size 2 \
+    --batch_size 5 \
     --exemplar_replay_selection \
     --exemplar_replay_max_length 850"
 
 CONFIGS=(
-    "A0_Baseline_PROB|ABLT_A0_BASE|--model_type prob"
+    "A1_Innov1|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --use_feature_align --align_loss_coef 2.0 --use_vlm_distill"
+    
+    "A0_Baseline_PROB|--model_type prob"
 
-    "A1_Innov1_MiningOnly|ABLT_A1_MINING|--model_type innov_1 --enable_unk_label_obj"
+    "A2_Innov1_MiningOnly|--model_type innov_1 --enable_unk_label_obj"
 
-    "A2_Innov1_Mining_ValidMask|ABLT_A2_VALIDMASK|--model_type innov_1 --enable_unk_label_obj --use_valid_mask"
+    "A3_Innov1_Mining_ValidMask|--model_type innov_1 --enable_unk_label_obj --use_valid_mask"
 
-    "A3_Innov1_Mining_ValidMask_ETOP|ABLT_A3_ETOP|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --etop"
+    "A3_Innov1_Mining_ValidMask_ETOP|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --etop"
 
-    "A4_Innov1_FullCore|ABLT_A4_FULLCORE|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --etop --tdqi"
-
-    "A5_Innov1_Full|ABLT_A5_FULL|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --etop --tdqi --use_feature_align --align_loss_coef 2.0 --use_vlm_distill"
+    "A4_Innov1_enhance|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --use_feature_align --align_loss_coef 2.0 --use_vlm_distill --etop --tdqi"
 )
 
 for CONFIG in "${CONFIGS[@]}"; do
-    EXP_NAME="${CONFIG%%|*}"
-    REST="${CONFIG#*|}"
-    RUN_NAME="${REST%%|*}"
-    EXTRA_ARGS="${REST#*|}"
+    EXP_NAME="${CONFIG%%|*}" # 第一项
+    EXTRA_ARGS="${CONFIG#*|}" # 第二部分
 
     CURRENT_OUT_DIR="${BASE_EXP_DIR}/${EXP_NAME}/t1"
 
     echo "=========================================================="
     echo "Running Ablation: ${EXP_NAME}"
-    echo "Run name: ${RUN_NAME}"
     echo "Args: ${EXTRA_ARGS}"
     echo "Output: ${CURRENT_OUT_DIR}"
     echo "=========================================================="
@@ -60,7 +57,7 @@ for CONFIG in "${CONFIGS[@]}"; do
     python -u main_open_world.py \
         --output_dir "${CURRENT_OUT_DIR}" \
         ${COMMON_T1_ARGS} \
-        --exemplar_replay_dir "${RUN_NAME}" \
+        --exemplar_replay_dir "${EXP_NAME}" \
         --exemplar_replay_cur_file learned_owod_t1_ft.txt \
         ${EXTRA_ARGS} \
         ${PY_ARGS}
