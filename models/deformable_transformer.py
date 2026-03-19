@@ -176,14 +176,35 @@ class DeformableTransformer(nn.Module):
             init_reference_out = reference_points
             pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
             if tdqi:
-                query_embed_init_all, tgt_init_all = torch.split(pos_trans_out, c, dim=2)
-                # 只使用前tdqi_query_num个查询进行任务解耦查询初始化
-                query_embed, tgt = torch.split(query_embed, c, dim=1)
-                query_embed = query_embed.unsqueeze(0).repeat(bs, 1, 1)
-                tgt = tgt.unsqueeze(0).repeat(bs, 1, 1)
-                query_embed[:, :tdqi_query_num, :] = query_embed_init_all[:, :tdqi_query_num, :]
-                tgt[:, :tdqi_query_num, :] = tgt_init_all[:, :tdqi_query_num, :]
+                # proposal-init queries from encoder top-k
+                query_embed_init_all, tgt_init_all = torch.split(pos_trans_out, c, dim=2)   # [bs, Q, c], [bs, Q, c]
+
+                assert query_embed is not None, "TDQI requires learned query_embed, but got None."
+
+                # learned queries
+                learned_query_embed, learned_tgt = torch.split(query_embed, c, dim=1)        # [Q, c], [Q, c]
+                learned_query_embed = learned_query_embed.unsqueeze(0).expand(bs, -1, -1)    # [bs, Q, c]
+                learned_tgt = learned_tgt.unsqueeze(0).expand(bs, -1, -1)                    # [bs, Q, c]
+
+                # 安全截断，避免 query_num 配置越界
+                k = min(tdqi_query_num, learned_query_embed.shape[1], query_embed_init_all.shape[1])
+                
+
+                # 前 k 个 query 用 proposal 初始化，后面的 query 保持 learned
+                if k > 0:
+                    query_embed = torch.cat(
+                        [query_embed_init_all[:, :k, :], learned_query_embed[:, k:, :]],
+                        dim=1
+                    )
+                    tgt = torch.cat(
+                        [tgt_init_all[:, :k, :], learned_tgt[:, k:, :]],
+                        dim=1
+                    )
+                else:
+                    query_embed = learned_query_embed
+                    tgt = learned_tgt
             else:
+                # 标准 two-stage：全部 query 初始化来自 encoder proposals
                 query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
             
         else:

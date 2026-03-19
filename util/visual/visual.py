@@ -3,6 +3,7 @@ import util.misc as utils
 from util.box_ops import box_cxcywh_to_xyxy, box_iou
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import os
 
 """
 绿色：GT
@@ -226,8 +227,8 @@ def _make_query_label(prefix, q, meta):
 
 
 @torch.no_grad()
-def log_debug_visualizations(writer, samples, targets, outputs, criterion, epoch, global_step,
-                             max_images=2, prefix='train_vis'):
+def log_debug_visualizations(samples, targets, outputs, criterion, epoch, global_step,
+                             max_images=2, prefix='train_vis', output_dir=None):
     """
     画 matched / dummy_pos / dummy_neg / GT 四组框到 TensorBoard
     增强点：
@@ -235,8 +236,9 @@ def log_debug_visualizations(writer, samples, targets, outputs, criterion, epoch
     - 伪标签重建逻辑与当前训练逻辑同步
     - 框上显示 query id / energy / known_max / max_iou
     """
-    if writer is None:
-        return
+    if output_dir is not None:
+        vis_dir = os.path.join(output_dir, 'vis')
+        os.makedirs(vis_dir, exist_ok=True)
 
     indices, dummy_pos_indices, dummy_neg_indices, debug_meta = _build_debug_groups(
         outputs, targets, criterion, epoch
@@ -322,5 +324,7 @@ def log_debug_visualizations(writer, samples, targets, outputs, criterion, epoch
 
         ax.set_title(' | '.join(title_parts), fontsize=10)
 
-        writer.add_figure(f'{prefix}/image_{b}', fig, global_step)
+        if output_dir is not None:
+            save_path = os.path.join(vis_dir, f'{prefix}_step{global_step}_img{b}.png')
+            fig.savefig(save_path, bbox_inches='tight', pad_inches=0.1)
         plt.close(fig)

@@ -14,6 +14,7 @@ import math
 import logging
 import copy
 import clip
+import logging
 
 from util import box_ops
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
@@ -85,7 +86,12 @@ class DeformableDETR(nn.Module):
             self.proj_head = MLP(hidden_dim, hidden_dim, clip_dim, 2) 
 
         self.num_feature_levels = num_feature_levels
-        self.query_embed = nn.Embedding(num_queries, hidden_dim * 2)
+
+        # 只有在单阶段，或者 two-stage + TDQI 时，learned query 才真正会被用到
+        if (not two_stage) or getattr(args, 'tdqi', False):
+            self.query_embed = nn.Embedding(num_queries, hidden_dim * 2)
+        else:
+            self.query_embed = None
         
         if num_feature_levels > 1:
             num_backbone_outs = len(backbone.strides)
@@ -174,7 +180,7 @@ class DeformableDETR(nn.Module):
                 masks.append(mask)
                 pos.append(pos_l)
 
-        query_embeds = self.query_embed.weight
+        query_embeds = None if self.query_embed is None else self.query_embed.weight
         clip_txt = getattr(self.args, 'clip_text_features', None)
         semantic_mask = getattr(self.args, 'semantic_mask', None)
         
@@ -450,6 +456,7 @@ class SetCriterion(nn.Module):
             neg_q = torch.cat(neg_query_idx)
             neg_energy = energy[neg_b, neg_q]
             neg_margin = getattr(self.args, 'obj_neg_margin', 1.0)
+            # margin-based learning / hinge loss 思想：负样本 energy 不只是比正样本大，而是要至少大到某个 margin.
             loss_neg = F.relu(neg_margin - neg_energy).mean()
 
         loss_obj = loss_pos + loss_neg
@@ -505,6 +512,44 @@ class SetCriterion(nn.Module):
             clip_feat = self.args.clip_model.encode_image(crops)
             clip_feat = F.normalize(clip_feat, dim=-1)
         return clip_feat
+    
+    def _is_valid_unknown_geometry(self, box_cxcywh, eps=1e-6):
+        """
+        box_cxcywh: Tensor [4] in normalized coords
+        return: bool
+        """
+        cx, cy, w, h = box_cxcywh.tolist()
+
+        # 基本合法性
+        if w <= 0 or h <= 0:
+            return False
+
+        area = w * h
+        aspect = max(w / (h + eps), h / (w + eps))
+
+        # 是否贴边
+        x1 = cx - 0.5 * w
+        y1 = cy - 0.5 * h
+        x2 = cx + 0.5 * w
+        y2 = cy + 0.5 * h
+        touch_border = (x1 < 0.01) or (y1 < 0.01) or (x2 > 0.99) or (y2 > 0.99)
+
+        # 1) 极小面积过滤
+        min_area = getattr(self.args, 'unk_min_area', 0.0015)
+        if area < min_area:
+            return False
+
+        # 2) 极端长宽比过滤
+        max_aspect = getattr(self.args, 'unk_max_aspect_ratio', 6.0)
+        if aspect > max_aspect:
+            return False
+
+        # 3) 边缘+偏长 联合过滤
+        border_aspect = getattr(self.args, 'unk_border_max_aspect_ratio', 3.5)
+        if touch_border and aspect > border_aspect:
+            return False
+
+        return True
 
     def forward(self, outputs, targets, epoch):
         outputs_without_aux = {k: v for k, v in outputs.items() if k not in ['aux_outputs', 'enc_outputs', 'pred_obj', 'samples', 'pred_proj']}
@@ -603,7 +648,14 @@ class SetCriterion(nn.Module):
                 else:
                     valid_unmatched = unmatched
                     unmatched_iou_map = {q: 0.0 for q in unmatched}
-
+                    
+                geom_valid_pos = []
+                for q in valid_unmatched:
+                    box_q = outputs['pred_boxes'][i, q]   # cxcywh normalized
+                    if self._is_valid_unknown_geometry(box_q):
+                        geom_valid_pos.append(q)
+                        
+                valid_unmatched = geom_valid_pos
                 stats['num_valid_unmatched'] += len(valid_unmatched)
 
                 if len(valid_unmatched) == 0:
@@ -615,11 +667,14 @@ class SetCriterion(nn.Module):
                 cur_known_prob = pred_probs[i, :, :self.num_classes - 1]
                 known_max = cur_known_prob.max(dim=-1)[0]
 
+                
+                        
                 pos_candidates = [
-                    q for q in valid_unmatched
+                    q for q in geom_valid_pos
                     if obj_scores[i, q].item() < pos_thresh
                     and known_max[q].item() < known_reject_thresh
                 ]
+                
                 neg_candidates = [
                     q for q in valid_unmatched
                     if obj_scores[i, q].item() > neg_thresh
@@ -629,7 +684,15 @@ class SetCriterion(nn.Module):
                 stats['num_pos_candidates'] += len(pos_candidates)
                 stats['num_neg_candidates'] += len(neg_candidates)
 
-                pos_candidates_sorted = sorted(pos_candidates, key=lambda q: obj_scores[i, q].item())
+                pos_candidates_sorted = sorted(
+                    pos_candidates,
+                    key=lambda q: (
+                        obj_scores[i, q].item(),         # energy 越低越优先
+                        known_max[q].item(),             # 越不像已知越优先
+                        unmatched_iou_map[q],            # 越远离 GT 越优先
+                    )
+                )
+                
                 neg_candidates_sorted = sorted(neg_candidates, key=lambda q: obj_scores[i, q].item(), reverse=True)
 
                 dummy_pos = pos_candidates_sorted[:max_pos_per_img]
@@ -804,35 +867,95 @@ class SetCriterion(nn.Module):
         return losses
     
 class PostProcess(nn.Module):
-    def __init__(self, invalid_cls_logits, temperature=1, pred_per_im=100):
+    def __init__(
+        self,
+        invalid_cls_logits,
+        num_classes,
+        temperature=1.0,
+        pred_per_im=100,
+        known_thresh=0.05,
+        unknown_thresh=0.05,
+        enable_unknown_output=True,
+    ):
         super().__init__()
-        self.temperature=temperature
-        self.invalid_cls_logits=invalid_cls_logits
-        self.pred_per_im=pred_per_im
+        self.temperature = temperature
+        self.invalid_cls_logits = invalid_cls_logits
+        self.num_classes = num_classes
+        self.pred_per_im = pred_per_im
+        self.known_thresh = known_thresh
+        self.unknown_thresh = unknown_thresh
+        self.enable_unknown_output = enable_unknown_output
 
     @torch.no_grad()
-    def forward(self, outputs, target_sizes):      
-        out_logits, pred_obj, out_bbox = outputs['pred_logits'], outputs['pred_obj'], outputs['pred_boxes']
-        out_logits[:,:, self.invalid_cls_logits] = -10e10
+    def forward(self, outputs, target_sizes):
+        out_logits = outputs['pred_logits'].clone()
+        pred_obj = outputs['pred_obj']
+        out_bbox = outputs['pred_boxes']
+
+        out_logits[:, :, self.invalid_cls_logits] = -10e10
 
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
 
-        obj_prob = torch.exp(-self.temperature*pred_obj).unsqueeze(-1)
-        prob = obj_prob*out_logits.sigmoid()
+        # [B, Q]
+        obj_prob = torch.exp(-self.temperature * pred_obj)
 
-        topk_values, topk_indexes = torch.topk(prob.view(out_logits.shape[0], -1), self.pred_per_im, dim=1)
-        scores = topk_values
-        
-        topk_boxes = topk_indexes // out_logits.shape[2]
-        labels = topk_indexes % out_logits.shape[2]
+        # 只看 known classes，不包含最后一个 unknown 类
+        cls_prob_all = out_logits.sigmoid()
+        known_prob = cls_prob_all[:, :, :self.num_classes - 1]
+        max_known_scores, known_labels = known_prob.max(dim=-1)   # [B, Q], [B, Q]
+
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
-        boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1,1,4))
-        
-        img_h, img_w = target_sizes.unbind(1)
-        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
-        boxes = boxes * scale_fct[:, None, :]
-        results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
+        results = []
+
+        unknown_label = self.num_classes - 1
+
+        for b in range(out_logits.shape[0]):
+            score_known = obj_prob[b] * max_known_scores[b]
+
+            if self.enable_unknown_output:
+                score_unknown = obj_prob[b] * (1.0 - max_known_scores[b])
+
+                # 每个 query 只保留 known / unknown 更强的一路
+                choose_unknown = score_unknown > score_known
+
+                final_scores = torch.where(choose_unknown, score_unknown, score_known)
+                final_labels = torch.where(
+                    choose_unknown,
+                    torch.full_like(known_labels[b], unknown_label),
+                    known_labels[b]
+                )
+
+                keep = torch.where(
+                    choose_unknown,
+                    score_unknown > self.unknown_thresh,
+                    score_known > self.known_thresh
+                )
+            else:
+                final_scores = score_known
+                final_labels = known_labels[b]
+                keep = score_known > self.known_thresh
+
+            final_scores = final_scores[keep]
+            final_labels = final_labels[keep]
+            final_boxes = boxes[b][keep]
+
+            if final_scores.numel() > self.pred_per_im:
+                topk_scores, topk_idx = torch.topk(final_scores, self.pred_per_im)
+                final_scores = topk_scores
+                final_labels = final_labels[topk_idx]
+                final_boxes = final_boxes[topk_idx]
+
+            img_h, img_w = target_sizes[b]
+            scale_fct = torch.tensor([img_w, img_h, img_w, img_h], device=final_boxes.device)
+            final_boxes = final_boxes * scale_fct
+
+            results.append({
+                'scores': final_scores,
+                'labels': final_labels,
+                'boxes': final_boxes
+            })
+
         return results
 
 class MLP(nn.Module):
@@ -855,7 +978,7 @@ class ExemplarSelection(nn.Module):
         self.num_seen_classes = args.PREV_INTRODUCED_CLS + args.CUR_INTRODUCED_CLS
         self.invalid_cls_logits=invalid_cls_logits
         self.temperature=temperature
-        print(f'running with exemplar_replay_selection')   
+        logging.info('running with exemplar_replay_selection')
               
     def calc_energy_per_image(self, outputs, targets, indices):
         out_logits, pred_obj = outputs['pred_logits'], outputs['pred_obj']
@@ -938,7 +1061,17 @@ def build(args):
 
     criterion = SetCriterion(args, num_classes, matcher, weight_dict, losses, invalid_cls_logits, args.hidden_dim, focal_alpha=args.focal_alpha)
     criterion.to(device)
-    postprocessors = {'bbox': PostProcess(invalid_cls_logits, temperature=args.obj_temp/args.hidden_dim)}
+    postprocessors = {
+        'bbox': PostProcess(
+            invalid_cls_logits=invalid_cls_logits,
+            num_classes=num_classes,
+            temperature=args.obj_temp / args.hidden_dim,
+            pred_per_im=args.pred_per_im,
+            known_thresh=getattr(args, 'postproc_known_thresh', 0.05),
+            unknown_thresh=getattr(args, 'postproc_unknown_thresh', 0.05),
+            enable_unknown_output=getattr(args, 'enable_unknown_output', True),
+        )
+    }
     exemplar_selection = ExemplarSelection(args, num_classes, matcher, invalid_cls_logits, temperature=args.obj_temp/args.hidden_dim)
     
     return model, criterion, postprocessors, exemplar_selection

@@ -182,17 +182,26 @@ def get_args_parser():
     parser.add_argument('--exemplar_replay_prev_file', default='', type=str, help="path to previous ft file")
     parser.add_argument('--exemplar_replay_cur_file', default='', type=str, help="path to current ft file")
     parser.add_argument('--exemplar_replay_random', default=False, action='store_true', help='make selection random')
+    parser.add_argument('--exemplar_replay_output', default='', type=str,  help='云服务器训练时code只读, 需要将动态生成的exemplar replay txt文件输出到可写路径')
     
     # 基础参数
     parser.add_argument('--enable_unk_label_obj', default=False, action='store_true', help='使用基于物体性分数的自适应伪标签筛选')
     parser.add_argument('--use_valid_mask', default=False, action='store_true', help='使用有效掩码')
     parser.add_argument('--unk_label_obj_score_thresh', default=0.8, type=float, help='自适应筛选阈值, 基于匹配上的query的obj统计量乘以该系数')
-    parser.add_argument('--unk_label_pos_quantile', default=0.5, type=float, help='用 matched energy 的哪个分位数来定义伪正阈值基准')
+    parser.add_argument('--unk_label_pos_quantile', default=0.25, type=float, help='用 matched energy 的哪个分位数来定义伪正阈值基准')
     parser.add_argument('--unk_label_start_epoch', default=2, type=int, help='从哪个epoch开始使用基于物体性分数的自适应伪标签筛选')
     parser.add_argument('--unk_label_obj_warmup_epochs', default=3, type=int, help='启动伪标签后，前多少个epoch只使用 dummy_neg，不使用 dummy_pos 进入 loss_obj')
     parser.add_argument('--obj_neg_margin', default=1.0, type=float, help='energy-based objectness loss中负样本的最小margin')
     parser.add_argument('--default_pos_energy_thresh', default=1.0, type=float, help='无matched query时的默认伪正energy阈值')
-    parser.add_argument('--unk_label_neg_margin', default=0.5, type=float, help='伪负样本阈值 = 伪正阈值 + margin')
+    parser.add_argument('--unk_label_neg_margin', default=0.5, type=float, help='伪负样本阈值 = 伪正阈值 + margin, 半监督/伪标签里的“置信区间分离”或“三段式采样”：低于某阈值当正，高于更高阈值当负，中间灰区不监督。')
+    parser.add_argument('--unk_min_area', default=0.0015, type=float, help='unknown positive 候选的最小归一化面积')
+    parser.add_argument('--unk_max_aspect_ratio', default=6.0, type=float, help='unknown positive 候选的最大长宽比 max(w/h, h/w)')
+    parser.add_argument('--unk_border_max_aspect_ratio', default=3.5, type=float, help='贴边 unknown positive 候选允许的最大长宽比')
+    parser.add_argument('--enable_unknown_output', dest='enable_unknown_output', action='store_true', help='在 innov1 推理阶段显式输出 unknown')
+    parser.add_argument('--disable_unknown_output', dest='enable_unknown_output', action='store_false', help='关闭 innov1 推理阶段的 unknown 输出，用于消融实验')
+    parser.set_defaults(enable_unknown_output=True)
+    parser.add_argument('--postproc_known_thresh', default=0.05, type=float, help='已知类最小分数阈值')
+    parser.add_argument('--postproc_unknown_thresh', default=0.05, type=float, help='unknown 最小分数阈值')
     ## 目标性预测的提前终止 (ETOP, Early Termination of Objectness Prediction)
     parser.add_argument('--etop', default=False, action='store_true', help='启用目标性预测的提前终止')
     parser.add_argument('--etop_layer', default=1, type=int, help='目标性预测的提前终止层')
@@ -208,14 +217,17 @@ def get_args_parser():
     parser.add_argument('--align_loss_coef', default=1.0, type=float, help='对齐损失权重系数')
     parser.add_argument('--pred_per_im', default=100, type=int, help='每张图片预测的框数')
     # innov2的参数. Unknownness branch
-    parser.add_argument('--enable_unk_head', default=False, action='store_true', help='启用独立 unknownness 分支')
+    parser.add_argument('--enable_unk_head', default=False, action='store_true', help='启用 unknownness 分支')
+    parser.add_argument('--train_unk_head', default=False, action='store_true', help='训练时是否使用 unknownness loss')
+    parser.add_argument('--infer_with_unk_head', default=False, action='store_true', help='推理时是否使用 unknownness 分支分数计算方式')
+    parser.add_argument('--unk_loss_use_known_neg', default=False, action='store_true', help='loss_unknownness 中是否使用 matched known 作为负样本')
+    parser.add_argument('--unk_loss_use_dummy_neg', default=False, action='store_true', help='loss_unknownness 中是否使用 dummy negatives')
+    parser.add_argument('--unk_loss_use_dummy_pos', default=False, action='store_true', help='是否使用 dummy positives 作为 unknown 正样本')
     parser.add_argument('--unk_loss_coef', default=1.0, type=float, help='unknownness loss 权重')
-    parser.add_argument('--unk_cls_reject_thresh', default=0.25, type=float, help='unknown候选的已知类置信上限')
+    parser.add_argument('--unk_cls_reject_thresh', default=0.2, type=float, help='来自 OOD 里的“已知类置信拒斥”。也就是：一个样本如果对某个已知类已经很自信，就不该再把它当 unknown 候选')
     parser.add_argument('--unk_pos_per_img', default=1, type=int, help='每张图最多选多少个 unknown 正候选')
     parser.add_argument('--unk_neg_per_img', default=2, type=int, help='每张图最多选多少个 background 负候选')
     parser.add_argument('--unk_temp', default=1.0, type=float, help='postprocess 中 unknownness sigmoid 温度')
-    parser.add_argument('--postproc_known_thresh', default=0.05, type=float, help='后处理已知类最小分数阈值')
-    parser.add_argument('--postproc_unknown_thresh', default=0.05, type=float, help='后处理unknown最小分数阈值')
     
     
     return parser
@@ -257,7 +269,13 @@ def main(args):
     args.class_names = class_names
     model, criterion, postprocessors, exemplar_selection = build_model(args, mode = args.model_type)
     model.to(device)
-
+    
+    print("Debugging - printing parameters:")
+    for i, (name, p) in enumerate(model.named_parameters()):
+        if 360 <= i <= 370:
+            print(i, name, p.shape, p.requires_grad)
+            
+            
     model_without_ddp = model
     logging.info("model_without_ddp: {}".format(model_without_ddp))
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -478,18 +496,16 @@ def main(args):
     return
 
 def get_datasets(args):
-    # print(args.dataset)
     logging.info(f"Dataset: {args.dataset}")
     
-    train_set = args.train_set
-    test_set = args.test_set
-    dataset_train = OWDetection(args, args.data_root, image_set=args.train_set, transforms=make_coco_transforms(args.train_set), dataset = args.dataset)
-    dataset_val = OWDetection(args, args.data_root, image_set=args.test_set, dataset = args.dataset, transforms=make_coco_transforms(args.test_set))
+    if args.exemplar_replay_output and 'ft' in args.train_set:
+        dataset_train = OWDetection(args, args.exemplar_replay_output, image_set=args.train_set, transforms=make_coco_transforms(args.train_set), dataset = args.dataset)
+        dataset_val = OWDetection(args, args.exemplar_replay_output, image_set=args.test_set, dataset = args.dataset, transforms=make_coco_transforms(args.test_set))
+    else:
+        dataset_train = OWDetection(args, args.data_root, image_set=args.train_set, transforms=make_coco_transforms(args.train_set), dataset = args.dataset)
+        dataset_val = OWDetection(args, args.data_root, image_set=args.test_set, dataset = args.dataset, transforms=make_coco_transforms(args.test_set))
 
-    # print(args.train_set)
-    # print(args.test_set)
-    # print(dataset_train)
-    # print(dataset_val)
+
     logging.info(f"Train dataset: {dataset_train}, Test dataset: {dataset_val}")
     logging.info(f"dataset_train: {dataset_train}")
     logging.info(f"dataset_val: {dataset_val}")
@@ -499,7 +515,12 @@ def get_datasets(args):
 
 def create_ft_dataset(args, image_sorted_scores):
     logging.info(f'found a total of {len(image_sorted_scores.keys())} images')
-    tmp_dir=args.data_root +'/ImageSets/'+args.dataset+"/"+args.exemplar_replay_dir+"/"
+    
+    # 云服务器上使用, 提供运行时可写的路径
+    if args.exemplar_replay_output:
+        tmp_dir = args.exemplar_replay_output +'/ImageSets/'+args.dataset+"/"+args.exemplar_replay_dir+"/"
+    else:
+        tmp_dir=args.data_root +'/ImageSets/'+args.dataset+"/"+args.exemplar_replay_dir+"/"
     
 
     class_sorted_scores={}

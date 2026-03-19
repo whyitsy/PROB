@@ -11,6 +11,7 @@
 Train and eval functions used in main.py
 """
 import math
+import logging
 import os
 import sys
 from typing import Iterable
@@ -66,8 +67,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         loss_value = losses_reduced_scaled.item()
  
         if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            print(loss_dict_reduced)
+            logging.error("Loss is %s, stopping training", loss_value)
+            logging.error("Reduced loss dict: %s", loss_dict_reduced)
             sys.exit(1)
  
         optimizer.zero_grad()
@@ -86,11 +87,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             for k, v in loss_dict_reduced_unscaled.items():
                 writer.add_scalar(f'train_unscaled/{k}', v, global_step)
 
-            # 每 200 step 画一次图，避免TensorBoard过大
             if global_step % 200 == 0:
                 try:
                     log_debug_visualizations(
-                        writer=writer,
                         samples=samples,
                         targets=targets,
                         outputs=outputs,
@@ -98,10 +97,16 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                         epoch=epoch,
                         global_step=global_step,
                         max_images=4,
-                        prefix='train_vis'
+                        prefix='train_vis',
+                        output_dir=args.output_dir     
                     )
                 except Exception as e:
-                    print(f'[warn] visualization failed at step {global_step}: {e}')
+                    logging.exception(
+                        'visualization failed at step %s with %s: %r',
+                        global_step,
+                        type(e).__name__,
+                        e,
+                    )
 
             # 重点监控 objectness / 伪标签统计
             stat_keys = [
@@ -169,7 +174,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         samples, targets = prefetcher.next()
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
+    logging.info("Averaged stats: %s", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 ## ORIGINAL FUNCTION
@@ -261,5 +266,5 @@ def get_exemplar_replay(model, exemplar_selection, device, data_loader):
         metric_logger.update(loss=len(image_sorted_scores_reduced.keys()))
         samples, targets = prefetcher.next()
         
-    print(f'found a total of {len(image_sorted_scores_reduced.keys())} images')
+    logging.info('found a total of %s images', len(image_sorted_scores_reduced.keys()))
     return image_sorted_scores_reduced

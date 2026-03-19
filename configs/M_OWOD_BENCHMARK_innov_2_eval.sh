@@ -5,16 +5,15 @@ echo running training of prob-detr, M-OWODB dataset
 set -x
 set -e
 
-EXP_DIR=/mnt/data/kky/output/PROB/exps/MOWODB/INNOV_3/
-PY_ARGS=${@:1}
+EXP_DIR=/mnt/data/kky/output/PROB/exps/MOWODB/ABLATION_STUDY/Exp5_Innov1_FullVSAD_no_etop/t1
 RUN_NAME=INNOV_2
 
 
 python -u main_open_world.py \
     --output_dir "${EXP_DIR}/eval" --dataset TOWOD --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 20\
     --train_set 'owod_t1_train' --test_set 'owod_all_task_test' --epochs 191 --lr_drop 35\
-    --pretrain '/mnt/data/kky/output/PROB/exps/MOWODB/INNOV_3/t1/checkpoint0040.pth' --eval \
-    --enable_unk_label_obj  --obj_loss_coef 10 --etop --tdqi --model_type 'innov_2'\
+    --pretrain '/mnt/data/kky/output/PROB/exps/MOWODB/ABLATION_STUDY/Exp5_Innov1_FullVSAD_no_etop/t1/checkpoint0040.pth' --eval \
+    --enable_unk_label_obj  --obj_loss_coef 1 --tdqi --model_type 'innov_1'\
     --use_feature_align --use_vlm_distill
     ${PY_ARGS}
     

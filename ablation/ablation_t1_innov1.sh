@@ -9,7 +9,7 @@ if [ $# -ge 1 ]; then
     BASE_EXP_DIR="$1"
     shift
 else
-    BASE_EXP_DIR="/gemini/output/ABLATION_T1_INNOV"
+    BASE_EXP_DIR="/mnt/data/kky/output/PROB/exps/MOWODB/ABLATION_T1_INNOV1"
 fi
 
 PY_ARGS=${@:1}
@@ -26,20 +26,30 @@ COMMON_T1_ARGS="\
     --lr_drop 35 \
     --batch_size 5 \
     --exemplar_replay_selection \
-    --exemplar_replay_max_length 850"
+    --exemplar_replay_max_length 850 \
+    --unk_label_start_epoch 8 \
+    --unk_label_obj_warmup_epochs 2 \
+    "
 
 CONFIGS=(
-    "A1_Innov1|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --use_feature_align --align_loss_coef 2.0 --use_vlm_distill"
+    # "A0_Baseline_PROB|--model_type prob"
     
-    "A0_Baseline_PROB|--model_type prob"
-
-    "A2_Innov1_MiningOnly|--model_type innov_1 --enable_unk_label_obj"
-
     "A3_Innov1_Mining_ValidMask|--model_type innov_1 --enable_unk_label_obj --use_valid_mask"
 
-    "A3_Innov1_Mining_ValidMask_ETOP|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --etop"
+    "A1_Innov1_Full|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --use_feature_align  --use_vlm_distill"
+    
+    "A2_Innov1_MiningOnly|--model_type innov_1 --enable_unk_label_obj"
 
-    "A4_Innov1_enhance|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --use_feature_align --align_loss_coef 2.0 --use_vlm_distill --etop --tdqi"
+    "A4_Innov1_Mining_ValidMask_Align|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --use_feature_align"
+
+    "A5_Innov1_Mining_ValidMask_Align_VLMDistill|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --use_feature_align --use_vlm_distill"
+
+    # # 这里如果有时间再跑, 作为additional verification
+    # "A6_Innov1_Full_ETOP|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --use_feature_align  --use_vlm_distill --etop"
+
+    # "A6_Innov1_Full_TDQI|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --use_feature_align  --use_vlm_distill --tdqi"
+
+    # "A6_Innov1_Full_ETOP_TDQI|--model_type innov_1 --enable_unk_label_obj --use_valid_mask --use_feature_align  --use_vlm_distill --etop --tdqi"
 )
 
 for CONFIG in "${CONFIGS[@]}"; do

@@ -83,14 +83,19 @@ class DeformableDETR(nn.Module):
         else:
             self.unk_head = None
         
-        # 跨模态投影头 (由 args 控制是否激活)
+        # 跨模态投影头
         self.use_feature_align = getattr(args, 'use_feature_align', False)
         if self.use_feature_align:
             clip_dim = getattr(args, 'clip_dim', 512)
             self.proj_head = MLP(hidden_dim, hidden_dim, clip_dim, 2) 
 
         self.num_feature_levels = num_feature_levels
-        self.query_embed = nn.Embedding(num_queries, hidden_dim * 2)
+
+        # 只有在单阶段，或者 two-stage + TDQI 时，learned query 才真正会被用到
+        if (not two_stage) or getattr(args, 'tdqi', False):
+            self.query_embed = nn.Embedding(num_queries, hidden_dim * 2)
+        else:
+            self.query_embed = None
         
         if num_feature_levels > 1:
             num_backbone_outs = len(backbone.strides)
@@ -130,12 +135,13 @@ class DeformableDETR(nn.Module):
             nn.init.constant_(proj[0].bias, 0)
 
         num_pred = (transformer.decoder.num_layers + 1) if two_stage else transformer.decoder.num_layers
+        num_unk_pred = transformer.decoder.num_layers
         if with_box_refine:
             self.class_embed = _get_clones(self.class_embed, num_pred)
             self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
             self.prob_obj_head = _get_clones(self.prob_obj_head, num_pred)
             if self.enable_unk_head:
-                self.unk_head = _get_clones(self.unk_head, num_pred)
+                self.unk_head = _get_clones(self.unk_head, num_unk_pred)
             if self.use_feature_align:
                 self.proj_head = _get_clones(self.proj_head, transformer.decoder.num_layers) 
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
@@ -183,7 +189,7 @@ class DeformableDETR(nn.Module):
                 masks.append(mask)
                 pos.append(pos_l)
 
-        query_embeds = self.query_embed.weight
+        query_embeds = None if self.query_embed is None else self.query_embed.weight
         clip_txt = getattr(self.args, 'clip_text_features', None)
         semantic_mask = getattr(self.args, 'semantic_mask', None)
         
@@ -331,6 +337,11 @@ class SetCriterion(nn.Module):
         self.unk_pos_per_img = getattr(args, 'unk_pos_per_img', 1)
         self.unk_neg_per_img = getattr(args, 'unk_neg_per_img', 2)
         self.writer = args.writer if hasattr(args, 'writer') else None  # 从 args 获取 writer
+        
+        self.train_unk_head = getattr(args, 'train_unk_head', False)
+        self.unk_loss_use_known_neg = getattr(args, 'unk_loss_use_known_neg', True) # 这三个默认都开启.
+        self.unk_loss_use_dummy_neg = getattr(args, 'unk_loss_use_dummy_neg', True)
+        self.unk_loss_use_dummy_pos = getattr(args, 'unk_loss_use_dummy_pos', True)
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True, **kwargs):
         assert 'pred_logits' in outputs
@@ -498,7 +509,8 @@ class SetCriterion(nn.Module):
       
     
     def loss_unknownness(self, outputs, targets, indices, num_boxes, dummy_pos_indices=None, dummy_neg_indices=None, dummy_vlm_weights=None, epoch=0, **kwargs):
-        if (not getattr(self, 'enable_unk_head', True)) or ('pred_unk' not in outputs):
+        # InferOnly时不使用 unk loss
+        if (not self.enable_unk_head) or (not self.train_unk_head) or ('pred_unk' not in outputs):
             zero = outputs['pred_logits'].sum() * 0.0
             return {'loss_unk': zero}
 
@@ -522,7 +534,7 @@ class SetCriterion(nn.Module):
 
         # 0) matched known -> target = 0
         # 这是“显式三分支解耦”最关键的补充
-        if indices is not None:
+        if self.unk_loss_use_known_neg and indices is not None:
             src_idx = self._get_src_permutation_idx(indices)
             if len(src_idx[0]) > 0:
                 sel_batch.append(src_idx[0].to(device))
@@ -532,7 +544,7 @@ class SetCriterion(nn.Module):
                 num_known_neg += len(src_idx[0])
 
         # 1) dummy_pos -> target = 1
-        if use_dummy_pos_loss and dummy_pos_indices is not None:
+        if self.unk_loss_use_dummy_pos and use_dummy_pos_loss and dummy_pos_indices is not None:
             for b_idx, q_list in enumerate(dummy_pos_indices):
                 if len(q_list) == 0:
                     continue
@@ -557,7 +569,7 @@ class SetCriterion(nn.Module):
                 num_pos += len(q_list)
 
         # 2) dummy_neg -> target = 0
-        if dummy_neg_indices is not None:
+        if self.unk_loss_use_dummy_neg and dummy_neg_indices is not None:
             for b_idx, q_list in enumerate(dummy_neg_indices):
                 if len(q_list) == 0:
                     continue
@@ -655,6 +667,44 @@ class SetCriterion(nn.Module):
             clip_feat = self.args.clip_model.encode_image(crops)
             clip_feat = F.normalize(clip_feat, dim=-1)
         return clip_feat
+    
+    def _is_valid_unknown_geometry(self, box_cxcywh, eps=1e-6):
+        """
+        box_cxcywh: Tensor [4] in normalized coords
+        return: bool
+        """
+        cx, cy, w, h = box_cxcywh.tolist()
+
+        # 基本合法性
+        if w <= 0 or h <= 0:
+            return False
+
+        area = w * h
+        aspect = max(w / (h + eps), h / (w + eps))
+
+        # 是否贴边
+        x1 = cx - 0.5 * w
+        y1 = cy - 0.5 * h
+        x2 = cx + 0.5 * w
+        y2 = cy + 0.5 * h
+        touch_border = (x1 < 0.01) or (y1 < 0.01) or (x2 > 0.99) or (y2 > 0.99)
+
+        # 1) 极小面积过滤
+        min_area = getattr(self.args, 'unk_min_area', 0.0015)
+        if area < min_area:
+            return False
+
+        # 2) 极端长宽比过滤
+        max_aspect = getattr(self.args, 'unk_max_aspect_ratio', 6.0)
+        if aspect > max_aspect:
+            return False
+
+        # 3) 边缘+偏长 联合过滤
+        border_aspect = getattr(self.args, 'unk_border_max_aspect_ratio', 3.5)
+        if touch_border and aspect > border_aspect:
+            return False
+
+        return True
     
     def forward(self, outputs, targets, epoch):
         # matcher 不需要 pred_obj / pred_unk / pred_proj / aux / enc / samples
@@ -768,7 +818,14 @@ class SetCriterion(nn.Module):
                 else:
                     valid_unmatched = unmatched
                     unmatched_iou_map = {q: 0.0 for q in unmatched}
-
+                    
+                geom_valid_pos = []
+                for q in valid_unmatched:
+                    box_q = outputs['pred_boxes'][i, q]   # cxcywh normalized
+                    if self._is_valid_unknown_geometry(box_q):
+                        geom_valid_pos.append(q)
+                        
+                valid_unmatched = geom_valid_pos
                 stats['num_valid_unmatched'] += len(valid_unmatched)
 
                 if len(valid_unmatched) == 0:
@@ -1044,7 +1101,7 @@ class SetCriterion(nn.Module):
 
 class PostProcess(nn.Module):
     def __init__(self, invalid_cls_logits, num_classes, temperature=1, pred_per_im=100,
-                 known_thresh=0.05, unknown_thresh=0.05, unk_temp=1.0, enable_unk_head=False):
+                 known_thresh=0.05, unknown_thresh=0.05, unk_temp=1.0, infer_with_unk_head=False):
         super().__init__()
         self.temperature = temperature
         self.invalid_cls_logits = invalid_cls_logits
@@ -1053,7 +1110,7 @@ class PostProcess(nn.Module):
         self.known_thresh = known_thresh
         self.unknown_thresh = unknown_thresh
         self.unk_temp = unk_temp
-        self.enable_unk_head = enable_unk_head
+        self.infer_with_unk_head = infer_with_unk_head
 
     @torch.no_grad()
     def forward(self, outputs, target_sizes):
@@ -1074,8 +1131,8 @@ class PostProcess(nn.Module):
         known_prob = known_prob_all[:, :, :self.num_classes - 1]
         max_known_scores, known_labels = known_prob.max(dim=-1)   # [B, Q], [B, Q]
 
-        # 若未启用 unk head，退化为 innov1 风格
-        if (not self.enable_unk_head) or ('pred_unk' not in outputs):
+        # 若未启用 unk head推理，退化为 innov1 风格
+        if (not self.infer_with_unk_head) or ('pred_unk' not in outputs):
             score_known = obj_prob * max_known_scores
 
             results = []
@@ -1252,7 +1309,8 @@ def build(args):
         weight_dict['loss_align'] = getattr(args, 'align_loss_coef', 1.0)
         losses.append('align')
         
-    if getattr(args, 'enable_unk_head', True):
+    # unk分支头+训练时使用损失
+    if getattr(args, 'enable_unk_head', False) and getattr(args, 'train_unk_head', False): 
         weight_dict['loss_unk'] = args.unk_loss_coef
         losses.append('unknownness')
         
@@ -1275,7 +1333,7 @@ def build(args):
             known_thresh=args.postproc_known_thresh,
             unknown_thresh=args.postproc_unknown_thresh,
             unk_temp=args.unk_temp,
-            enable_unk_head=args.enable_unk_head,
+            infer_with_unk_head=(args.enable_unk_head and args.infer_with_unk_head),
         )
     }
     exemplar_selection = ExemplarSelection(args, num_classes, matcher, invalid_cls_logits, temperature=args.obj_temp/args.hidden_dim)

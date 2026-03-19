@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-echo "Running full M-OWODB training pipeline: INNOV2"
+echo "Running full M-OWODB training pipeline: INNOV1"
 
 set -x
 set -e
@@ -9,34 +9,27 @@ if [ $# -ge 1 ]; then
     EXP_DIR="$1"
     shift
 else
-    EXP_DIR="/gemini/output/INNOV_2_FULL"
+    EXP_DIR="/gemini/output/INNOV_1_FULL"
 fi
 
 PY_ARGS=${@:1}
-RUN_NAME=INNOV_2_FULL
-
-export WANDB_MODE=offline
-export WANDB_DIR="${EXP_DIR}"
+RUN_NAME=INNOV_1_FULL
 
 COMMON_ARGS="\
     --dataset TOWOD \
     --test_set owod_all_task_test \
     --obj_temp 1.3 \
-    --model_type innov_2 \
+    --model_type innov_1 \
     --enable_unk_label_obj \
     --use_valid_mask \
     --use_feature_align \
     --align_loss_coef 2.0 \
     --use_vlm_distill \
-    --enable_unk_head \
-    --train_unk_head \
-    --infer_with_unk_head \
-    --unk_loss_use_known_neg \
-    --unk_loss_use_dummy_neg \
-    --unk_loss_use_dummy_pos \
+    --batch_size 5 \
     --unk_label_start_epoch 8 \
     --unk_label_obj_warmup_epochs 2 \
-    --batch_size 5"
+    --postproc_known_thresh 0.05 \
+    --postproc_unknown_thresh 0.05"
 
 # -------------------------
 # T1
