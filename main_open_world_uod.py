@@ -26,11 +26,21 @@ import datasets.samplers as samplers
 from datasets import build_dataset, get_coco_api_from_dataset
 from datasets.coco import make_coco_transforms
 from datasets.torchvision_datasets.open_world import OWDetection
-from engine import evaluate, train_one_epoch, get_exemplar_replay
+from engine_uod import evaluate, train_one_epoch, get_exemplar_replay
 from models import build_model
 from torch.utils.tensorboard import SummaryWriter
 import logging
 from util.log import setup_logging
+
+
+def build_model_dispatch(args):
+    if args.model_type in ['uod', 'merged_uod', 'merged_unknown']:
+        try:
+            from models.prob_deformable_detr_uod import build as build_uod
+        except Exception as e:
+            raise ImportError('Place prob_deformable_detr_uod.py under models/ before running model_type=uod') from e
+        return build_uod(args)
+    return build_model(args, mode=args.model_type)
 
 
 def _sanitize_for_checkpoint(obj):
@@ -140,6 +150,12 @@ def get_args_parser():
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--viz', action='store_true')
+    parser.add_argument('--enable_train_uod_vis', action='store_true', help='enable training-stage UOD visualization dumps')
+    parser.add_argument('--train_uod_vis_freq', default=200, type=int, help='dump training UOD visualizations every N global steps')
+    parser.add_argument('--train_uod_vis_max_images', default=4, type=int, help='max number of images per training visualization dump')
+    parser.add_argument('--enable_eval_uod_vis', action='store_true', help='enable eval-stage UOD visualization dumps')
+    parser.add_argument('--eval_uod_vis_num_batches', default=1, type=int, help='dump eval-stage UOD visualizations for first N eval batches')
+    parser.add_argument('--eval_uod_vis_max_images', default=8, type=int, help='max number of images per eval visualization dump')
     parser.add_argument('--eval_every', default=5, type=int)
     parser.add_argument('--num_workers', default=16, type=int)
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
@@ -165,7 +181,7 @@ def get_args_parser():
 
     ################ PROB OWOD ################
     # model config
-    parser.add_argument('--model_type', default='prob', type=str)
+    parser.add_argument('--model_type', default='uod', type=str)
     
     
     # model hyperparameters
@@ -197,6 +213,7 @@ def get_args_parser():
     parser.add_argument('--unk_min_area', default=0.0015, type=float, help='unknown positive 候选的最小归一化面积')
     parser.add_argument('--unk_max_aspect_ratio', default=6.0, type=float, help='unknown positive 候选的最大长宽比 max(w/h, h/w)')
     parser.add_argument('--unk_border_max_aspect_ratio', default=3.5, type=float, help='贴边 unknown positive 候选允许的最大长宽比')
+    parser.add_argument('--enable_unknown_output', default=True, action='store_true', help='在 innov1 推理阶段显式输出 unknown')
     parser.add_argument('--postproc_known_thresh', default=0.05, type=float, help='已知类最小分数阈值')
     parser.add_argument('--postproc_unknown_thresh', default=0.05, type=float, help='unknown 最小分数阈值')
     ## 目标性预测的提前终止 (ETOP, Early Termination of Objectness Prediction)
@@ -225,8 +242,17 @@ def get_args_parser():
     parser.add_argument('--unk_pos_per_img', default=1, type=int, help='每张图最多选多少个 unknown 正候选')
     parser.add_argument('--unk_neg_per_img', default=2, type=int, help='每张图最多选多少个 background 负候选')
     parser.add_argument('--unk_temp', default=1.0, type=float, help='postprocess 中 unknownness sigmoid 温度')
-    
-    
+    parser.add_argument('--soft_valid_mask', default=False, action='store_true', help='对伪正样本保留软背景监督，而非直接0/1豁免')
+    parser.add_argument('--dummy_pos_cls_weight', default=0.25, type=float, help='soft valid mask下伪正样本保留的最小背景监督权重')
+    parser.add_argument('--unk_max_iou', default=0.3, type=float, help='unknown候选与GT允许的最大IoU')
+    parser.add_argument('--unk_max_iof', default=0.6, type=float, help='unknown候选与GT允许的最大IoF(过滤只框住GT一部分的框)')
+    parser.add_argument('--unk_min_side', default=0.04, type=float, help='unknown候选最小边长(归一化)')
+    parser.add_argument('--image_gate_min_valid_ratio', default=0.05, type=float, help='图像级空挖掘门控: 有效候选最小比例')
+    parser.add_argument('--image_gate_min_low_energy_ratio', default=0.02, type=float, help='图像级空挖掘门控: 低能候选最小比例')
+    parser.add_argument('--image_gate_min_pos_candidates', default=1, type=int, help='图像级空挖掘门控: 最少潜在unknown候选数')
+    parser.add_argument('--image_gate_known_mean_max', default=0.25, type=float, help='图像级空挖掘门控: 低能候选已知置信均值上界')
+    parser.add_argument('--bg_neg_score_margin', default=0.5, type=float, help='可靠背景负样本阈值 = 正阈值 + margin')
+
     return parser
 
 def main(args):
@@ -264,7 +290,7 @@ def main(args):
     
     dataset_train, dataset_val, class_names = get_datasets(args)
     args.class_names = class_names
-    model, criterion, postprocessors, exemplar_selection = build_model(args, mode = args.model_type)
+    model, criterion, postprocessors, exemplar_selection = build_model_dispatch(args)
     model.to(device)
     
     print("Debugging - printing parameters:")
@@ -360,6 +386,7 @@ def main(args):
         logging.info("InCompatible keys: {}".format(msg))
         args.start_epoch = checkpoint['epoch'] + 1
         if args.eval:
+            args._eval_vis_tag = f'pretrain_eval_epoch{checkpoint.get("epoch", -1):04d}'
             test_stats, coco_evaluator = evaluate(model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args)
             return
         
@@ -405,6 +432,7 @@ def main(args):
                 model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args
             )
         if args.eval:
+            args._eval_vis_tag = f'resume_eval_epoch{checkpoint.get("epoch", -1):04d}'
             test_stats, coco_evaluator = evaluate(model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args)
             if args.output_dir:
                 utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
@@ -437,6 +465,7 @@ def main(args):
             checkpoint_paths = [output_dir / 'checkpoint.pth']
             # extra checkpoint before LR drop and every 5 epochs
             if (epoch + 1) % args.lr_drop == 0 or (epoch % args.eval_every == 0 or epoch == 0 or epoch == 1 or (args.epochs-epoch)<1):
+                args._eval_vis_tag = f'epoch_{epoch:04d}'
                 test_stats, coco_evaluator = evaluate(
                     model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args)
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')

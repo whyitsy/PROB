@@ -22,6 +22,7 @@ from datasets.panoptic_eval import PanopticEvaluator
 from datasets.data_prefetcher import data_prefetcher
 from copy import deepcopy
 from util.visual.visual import *
+from util.visual.uod_visual import save_training_uod_visualizations, save_eval_uod_visualizations
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -87,7 +88,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             for k, v in loss_dict_reduced_unscaled.items():
                 writer.add_scalar(f'train_unscaled/{k}', v, global_step)
 
-            if global_step % 2000 == 0:
+            legacy_vis_freq = int(getattr(args, 'train_uod_vis_freq', 200))
+            if global_step % max(legacy_vis_freq, 1) == 0:
                 try:
                     log_debug_visualizations(
                         samples=samples,
@@ -96,13 +98,45 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                         criterion=criterion,
                         epoch=epoch,
                         global_step=global_step,
-                        max_images=4,
+                        max_images=int(getattr(args, 'train_uod_vis_max_images', 4)),
                         prefix='train_vis',
-                        output_dir=args.output_dir     
+                        output_dir=args.output_dir
+                    )
+                except KeyError:
+                    logging.info(
+                        'legacy visualization skipped at step %s due to missing key: %r',
+                        global_step,
+                        KeyError,
                     )
                 except Exception as e:
                     logging.exception(
-                        'visualization failed at step %s with %s: %r',
+                        'legacy visualization failed at step %s with %s: %r',
+                        global_step,
+                        type(e).__name__,
+                        e,
+                    )
+
+            if bool(getattr(args, 'enable_train_uod_vis', False)) and global_step % max(int(getattr(args, 'train_uod_vis_freq', 200)), 1) == 0:
+                try:
+                    save_training_uod_visualizations(
+                        samples=samples,
+                        targets=targets,
+                        outputs=outputs,
+                        criterion=criterion,
+                        epoch=epoch,
+                        global_step=global_step,
+                        output_dir=args.output_dir,
+                        max_images=int(getattr(args, 'train_uod_vis_max_images', 4)),
+                    )
+                except KeyError:
+                    logging.info(
+                        'uod visualization skipped at step %s due to missing key: %r',
+                        global_step,
+                        KeyError,
+                    )
+                except Exception as e:
+                    logging.exception(
+                        'uod training visualization failed at step %s with %s: %r',
                         global_step,
                         type(e).__name__,
                         e,
@@ -115,18 +149,22 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 'stat_num_valid_unmatched',
                 'stat_num_pos_candidates',
                 'stat_num_neg_candidates',
-
                 'stat_pos_energy_mean',
                 'stat_neg_energy_mean',
                 'stat_matched_energy_mean',
-
                 'stat_dummy_pos_known_max_mean',
                 'stat_dummy_neg_known_max_mean',
                 'stat_dummy_pos_iou_mean',
                 'stat_dummy_neg_iou_mean',
-
                 'stat_pos_thresh_mean',
                 'stat_neg_thresh_mean',
+                'stat_image_gate_open_ratio',
+                'stat_image_valid_ratio_mean',
+                'stat_image_low_energy_ratio_mean',
+                'stat_unk_num_pos',
+                'stat_unk_num_neg',
+                'stat_unk_num_known_neg',
+                'stat_unk_pos_weight',
             ]
             for k in stat_keys:
                 if k in loss_dict_reduced:
@@ -166,6 +204,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                                             global_step)
                 except Exception:
                     pass
+
+                if 'pred_unk' in outputs:
+                    writer.add_histogram('train_hist/pred_unk_logit_all',
+                                         outputs['pred_unk'].detach().float().cpu(),
+                                         global_step)
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
@@ -186,6 +229,11 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     header = 'Test:'
     iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
     coco_evaluator = OWEvaluator(base_ds, iou_types, args=args)
+    eval_vis_enabled = bool(getattr(args, 'enable_eval_uod_vis', False)) and utils.is_main_process()
+    eval_vis_saved = 0
+    eval_vis_limit = max(int(getattr(args, 'eval_uod_vis_num_batches', 1)), 0)
+    eval_vis_max_images = max(int(getattr(args, 'eval_uod_vis_max_images', 8)), 1)
+    eval_tag = str(getattr(args, '_eval_vis_tag', 'eval_latest'))
  
     panoptic_evaluator = None
     if 'panoptic' in postprocessors.keys():
@@ -209,6 +257,24 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         res = {target['image_id'].item(): output for target, output in zip(targets, results)}
         if coco_evaluator is not None:
             coco_evaluator.update(res)
+
+        if eval_vis_enabled and eval_vis_saved < eval_vis_limit:
+            try:
+                save_eval_uod_visualizations(
+                    samples=samples,
+                    targets=targets,
+                    outputs=outputs,
+                    results=results,
+                    criterion=criterion,
+                    output_dir=output_dir,
+                    eval_tag=f"{eval_tag}_batch{eval_vis_saved:02d}",
+                    class_names=getattr(args, 'class_names', None),
+                    max_images=eval_vis_max_images,
+                    score_thresh=min(float(getattr(args, 'postproc_known_thresh', 0.05)), float(getattr(args, 'postproc_unknown_thresh', 0.10))),
+                )
+                eval_vis_saved += 1
+            except Exception as e:
+                logging.exception('eval visualization failed with %s: %r', type(e).__name__, e)
  
         if panoptic_evaluator is not None:
             res_pano = postprocessors["panoptic"](outputs, target_sizes, orig_target_sizes)

@@ -11,7 +11,7 @@
 
 # CUDA_VISIBLE_DEVICES=0,3 ./tools/run_dist_launch.sh 2 33067 configs/M_OWOD_BENCHMARK_innov_2.sh
 
-CUDA_VISIBLE_DEVICES=1,2 ./tools/run_dist_launch.sh 2 127.0.0.1 33068 ablation/ablation_t1_innov1.sh 
+CUDA_VISIBLE_DEVICES=1,2 ./tools/run_dist_launch.sh 2 127.0.0.1 33068 ablation/ablation_t1_uod.sh
 
 # ./tools/run_dist_launch.sh 4 33068 configs/innov/train_mowod_innov2_full.sh
 
