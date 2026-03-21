@@ -98,15 +98,22 @@ def parse_wi_tables(log_path):
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        # 检测表头
-        if 'Recall' in line and 'WI-IoU50' in line and 'Unk-IoU50' in line:
+        # 检测表头行：必须包含 "Recall" 和 "WI-IoU50"（可能带连字符或下划线）
+        # 同时过滤掉可能的分隔线（如 "--------" 或 "---"）
+        if ('Recall' in line and 'WI-IoU50' in line and not line.startswith('-')):
+            # 跳过可能的分隔线（下一行可能是 "--------" 或 "---"）
             i += 1
+            # 跳过连续的分隔线
+            while i < len(lines) and lines[i].strip().startswith('-'):
+                i += 1
+            # 开始解析数据行
             table = {}
             while i < len(lines):
                 data_line = lines[i].strip()
-                # 空行或非数字开头表示表格结束
-                if not data_line or not data_line[0].isdigit():
+                # 遇到空行或下一张表头则结束当前表格
+                if not data_line or ('Recall' in data_line and 'WI-IoU50' in data_line):
                     break
+                # 尝试按空白分割（支持空格/制表符）
                 parts = data_line.split()
                 if len(parts) >= 3:
                     try:
@@ -116,7 +123,8 @@ def parse_wi_tables(log_path):
                     except ValueError:
                         pass
                 i += 1
-            tables.append(table)
+            if table:
+                tables.append(table)
         else:
             i += 1
     return tables
@@ -194,10 +202,10 @@ def extract_metrics(group_tables, absolute_ose_list, wi_tables_list):
 
     return metrics
 
-
 def plot_metrics(metrics, save_path):
     """
     绘制三条曲线（Recall、AP50、Absolute OSE + WI）并保存。
+    第三子图使用双Y轴：左轴为Absolute OSE，右轴为WI@Recall0.8。
     """
     if not metrics or all(len(v) == 0 for v in metrics.values()):
         print("没有有效指标可绘制。")
@@ -228,22 +236,36 @@ def plot_metrics(metrics, save_path):
     ax2.legend()
     ax2.grid(True)
 
-    # 子图3：Absolute OSE 和 WI
-    if 'Absolute_OSE' in metrics and metrics['Absolute_OSE']:
-        ax3.plot(epochs, metrics['Absolute_OSE'], marker='^', label='Absolute OSE (IoU=50)')
-    if 'WI_Recall0.8' in metrics and metrics['WI_Recall0.8']:
-        ax3.plot(epochs, metrics['WI_Recall0.8'], marker='d', label='WI@Recall0.8')
+    # 子图3：Absolute OSE 和 WI (双Y轴)
     ax3.set_xlabel('Evaluation Step')
-    ax3.set_ylabel('Value')
-    ax3.set_title('Additional Metrics')
-    ax3.legend()
+    ax3.set_title('Additional Metrics (Absolute OSE and WI)')
     ax3.grid(True)
+
+    # 左轴：Absolute OSE
+    color_left = 'tab:red'
+    ax3.set_ylabel('Absolute OSE (IoU=50)', color=color_left)
+    if 'Absolute_OSE' in metrics and metrics['Absolute_OSE']:
+        ax3.plot(epochs, metrics['Absolute_OSE'], marker='^', color=color_left, label='Absolute OSE (IoU=50)')
+    ax3.tick_params(axis='y', labelcolor=color_left)
+
+    # 右轴：WI@Recall0.8
+    ax3_right = ax3.twinx()
+    color_right = 'tab:blue'
+    ax3_right.set_ylabel('WI@Recall0.8', color=color_right)
+    if 'WI_Recall0.8' in metrics and metrics['WI_Recall0.8']:
+        ax3_right.plot(epochs, metrics['WI_Recall0.8'], marker='d', color=color_right, label='WI@Recall0.8')
+    ax3_right.tick_params(axis='y', labelcolor=color_right)
+
+    # 合并图例（避免重复）
+    lines_left, labels_left = ax3.get_legend_handles_labels()
+    lines_right, labels_right = ax3_right.get_legend_handles_labels()
+    if lines_left or lines_right:
+        ax3.legend(lines_left + lines_right, labels_left + labels_right, loc='upper left')
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     print(f"图片已保存至：{save_path}")
     plt.close()
-
 
 def get_base_name_from_log(log_path):
     """

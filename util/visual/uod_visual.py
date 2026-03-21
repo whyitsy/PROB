@@ -14,6 +14,18 @@ IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 
+UOD_COLORS = {
+    "gt": "#2ca02c",
+    "matched": "#1f77b4",
+    "dummy_pos": "#ff7f0e",
+    "dummy_neg": "#d62728",
+    "rejected_gt": "#9467bd",
+    "rejected_geom": "#8c564b",
+    "valid_unmatched": "#7f7f7f",
+    "known_pred": "#1f77b4",
+    "unknown_pred": "#ff7f0e",
+}
+
 def _to_tensor_images(samples: Any) -> torch.Tensor:
     if hasattr(samples, 'tensors'):
         return samples.tensors
@@ -201,7 +213,7 @@ def _draw_boxes(ax, boxes_xyxy: torch.Tensor, color: str, linewidth: float = 1.6
         rect = Rectangle((x1, y1), max(x2 - x1, 1.0), max(y2 - y1, 1.0), fill=False, edgecolor=color, linewidth=linewidth, linestyle=linestyle)
         ax.add_patch(rect)
         if labels is not None and idx < len(labels) and labels[idx]:
-            ax.text(x1, max(0, y1 - 2), labels[idx], color=color, fontsize=7, bbox=dict(facecolor='black', alpha=0.35, pad=1, edgecolor='none'))
+            ax.text(x1, max(0, y1 - 2), labels[idx], color=color, fontsize=7, bbox=dict(facecolor='black', alpha=0.55, pad=1, edgecolor='none'))
 
 
 def _save_overlay_grid(images: torch.Tensor, targets: List[Dict[str, torch.Tensor]], outputs: Dict[str, torch.Tensor], snapshots: List[Dict[str, Any]], save_path: str, max_images: int = 4):
@@ -218,7 +230,8 @@ def _save_overlay_grid(images: torch.Tensor, targets: List[Dict[str, torch.Tenso
         if plot_idx >= n:
             ax.axis('off')
             continue
-        img = _unnormalize_image(images[plot_idx])
+        real_h, real_w = targets[plot_idx]["size"].tolist()
+        img = _unnormalize_image(images[plot_idx][:, :real_h, :real_w])
         ax.imshow(img)
         ax.axis('off')
 
@@ -228,12 +241,13 @@ def _save_overlay_grid(images: torch.Tensor, targets: List[Dict[str, torch.Tenso
         gt_xyxy = _scale_boxes_xyxy(_cxcywh_to_xyxy(targets[plot_idx]['boxes'].detach()), hw) if len(targets[plot_idx]['boxes']) > 0 else torch.empty((0, 4))
         snap = snapshots[plot_idx]
 
-        _draw_boxes(ax, gt_xyxy, color='lime', linewidth=2.0, labels=[f'gt:{int(x)}' for x in targets[plot_idx]['labels'].detach().cpu().tolist()])
-        _draw_boxes(ax, pred_xyxy[snap['matched']] if len(snap['matched']) > 0 else pred_xyxy.new_zeros((0, 4)), color='cyan', linewidth=1.5, labels=[f'm{q}' for q in snap['matched']])
-        _draw_boxes(ax, pred_xyxy[snap['dummy_pos']] if len(snap['dummy_pos']) > 0 else pred_xyxy.new_zeros((0, 4)), color='gold', linewidth=1.8, labels=[f'p{q}' for q in snap['dummy_pos']])
-        _draw_boxes(ax, pred_xyxy[snap['dummy_neg']] if len(snap['dummy_neg']) > 0 else pred_xyxy.new_zeros((0, 4)), color='red', linewidth=1.4, labels=[f'n{q}' for q in snap['dummy_neg']])
-        _draw_boxes(ax, pred_xyxy[snap['rejected_gt']] if len(snap['rejected_gt']) > 0 else pred_xyxy.new_zeros((0, 4)), color='magenta', linewidth=1.0, linestyle='--', labels=[f'i{q}' for q in snap['rejected_gt']])
-        _draw_boxes(ax, pred_xyxy[snap['rejected_geom']] if len(snap['rejected_geom']) > 0 else pred_xyxy.new_zeros((0, 4)), color='orange', linewidth=1.0, linestyle=':', labels=[f'g{q}' for q in snap['rejected_geom']])
+        
+        _draw_boxes(ax, gt_xyxy, color=UOD_COLORS["gt"], linewidth=2.0, labels=[f'gt:{int(x)}' for x in targets[plot_idx]['labels'].detach().cpu().tolist()])
+        _draw_boxes(ax, pred_xyxy[snap['matched']] if len(snap['matched']) > 0 else pred_xyxy.new_zeros((0, 4)), color=UOD_COLORS["matched"], linewidth=1.5, labels=[f'm{q}' for q in snap['matched']])
+        _draw_boxes(ax, pred_xyxy[snap['dummy_pos']] if len(snap['dummy_pos']) > 0 else pred_xyxy.new_zeros((0, 4)), color=UOD_COLORS["dummy_pos"], linewidth=1.8, labels=[f'p{q}' for q in snap['dummy_pos']])
+        _draw_boxes(ax, pred_xyxy[snap['dummy_neg']] if len(snap['dummy_neg']) > 0 else pred_xyxy.new_zeros((0, 4)), color=UOD_COLORS["dummy_neg"], linewidth=1.4, labels=[f'n{q}' for q in snap['dummy_neg']])
+        _draw_boxes(ax, pred_xyxy[snap['rejected_gt']] if len(snap['rejected_gt']) > 0 else pred_xyxy.new_zeros((0, 4)), color=UOD_COLORS["rejected_gt"], linewidth=1.0, linestyle='--', labels=[f'i{q}' for q in snap['rejected_gt']])
+        _draw_boxes(ax, pred_xyxy[snap['rejected_geom']] if len(snap['rejected_geom']) > 0 else pred_xyxy.new_zeros((0, 4)), color=UOD_COLORS["rejected_geom"], linewidth=1.0, linestyle=':', labels=[f'g{q}' for q in snap['rejected_geom']])
 
         title = (
             f"img={plot_idx} gate={int(snap['gate_open'])} "
@@ -251,14 +265,13 @@ def _save_overlay_grid(images: torch.Tensor, targets: List[Dict[str, torch.Tenso
 def _save_phase_plot(snapshots: List[Dict[str, Any]], save_path: str):
     xs, ys, colors, labels = [], [], [], []
     color_map = {
-        'matched': '#00bcd4',
-        'dummy_pos': '#f4c430',
-        'dummy_neg': '#d62728',
-        'valid_unmatched': '#9e9e9e',
-        'rejected_gt': '#e040fb',
-        'rejected_geom': '#ff9800',
+        'matched': UOD_COLORS["matched"],
+        'dummy_pos': UOD_COLORS["dummy_pos"],
+        'dummy_neg': UOD_COLORS["dummy_neg"],
+        'valid_unmatched': UOD_COLORS["valid_unmatched"],
+        'rejected_gt': UOD_COLORS["rejected_gt"],
+        'rejected_geom': UOD_COLORS["rejected_geom"],
     }
-
     for snap in snapshots:
         matched = set(snap['matched'])
         dpos = set(snap['dummy_pos'])
@@ -372,7 +385,10 @@ def _save_eval_prediction_overlay(images: torch.Tensor, targets: List[Dict[str, 
         if plot_idx >= n:
             ax.axis('off')
             continue
-        img = _unnormalize_image(images[plot_idx])
+        
+        real_h, real_w = targets[plot_idx]["size"].tolist()
+        img = _unnormalize_image(images[plot_idx][:, :real_h, :real_w])
+        
         ax.imshow(img)
         ax.axis('off')
 
@@ -387,7 +403,7 @@ def _save_eval_prediction_overlay(images: torch.Tensor, targets: List[Dict[str, 
                 gt_text.append(f'gt:{class_names[lab]}')
             else:
                 gt_text.append(f'gt:{lab}')
-        _draw_boxes(ax, gt_xyxy, color='lime', linewidth=2.0, labels=gt_text)
+        _draw_boxes(ax, gt_xyxy, color=UOD_COLORS["gt"], linewidth=2.0, labels=gt_text)
 
         pred = results[plot_idx]
         boxes = pred.get('boxes', torch.empty((0, 4))).detach().cpu()
@@ -407,10 +423,11 @@ def _save_eval_prediction_overlay(images: torch.Tensor, targets: List[Dict[str, 
             else:
                 known_boxes.append(b)
                 known_text.append(f'k:{name}:{s:.2f}')
+                
         if len(known_boxes) > 0:
-            _draw_boxes(ax, torch.stack(known_boxes), color='deepskyblue', linewidth=1.5, labels=known_text)
+            _draw_boxes(ax, torch.stack(known_boxes), color=UOD_COLORS["known_pred"], linewidth=1.5, labels=known_text)
         if len(unk_boxes) > 0:
-            _draw_boxes(ax, torch.stack(unk_boxes), color='gold', linewidth=1.8, labels=unk_text)
+            _draw_boxes(ax, torch.stack(unk_boxes), color=UOD_COLORS["unknown_pred"], linewidth=1.8, labels=unk_text)
         ax.set_title(f'img={plot_idx} gt={len(gt_text)} predK={len(known_boxes)} predU={len(unk_boxes)}', fontsize=10)
     fig.tight_layout()
     fig.savefig(save_path, dpi=180, bbox_inches='tight')

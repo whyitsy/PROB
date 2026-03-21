@@ -10,7 +10,6 @@
 import copy
 from typing import Optional, List
 import math
-import logging
 
 import torch
 import torch.nn.functional as F
@@ -128,10 +127,10 @@ class DeformableTransformer(nn.Module):
     def to_4d(self, x,h,w):
         return rearrange(x, 'b (h w) c -> b c h w',h=h,w=w)
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None, **kwargs):
+    def forward(self, srcs, masks, pos_embeds, query_embed=None):
+
         assert self.two_stage or query_embed is not None
-        tdqi = kwargs.get('tdqi', False)
-        tdqi_query_num = kwargs.get('tdqi_query_num', 0)
+
         # prepare input for encoder
         src_flatten = []
         mask_flatten = []
@@ -169,44 +168,13 @@ class DeformableTransformer(nn.Module):
             enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
 
             topk = self.two_stage_num_proposals
-            topk_proposals = torch.topk(enc_outputs_class.max(-1)[0], topk, dim=1)[1] # topk proposals
+            topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1] ##TODO?? Why only based on first dimension??
             topk_coords_unact = torch.gather(enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
             topk_coords_unact = topk_coords_unact.detach()
             reference_points = topk_coords_unact.sigmoid()
             init_reference_out = reference_points
             pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
-            if tdqi:
-                # proposal-init queries from encoder top-k
-                query_embed_init_all, tgt_init_all = torch.split(pos_trans_out, c, dim=2)   # [bs, Q, c], [bs, Q, c]
-
-                assert query_embed is not None, "TDQI requires learned query_embed, but got None."
-
-                # learned queries
-                learned_query_embed, learned_tgt = torch.split(query_embed, c, dim=1)        # [Q, c], [Q, c]
-                learned_query_embed = learned_query_embed.unsqueeze(0).expand(bs, -1, -1)    # [bs, Q, c]
-                learned_tgt = learned_tgt.unsqueeze(0).expand(bs, -1, -1)                    # [bs, Q, c]
-
-                # 安全截断，避免 query_num 配置越界
-                k = min(tdqi_query_num, learned_query_embed.shape[1], query_embed_init_all.shape[1])
-                
-
-                # 前 k 个 query 用 proposal 初始化，后面的 query 保持 learned
-                if k > 0:
-                    query_embed = torch.cat(
-                        [query_embed_init_all[:, :k, :], learned_query_embed[:, k:, :]],
-                        dim=1
-                    )
-                    tgt = torch.cat(
-                        [tgt_init_all[:, :k, :], learned_tgt[:, k:, :]],
-                        dim=1
-                    )
-                else:
-                    query_embed = learned_query_embed
-                    tgt = learned_tgt
-            else:
-                # 标准 two-stage：全部 query 初始化来自 encoder proposals
-                query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
-            
+            query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
         else:
             query_embed, tgt = torch.split(query_embed, c, dim=1)
             query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)
@@ -215,9 +183,7 @@ class DeformableTransformer(nn.Module):
             init_reference_out = reference_points
 
         # decoder
-        semantic_mask = kwargs.get('semantic_mask', None)
-        clip_text_features = kwargs.get('clip_text_features', None)
-        hs, inter_references = self.decoder(tgt, reference_points, memory, spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten, clip_text_features, semantic_mask)
+        hs, inter_references = self.decoder(tgt, reference_points, memory, spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten)
 
         inter_references_out = inter_references
 
@@ -295,7 +261,7 @@ class DeformableTransformerEncoder(nn.Module):
         output = src
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
         for _, layer in enumerate(self.layers):
-            output = layer(output, pos, reference_points, spatial_shapes, level_start_index, padding_mask, )
+            output = layer(output, pos, reference_points, spatial_shapes, level_start_index, padding_mask)
 
         return output
 
@@ -315,13 +281,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
-        
-        # 跨模态语义-视觉融合 SVCF
-        self.semantic_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
-        self.dropout_semantic = nn.Dropout(dropout)
-        self.norm_semantic = nn.LayerNorm(d_model)
-        self.semantic_proj = nn.Linear(512, d_model)
-        
+
         # ffn
         self.linear1 = nn.Linear(d_model, d_ffn)
         self.activation = _get_activation_fn(activation)
@@ -340,7 +300,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = self.norm3(tgt)
         return tgt
 
-    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask=None, clip_text_features=None, semantic_mask=None):
+    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask=None):
         # self attention
         q = k = self.with_pos_embed(tgt, query_pos)
         tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1))[0].transpose(0, 1)
@@ -354,42 +314,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
-        
-        # Semantic Cross Attention (用视觉特征与大模型文本库做深度融合)
-        if clip_text_features is not None:
-            # 将 [num_classes + 1, 512] 的 CLIP 特征投影到 [num_classes + 1, d_model]
-            clip_text_features = clip_text_features.to(self.semantic_proj.weight.dtype)
-            semantic_memory = self.semantic_proj(clip_text_features)
-            # 扩展到 Batch Size: [num_classes + 1, bs, d_model]
-            bs = tgt.shape[1]
-            semantic_memory = semantic_memory.unsqueeze(1).repeat(1, bs, 1)
-            key_padding_mask = None
-            if semantic_mask is not None:
-                key_padding_mask = semantic_mask.unsqueeze(0).expand(bs, -1)
-                
-            # Query 主动提取最匹配的语义概念
-            tgt2 = self.semantic_attn(
-                query=tgt, 
-                key=semantic_memory, 
-                value=semantic_memory,
-                key_padding_mask=key_padding_mask # [NEW] 阻断信息泄露
-                )[0]
-            tgt = tgt + self.dropout_semantic(tgt2)
-            tgt = self.norm_semantic(tgt)
-        else:
-            # [FIX] DDP Dummy Pass: 确保在没有 CLIP 特征时，这些新增模块的参数也不会闲置
-            bs = tgt.shape[1]
-            dummy_clip = torch.zeros((1, 512), device=tgt.device, dtype=self.semantic_proj.weight.dtype)
-            dummy_mem = self.semantic_proj(dummy_clip).unsqueeze(1).repeat(1, bs, 1)
-            
-            dummy_tgt2 = self.semantic_attn(query=tgt, key=dummy_mem, value=dummy_mem)[0]
-            
-            # 乘以 0.0 消除对 tgt 实际数值的影响，但确保梯度图连通
-            tgt = tgt + self.dropout_semantic(dummy_tgt2) * 0.0
-            
-            # LayerNorm 也必须参与一次计算
-            dummy_norm = self.norm_semantic(tgt)
-            tgt = tgt + dummy_norm * 0.0
+
         # ffn
         tgt = self.forward_ffn(tgt)
 
@@ -407,7 +332,7 @@ class DeformableTransformerDecoder(nn.Module):
         self.class_embed = None
 
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
-                query_pos=None, src_padding_mask=None, clip_text_features=None, semantic_mask=None):
+                query_pos=None, src_padding_mask=None):
         output = tgt
 
         intermediate = []
@@ -420,7 +345,7 @@ class DeformableTransformerDecoder(nn.Module):
             else:
                 assert reference_points.shape[-1] == 2
                 reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
-            output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask, clip_text_features, semantic_mask)
+            output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask)
 
             # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:
