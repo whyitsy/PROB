@@ -19,6 +19,7 @@ COMMON_UOD_ARGS="--model_type uod --uod_enable_unknown --uod_enable_pseudo --uod
  --uod_pos_per_img_cap 1 --uod_neg_per_img 1 --uod_batch_topk_max 8 --uod_batch_topk_ratio 0.25"
 
 python -u main_open_world.py \
+    --resume '/mnt/data/kky/output/PROB/exps/MOWODB/UOD_CH4/t1/checkpoint.pth' \
     --output_dir "${EXP_DIR}/t1" --dataset TOWOD --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 20 \
     --train_set 'owod_t1_train' --test_set 'owod_all_task_test' --epochs 41 \
     --obj_loss_coef 8e-4 --obj_temp 1.3 \

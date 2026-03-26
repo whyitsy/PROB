@@ -15,8 +15,9 @@ from util.misc import (NestedTensor, accuracy, get_world_size, interpolate,
                        inverse_sigmoid, is_dist_avail_and_initialized,
                        nested_tensor_from_tensor_list)
 
+from models.ops.modules import MSDeformAttn
 from .backbone import build_backbone
-from .deformable_transformer import build_deforamble_transformer
+from .deformable_transformer_CH4 import build_deforamble_transformer
 from .matcher import build_matcher
 from .prob_deformable_detr import ProbObjectnessHead, sigmoid_focal_loss
 from .segmentation import DETRsegm, PostProcessPanoptic, PostProcessSegm, dice_loss
@@ -54,6 +55,7 @@ class DeformableDETRUOD(nn.Module):
         self.with_box_refine = with_box_refine
         self.two_stage = two_stage
         self.use_decorr = bool(getattr(args, 'uod_enable_decorr', False))
+        self.enable_oadf = bool(getattr(args, 'uod_enable_oadf', False))
 
         # Shared heads for detection outputs.
         self.class_embed = nn.Linear(hidden_dim, num_classes)
@@ -61,10 +63,23 @@ class DeformableDETRUOD(nn.Module):
         self.unk_embed = nn.Linear(hidden_dim, 1)
         self.prob_obj_head = ProbObjectnessHead(hidden_dim)
 
-        # Light branch-specific projections. Chapter 4 adds extra losses on top of these features.
-        self.obj_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.unk_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.cls_proj = nn.Linear(hidden_dim, hidden_dim)
+        # ==========================================================
+        # 【修改点 2】：CH4 OADF - 对象感知解耦框架模块定义
+        # ==========================================================
+        if self.enable_oadf:
+            # 1. 上下文增强 (Cross Attention with Encoder Memory)
+            self.context_attn = MSDeformAttn(hidden_dim, num_feature_levels, nheads=8, n_points=4)
+            # 2. 门控融合 (Gated Fusion)
+            self.gate_mlp = MLP(hidden_dim * 2, hidden_dim, hidden_dim, 2)
+            # 3. 三分支任务细化 (Task-specific FFN Refinement)
+            self.ffn_obj = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
+            self.ffn_unk = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
+            self.ffn_cls = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
+        else:
+            # 退回 CH3 的单层线性投影
+            self.obj_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.unk_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.cls_proj = nn.Linear(hidden_dim, hidden_dim)
 
         if not two_stage:
             self.query_embed = nn.Embedding(num_queries, hidden_dim * 2)
@@ -110,9 +125,17 @@ class DeformableDETRUOD(nn.Module):
             self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
             self.unk_embed = _get_clones(self.unk_embed, num_pred)
             self.prob_obj_head = _get_clones(self.prob_obj_head, num_pred)
-            self.obj_proj = _get_clones(self.obj_proj, num_pred)
-            self.unk_proj = _get_clones(self.unk_proj, num_pred)
-            self.cls_proj = _get_clones(self.cls_proj, num_pred)
+            # 【修改点 3】：支持迭代框优化的模块克隆
+            if self.enable_oadf:
+                self.context_attn = _get_clones(self.context_attn, num_pred)
+                self.gate_mlp = _get_clones(self.gate_mlp, num_pred)
+                self.ffn_obj = _get_clones(self.ffn_obj, num_pred)
+                self.ffn_unk = _get_clones(self.ffn_unk, num_pred)
+                self.ffn_cls = _get_clones(self.ffn_cls, num_pred)
+            else:
+                self.obj_proj = _get_clones(self.obj_proj, num_pred)
+                self.unk_proj = _get_clones(self.unk_proj, num_pred)
+                self.cls_proj = _get_clones(self.cls_proj, num_pred)
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
             self.transformer.decoder.bbox_embed = self.bbox_embed
         else:
@@ -121,9 +144,16 @@ class DeformableDETRUOD(nn.Module):
             self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
             self.unk_embed = nn.ModuleList([self.unk_embed for _ in range(num_pred)])
             self.prob_obj_head = nn.ModuleList([self.prob_obj_head for _ in range(num_pred)])
-            self.obj_proj = nn.ModuleList([self.obj_proj for _ in range(num_pred)])
-            self.unk_proj = nn.ModuleList([self.unk_proj for _ in range(num_pred)])
-            self.cls_proj = nn.ModuleList([self.cls_proj for _ in range(num_pred)])
+            if self.enable_oadf:
+                self.context_attn = nn.ModuleList([self.context_attn for _ in range(num_pred)])
+                self.gate_mlp = nn.ModuleList([self.gate_mlp for _ in range(num_pred)])
+                self.ffn_obj = nn.ModuleList([self.ffn_obj for _ in range(num_pred)])
+                self.ffn_unk = nn.ModuleList([self.ffn_unk for _ in range(num_pred)])
+                self.ffn_cls = nn.ModuleList([self.ffn_cls for _ in range(num_pred)])
+            else:
+                self.obj_proj = nn.ModuleList([self.obj_proj for _ in range(num_pred)])
+                self.unk_proj = nn.ModuleList([self.unk_proj for _ in range(num_pred)])
+                self.cls_proj = nn.ModuleList([self.cls_proj for _ in range(num_pred)])
             self.transformer.decoder.bbox_embed = None
         if two_stage:
             self.transformer.decoder.class_embed = self.class_embed
@@ -160,8 +190,18 @@ class DeformableDETRUOD(nn.Module):
         if not self.two_stage:
             query_embeds = self.query_embed.weight
 
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(srcs, masks, pos, query_embeds)
+        # ==========================================================
+        # 【修改点 4】：解包 Transformer 传出的 enc_info 并执行 OADF 逻辑
+        # ==========================================================
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, enc_info = self.transformer(srcs, masks, pos, query_embeds)
 
+        # 提取 OADF 所需的全图上下文结构变量
+        memory = enc_info['memory']
+        spatial_shapes = enc_info['spatial_shapes']
+        level_start_index = enc_info['level_start_index']
+        valid_ratios = enc_info['valid_ratios']
+        padding_mask = enc_info['padding_mask']
+        
         outputs_classes = []
         outputs_coords = []
         outputs_objectness = []
@@ -173,16 +213,60 @@ class DeformableDETRUOD(nn.Module):
             else:
                 reference = inter_references[lvl - 1]
             reference = inverse_sigmoid(reference)
+            
+            # ------ OADF 机制开始 ------
+            q = hs[lvl]  # 当前层的 Query
+            if self.enable_oadf:
+                if lvl < 3: 
+                    # 准备参考点：MSDeformAttn 要求输入的 reference_points 必须在 [0, 1] 范围内
+                    ref_sig = reference.sigmoid()
+                    if ref_sig.shape[-1] == 4:
+                        ref_input = ref_sig[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[:, None]
+                    else:
+                        ref_input = ref_sig[:, :, None] * valid_ratios[:, None]
 
-            cls_feat = self.cls_proj[lvl](hs[lvl])
-            obj_feat = self.obj_proj[lvl](hs[lvl])
-            unk_feat = self.unk_proj[lvl](hs[lvl])
+                    # 步骤一：提取物理上下文 (仅在底层)
+                    c_q = self.context_attn[lvl](q, ref_input, memory, spatial_shapes, level_start_index, padding_mask)
 
+                    # 步骤二：门控融合形成增强 Query
+                    concat_feat = torch.cat([q, c_q], dim=-1)
+                    g_q = torch.sigmoid(self.gate_mlp[lvl](concat_feat))
+                    q_tilde = q + g_q * c_q
+                else:
+                    # 高层直接使用传递上来的特征，拒绝高级语义对轮廓信息的污染
+                    q_tilde = q 
+                    g_q = None
+                
+                if lvl == hs.shape[0] - 1 and g_q is not None:
+                    gate_mean = g_q.mean()  # 存一下最后一层的门控均值，用于可视化
+                elif lvl == hs.shape[0] - 1:
+                    gate_mean = None # 或者保持上一次的值
+
+                # 步骤三：三分支轻量细化 (Task-specific Refinement)
+                obj_feat = self.ffn_obj[lvl](q_tilde)
+                unk_feat = self.ffn_unk[lvl](q_tilde)
+                cls_feat = self.ffn_cls[lvl](q_tilde)
+                # ------ OADF 机制结束 ------
+                # 供 bbox 回归使用
+                hs_for_bbox = q_tilde
+            else:
+                # ------ 基础机制 (CH3) ------
+                obj_feat = self.obj_proj[lvl](q)
+                unk_feat = self.unk_proj[lvl](q)
+                cls_feat = self.cls_proj[lvl](q)
+                
+                # 供 bbox 回归使用
+                hs_for_bbox = q
+                
+                gate_mean=None
+
+            # 将纯净细化后的特征送入最终预测头
             outputs_class = self.class_embed[lvl](cls_feat)
             outputs_objectness_lvl = self.prob_obj_head[lvl](obj_feat)
             outputs_unknownness_lvl = self.unk_embed[lvl](unk_feat).squeeze(-1)
 
-            tmp = self.bbox_embed[lvl](hs[lvl])
+
+            tmp = self.bbox_embed[lvl](hs_for_bbox)
             if reference.shape[-1] == 4:
                 tmp += reference
             else:
@@ -195,21 +279,28 @@ class DeformableDETRUOD(nn.Module):
             outputs_objectness.append(outputs_objectness_lvl)
             outputs_unknownness.append(outputs_unknownness_lvl)
 
+            # 保存最后一次循环的特征映射，用于 CH4 的特征正交 Loss
+            if lvl == hs.shape[0] - 1:
+                final_obj_feat = obj_feat
+                final_unk_feat = unk_feat
+                final_cls_feat = cls_feat
+                
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
         outputs_objectness = torch.stack(outputs_objectness)
         outputs_unknownness = torch.stack(outputs_unknownness)
 
-        final_hs = hs[-1]
         out = {
             'pred_logits': outputs_class[-1],
             'pred_boxes': outputs_coord[-1],
             'pred_obj': outputs_objectness[-1],
             'pred_unk': outputs_unknownness[-1],
-            'proj_obj': self.obj_proj[-1](final_hs),
-            'proj_unk': self.unk_proj[-1](final_hs),
-            'proj_cls': self.cls_proj[-1](final_hs),
+            'proj_obj': final_obj_feat,   
+            'proj_unk': final_unk_feat,   
+            'proj_cls': final_cls_feat,   
         }
+        if gate_mean:
+            out['gate_mean'] = gate_mean
 
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_objectness, outputs_unknownness)
@@ -239,7 +330,8 @@ class SetCriterion(nn.Module):
         self.empty_weight = empty_weight
         self.invalid_cls_logits = invalid_cls_logits
         self.hidden_dim = hidden_dim
-        self.min_obj = -hidden_dim * math.log(0.9)
+        # self.min_obj = -hidden_dim * math.log(0.9)
+        self.min_obj = -hidden_dim * math.log(0.999)
         self.args = args
 
         self.enable_unknown = bool(getattr(args, 'uod_enable_unknown', False))
@@ -281,6 +373,7 @@ class SetCriterion(nn.Module):
             loss = loss * query_weights.unsqueeze(-1)
         return loss.mean(1).sum() / num_boxes
 
+
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True,
                     dummy_pos_indices=None, dummy_pos_weights=None, **kwargs):
         assert 'pred_logits' in outputs
@@ -307,8 +400,13 @@ class SetCriterion(nn.Module):
                     conf = torch.as_tensor(dummy_pos_weights[b_idx], dtype=src_logits.dtype, device=src_logits.device)
                 else:
                     conf = torch.ones(len(q_list), dtype=src_logits.dtype, device=src_logits.device)
+                
                 attn = 1.0 - self.uod_cls_soft_attn_alpha * conf
                 attn = torch.clamp(attn, min=self.uod_cls_soft_attn_min, max=1.0)
+                # 两段式, 如果置信度很高, 直接硬豁免.
+                hard_mask = conf >= 0.8
+                attn[hard_mask] = 0.0
+                
                 query_weights[b_idx, q] = attn
 
         if query_weights is None:
@@ -326,6 +424,59 @@ class SetCriterion(nn.Module):
             losses['class_error'] = src_logits.sum() * 0.0
         return losses
 
+    
+    # def loss_labels(self, outputs, targets, indices, num_boxes, log=True,
+    #                 dummy_pos_indices=None, dummy_pos_weights=None, **kwargs):
+    #     assert 'pred_logits' in outputs
+    #     temp_src_logits = outputs['pred_logits'].clone()
+    #     temp_src_logits[:, :, self.invalid_cls_logits] = -10e10
+    #     src_logits = temp_src_logits
+
+    #     idx = self._get_src_permutation_idx(indices)
+    #     target_classes_o = torch.cat([t['labels'][J] for t, (_, J) in zip(targets, indices)])
+
+    #     # =====================================================================
+    #     # 【架构重构：基于 Focal Loss 的纯净标签空间】
+    #     # 默认初始化全为 0。在 Focal Loss 的语义下，全 0 就代表“纯背景”。
+    #     # 我们不再强制给未匹配的 Query 赋予某个特定的“背景类别”索引。
+    #     # =====================================================================
+    #     target_classes_onehot = torch.zeros(src_logits.shape, dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
+
+    #     # 1. 已知类硬标签 (Hard Labels for Known Classes): Target = 1.0
+    #     target_classes_onehot[idx[0], idx[1], target_classes_o] = 1.0
+
+    #     # =====================================================================
+    #     # 【核心创新：不确定性感知软目标 (Uncertainty-Aware Soft Target)】
+    #     # 我们征用最后一个维度 (self.num_classes - 1) 作为专属的“未知类”通道。
+    #     # 对于挖掘出的伪未知正样本，将几何平均置信度 (Conf) 作为它的正向监督信号！
+    #     # =====================================================================
+    #     unknown_class_index = self.num_classes - 1
+        
+    #     if dummy_pos_indices is not None and dummy_pos_weights is not None:
+    #         for b_idx, q_list in enumerate(dummy_pos_indices):
+    #             if len(q_list) > 0:
+    #                 q_tensor = torch.as_tensor(q_list, dtype=torch.long, device=src_logits.device)
+    #                 # 这里的 dummy_pos_weights 就是你在挖掘流程中算出的几何平均 Conf
+    #                 conf_tensor = torch.as_tensor(dummy_pos_weights[b_idx], dtype=src_logits.dtype, device=src_logits.device)
+                    
+    #                 # 赋予正向的软标签增强！它不再是被压制的背景了！
+    #                 target_classes_onehot[b_idx, q_tensor, unknown_class_index] = conf_tensor
+
+    #     # 3. 直接计算 Focal Loss（不再需要繁琐的 query_weights 软掩码抑制了！）
+    #     # 注意：这里的 empty_weight 刚好会作用在最后一个维度上，这非常完美地缓解了
+    #     # 纯背景样本过多导致的类别不平衡问题。
+    #     loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha,
+    #                                  num_classes=self.num_classes, empty_weight=self.empty_weight) * src_logits.shape[1]
+
+    #     losses = {'loss_ce': loss_ce}
+        
+    #     if log and len(target_classes_o) > 0:
+    #         losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
+    #     elif log:
+    #         losses['class_error'] = src_logits.sum() * 0.0
+            
+    #     return losses
+    
     @torch.no_grad()
     def loss_cardinality(self, outputs, targets, indices, num_boxes):
         pred_logits = outputs['pred_logits']
@@ -413,19 +564,15 @@ class SetCriterion(nn.Module):
         dummy_neg_indices = [[] for _ in range(batch_size)]
         dummy_pos_weights = [[] for _ in range(batch_size)]
         stats = {
-            'num_dummy_pos': 0.0,
-            'num_dummy_neg': 0.0,
-            'num_valid_unmatched': 0.0,
-            'num_pos_candidates': 0.0,
-            'num_batch_selected_pos': 0.0,
-            'pos_thresh_sum': 0.0,
-            'num_thresh': 0.0,
+            'num_dummy_pos': 0.0, 'num_dummy_neg': 0.0,
+            'num_valid_unmatched': 0.0, 'num_pos_candidates': 0.0,
+            'num_batch_selected_pos': 0.0, 'pos_thresh_sum': 0.0, 'num_thresh': 0.0,
         }
 
         if (not self.enable_pseudo) or epoch < self.uod_start_epoch:
             return dummy_pos_indices, dummy_neg_indices, dummy_pos_weights, stats
 
-        # 这里的 energy 实际上是马氏距离的变体，值越小说明越像物体
+        # 注意：这里的 energy 实际上是马氏距离的变体，值越小说明越像物体
         energy = outputs['pred_obj'].detach() / float(self.hidden_dim)
         pred_boxes = outputs['pred_boxes'].detach()
         pred_probs = outputs['pred_logits'].detach().sigmoid().clone()
@@ -440,13 +587,31 @@ class SetCriterion(nn.Module):
             matched = set(src_idx.tolist())
             unmatched = [q for q in range(num_queries) if q not in matched]
 
+            # =====================================================================
+            # 创新点 1：基于高斯分布 3-Sigma 法则的数据驱动自适应阈值
+            # 彻底摒弃 uod_pos_quantile 和 uod_pos_scale 等人工设定的经验比例
+            # =====================================================================
             if len(src_idx) > 0:
                 matched_scores = energy[i, src_idx]
-                base_thresh = torch.quantile(matched_scores, self.uod_pos_quantile).item()
-                pos_thresh = max(base_thresh * self.uod_pos_scale, self.uod_min_pos_thresh)
+                mu_obj = matched_scores.mean().item()
+                std_obj = matched_scores.std().item() if len(src_idx) > 1 else 0.0
+                
+                # 统计学先验：正态分布下，mu + 3*std 覆盖了 99.7% 的有效物体分布
+                pos_thresh = mu_obj + 3.0 * std_obj
+                # 保底机制防止方差极度坍塌
+                pos_thresh = max(pos_thresh, self.uod_min_pos_thresh)
             else:
                 pos_thresh = self.uod_min_pos_thresh
-            neg_thresh = pos_thresh + self.uod_neg_margin
+
+            # 自适应负样本（背景）阈值：纯背景的能量应该大于未匹配 Queries 的均值
+            if len(unmatched) > 0:
+                unmatched_scores = energy[i, unmatched]
+                mu_bg = unmatched_scores.mean().item()
+                # 负样本的门槛：至少要达到纯背景的平均“距离”，且不能与正样本阈值重叠
+                neg_thresh = max(mu_bg, pos_thresh + 0.5)
+            else:
+                neg_thresh = pos_thresh + 0.5
+
             stats['pos_thresh_sum'] += pos_thresh
             stats['num_thresh'] += 1.0
 
@@ -475,15 +640,24 @@ class SetCriterion(nn.Module):
             stats['num_valid_unmatched'] += float(len(valid))
             known_max = pred_probs[i].max(dim=-1)[0]
 
+            # =====================================================================
+            # 创新点 2：非线性几何平均 (Geometric Mean) 替代硬编码线性加权
+            # 彻底抛弃 0.5, 0.3, 0.2 的人工调参，引入“一票否决”机制
+            # =====================================================================
             pos_candidates = []
             for q in valid:
                 e = energy[i, q].item()
                 k = known_max[q].item()
                 if e < pos_thresh and k < self.uod_known_reject_thresh:
+                    # 分别计算三个维度的相对置信度 (0 到 1 之间)
                     energy_rel = max(0.0, min(1.0, (pos_thresh - e) / max(pos_thresh, 1e-6)))
                     known_rel = max(0.0, min(1.0, (self.uod_known_reject_thresh - k) / max(self.uod_known_reject_thresh, 1e-6)))
                     iou_rel = 1.0 - max(0.0, min(1.0, iou_map[q] / max(self.uod_max_iou, 1e-6)))
-                    conf = 0.5 * energy_rel + 0.3 * known_rel + 0.2 * iou_rel
+                    
+                    # 几何平均数：任何一个维度表现极差（接近0），整体置信度都会崩溃
+                    # 这符合“木桶原理”，极其适合高质量伪标签的苛刻筛选
+                    conf = (energy_rel * known_rel * iou_rel) ** (1.0 / 3.0)
+                    
                     item = (i, q, conf, e, k)
                     pos_candidates.append(item)
                     all_pos_candidates.append(item)
@@ -495,6 +669,7 @@ class SetCriterion(nn.Module):
                 for q in valid:
                     e = energy[i, q].item()
                     k = known_max[q].item()
+                    # 用自适应的 neg_thresh 替代原来死板的 margin
                     if e > neg_thresh and k < self.uod_known_reject_thresh:
                         neg_candidates.append((q, e, k))
                 neg_candidates.sort(key=lambda x: (-x[1], x[2]))
@@ -502,6 +677,7 @@ class SetCriterion(nn.Module):
                 dummy_neg_indices[i] = [q for q, _, _ in neg_candidates]
                 stats['num_dummy_neg'] += float(len(dummy_neg_indices[i]))
 
+        # Batch 动态分配逻辑保留，它根据我们算出的几何平均置信度进行排序截断
         if self.enable_batch_dynamic:
             all_pos_candidates.sort(key=lambda x: (-x[2], x[3], x[4]))
             topk = min(self.uod_batch_topk_max, max(1, int(math.ceil(self.uod_batch_topk_ratio * max(len(all_pos_candidates), 1)))))
@@ -529,7 +705,8 @@ class SetCriterion(nn.Module):
 
         stats['num_dummy_pos'] = float(sum(len(v) for v in dummy_pos_indices))
         return dummy_pos_indices, dummy_neg_indices, dummy_pos_weights, stats
-
+    
+    
     def loss_obj_pseudo(self, outputs, targets, indices, num_boxes,
                         dummy_pos_indices=None, dummy_pos_weights=None, **kwargs):
         assert 'pred_obj' in outputs
@@ -650,7 +827,29 @@ class SetCriterion(nn.Module):
         z_obj = outputs['proj_obj']
         z_unk = outputs['proj_unk']
         z_cls = outputs['proj_cls']
-        loss = self._feature_orth_loss(z_obj, z_unk) + self._feature_orth_loss(z_obj, z_cls) + self._feature_orth_loss(z_unk, z_cls)
+        # loss = self._feature_orth_loss(z_obj, z_unk) + self._feature_orth_loss(z_obj, z_cls) + self._feature_orth_loss(z_unk, z_cls)
+        
+        ########## 增加 ############################################
+        # 提取 objectness prob 作为前景掩码，阻断背景噪声的疯狂梯度
+        obj_temp = float(getattr(self.args, 'obj_temp', 1.0))
+        obj_prob = torch.exp(-(obj_temp / float(self.hidden_dim)) * outputs['pred_obj'])
+        
+        # 建议正交损失的掩码严格一点，保证只在确信的物体上做特征解耦
+        fg_mask = obj_prob > 0.1 
+        
+        if fg_mask.sum() < 2:
+            return {'loss_orth': outputs['pred_logits'].sum() * 0.0}
+
+        # 只提取前景特征进行正交计算 [N_fg, C]
+        z_obj_fg = z_obj[fg_mask]
+        z_unk_fg = z_unk[fg_mask]
+        z_cls_fg = z_cls[fg_mask]
+
+        loss = self._feature_orth_loss(z_obj_fg, z_unk_fg) + \
+               self._feature_orth_loss(z_obj_fg, z_cls_fg) + \
+               self._feature_orth_loss(z_unk_fg, z_cls_fg)
+        ########## 增加-结束 ############################################
+        
         return {'loss_orth': loss / 3.0}
 
     def _corr_loss(self, x, y, mask=None):
@@ -834,16 +1033,31 @@ class PostProcess(nn.Module):
         prob[:, :, self.invalid_cls_logits] = 0.0
 
         if pred_unk is not None:
-            unk_prob = torch.sigmoid(pred_unk)
-            is_unknown = unk_prob > 0.55
-            prob[:, :, :-1] = prob[:, :, :-1].masked_fill(is_unknown.unsqueeze(-1), 0.0)
-            max_known_prob = prob[:, :, :-1].max(dim=-1)[0]
-            # prob = prob * (1.0 - unk_prob.unsqueeze(-1))
-            # prob[:, :, -1] = (obj_prob.squeeze(-1) * unk_prob)
-            # (a) 用未知概率压制已知类得分
-            # prob[:, :, :-1] = prob[:, :, :-1] * (1.0 - unk_prob.unsqueeze(-1))
-            # (b) 用已知概率压制未知类得分
+            unk_prob = torch.sigmoid(pred_unk)                    # [B, Q]
+
+            # --- 护城河：绝对置信度拦截 (解决 A-OSE 暴涨的唯一解) ---
+            known_prob = logits.sigmoid()
+            # 必须大于 0.05（或0.1），否则原始概率太低，直接归零，禁止通过乘法泄漏
+            valid_known_mask = known_prob > 0.2
+            known_prob = known_prob * valid_known_mask.float()
+            
+            known_prob[:, :, self.invalid_cls_logits] = 0.0
+            known_prob[:, :, -1] = 0.0                           # 最后一维不参与 known max
+
+            max_known_prob = known_prob[:, :, :-1].max(dim=-1)[0]   # [B, Q]
+
+            # 1) known 分数：保留你的 soft suppression
+            beta = 1.5
+            prob[:, :, :-1] = obj_prob * known_prob[:, :, :-1] * (1.0 - beta * unk_prob.unsqueeze(-1))
+
+            # 2) unknown 分数：保留你的 known-aware 抑制
             prob[:, :, -1] = obj_prob.squeeze(-1) * unk_prob * (1.0 - max_known_prob)
+            
+            # --- 终极保险：强制排他 (可选，但强烈建议加上) ---
+            # 即使经过软抑制，如果 unk 明显大于 known，还是建议把 known 清零
+            # 避免评测脚本惩罚双重预测
+            is_unknown = unk_prob > max_known_prob
+            prob[:, :, :-1] = prob[:, :, :-1].masked_fill(is_unknown.unsqueeze(-1), 0.0)
 
         topk_values, topk_indexes = torch.topk(prob.view(logits.shape[0], -1), self.pred_per_im, dim=1)
         scores = topk_values

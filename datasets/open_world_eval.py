@@ -47,13 +47,9 @@ class OWEvaluator:
             self.unknown_class_index = self.total_num_class - 1
             self.num_seen_classes = self.prev_intro_cls + self.curr_intro_cls
             self.known_classes = self._class_names[:self.num_seen_classes]
-            # print("testing data details")
-            # print(self.total_num_class)
-            # print(self.unknown_class_index)
-            # print(self.known_classes)
-            # print(self.voc_gt.CLASS_NAMES)
-            logger.info("Testing data details")
-            logger.info("total classes, unknown index, known classes, all classes: ")
+
+            logger.info("Testing data details:")
+            logger.info("total classes\t, unknown index\t, known classes\t, all classes: ")
             logger.info(f"{self.total_num_class}, {self.unknown_class_index}, {self.known_classes}, {self.voc_gt.CLASS_NAMES}")
 
 

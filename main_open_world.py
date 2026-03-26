@@ -18,7 +18,6 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from util.log import setup_logging
 
 import datasets
 import datasets.samplers as samplers
@@ -26,8 +25,20 @@ import util.misc as utils
 from datasets.coco import make_coco_transforms
 from datasets.torchvision_datasets.open_world import OWDetection
 from engine import evaluate, get_exemplar_replay, train_one_epoch
+from util.log import setup_logging
 from models import build_model
 
+
+METRICS_JSONL = 'metrics_log.jsonl'
+
+
+def _safe_float(x):
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
 
 
 def _sanitize_for_checkpoint(obj):
@@ -52,6 +63,336 @@ def _build_checkpoint_args(args):
     return _sanitize_for_checkpoint(args)
 
 
+def _safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def _read_metrics_history(metrics_jsonl_path: Path):
+    history = []
+    if not metrics_jsonl_path.exists():
+        return history
+
+    for line in metrics_jsonl_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+
+        metrics = record.get('test_metrics', {}) or {}
+        epoch = record.get('epoch', None)
+        if epoch is None or not isinstance(metrics, dict) or not metrics:
+            continue
+
+        history.append({
+            'epoch': int(epoch),
+            'Current AP50': _safe_float(metrics.get('CK_AP50')),
+            'Known AP50': _safe_float(metrics.get('K_AP50')),
+            'Unknown Recall50': _safe_float(metrics.get('U_R50')),
+            'WI@0.8': _safe_float(metrics.get('WI')),
+            'A-OSE': _safe_float(metrics.get('AOSA', metrics.get('A-OSE'))),
+        })
+
+    history.sort(key=lambda x: x['epoch'])
+    return history
+
+def _filter_valid_series(history, key):
+    xs, ys = [], []
+    for item in history:
+        val = item.get(key)
+        if val is None:
+            continue
+        xs.append(item['epoch'])
+        ys.append(val)
+    return xs, ys
+
+
+def _plot_percent_metric_trends(history, plots_dir: Path):
+    keys = ['Current AP50', 'Known AP50', 'Unknown Recall50']
+    has_any = any(_filter_valid_series(history, k)[0] for k in keys)
+    if not has_any:
+        return
+
+    plt.figure(figsize=(10, 6))
+    for key in keys:
+        xs, ys = _filter_valid_series(history, key)
+        if xs:
+            plt.plot(xs, ys, marker='o', linewidth=2, label=key)
+
+    plt.xlabel('Epoch')
+    plt.ylabel('Percentage (%)')
+    plt.title('Open-World Percentage Metrics')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(plots_dir / 'open_world_metric_trends_percent.png', dpi=200)
+    plt.close()
+    
+def _plot_openworld_metric_trends(history, plots_dir: Path):
+    xs_wi, ys_wi = _filter_valid_series(history, 'WI@0.8')
+    xs_ose, ys_ose = _filter_valid_series(history, 'A-OSE')
+    if not xs_wi and not xs_ose:
+        return
+
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+
+    lines = []
+    labels = []
+
+    if xs_wi:
+        l1 = ax1.plot(xs_wi, ys_wi, marker='o', linewidth=2,
+                      label='WI@Recall0.8, IoU50')
+        lines += l1
+        labels += [line.get_label() for line in l1]
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Wilderness Impact (lower is better)')
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = ax1.twinx()
+    if xs_ose:
+        l2 = ax2.plot(xs_ose, ys_ose, marker='s', linewidth=2,
+                      label='A-OSE@IoU50')
+        lines += l2
+        labels += [line.get_label() for line in l2]
+    ax2.set_ylabel('Absolute Open-Set Error (lower is better)')
+
+    if lines:
+        ax1.legend(lines, labels, loc='best')
+
+    plt.title('Open-World Error Metrics')
+    fig.tight_layout()
+    fig.savefig(plots_dir / 'open_world_metric_trends_openworld.png', dpi=200)
+    plt.close(fig)
+
+def _plot_current_metric_bars(history, plots_dir: Path):
+    if not history:
+        return
+    latest = history[-1]
+
+    # 百分比指标
+    percent_items = [
+        ('Current AP50', latest.get('Current AP50')),
+        ('Known AP50', latest.get('Known AP50')),
+        ('Unknown Recall50', latest.get('Unknown Recall50')),
+    ]
+    percent_items = [(k, v) for k, v in percent_items if v is not None]
+    if percent_items:
+        plt.figure(figsize=(8, 5))
+        labels = [k for k, _ in percent_items]
+        values = [v for _, v in percent_items]
+        plt.bar(labels, values)
+        plt.ylabel('Percentage (%)')
+        plt.title(f'Current Percentage Metrics (Epoch {latest["epoch"]})')
+        plt.xticks(rotation=15)
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'current_metrics_bar_percent.png', dpi=200)
+        plt.close()
+
+    # 开放世界误差指标
+    wi_val = latest.get('WI@0.8')
+    ose_val = latest.get('A-OSE')
+    if wi_val is not None or ose_val is not None:
+        fig, ax1 = plt.subplots(figsize=(8, 5))
+        ax1.set_xticks([0, 1])
+        ax1.set_xticklabels(['WI@0.8', 'A-OSE'], rotation=15)
+        ax1.set_ylabel('WI@0.8 (lower is better)')
+
+        if wi_val is not None:
+            ax1.bar([0], [wi_val], width=0.5)
+
+        if ose_val is not None:
+            ax2 = ax1.twinx()
+            ax2.bar([1], [ose_val], width=0.5)
+            ax2.set_ylabel('A-OSE (lower is better)')
+
+        fig.suptitle(f'Current Open-World Error Metrics (Epoch {latest["epoch"]})')
+        fig.tight_layout()
+        fig.savefig(plots_dir / 'current_metrics_bar_openworld.png', dpi=200)
+        plt.close(fig)
+        
+        
+def _plot_training_loss_trends(metrics_jsonl_path: Path, plots_dir: Path):
+    if not metrics_jsonl_path.exists():
+        return
+
+    epochs = []
+    total_losses = []
+    objectness_losses = []
+    unknown_losses = []
+    pseudo_losses = []
+    negative_losses = []
+
+    for line in metrics_jsonl_path.read_text().splitlines():
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+
+        epoch = record.get('epoch')
+        if epoch is None:
+            continue
+
+        train_loss = record.get('train_loss')
+        if train_loss is not None:
+            epochs.append(epoch)
+            total_losses.append(float(train_loss))
+
+            obj_loss = record.get('train_loss_obj_ll_unscaled', record.get('train_loss_obj_ll'))
+            unk_loss = record.get('train_loss_unk_unscaled', record.get('train_loss_unk'))
+            pseudo_loss = record.get('train_loss_obj_pseudo_unscaled', record.get('train_loss_obj_pseudo'))
+            neg_loss = record.get('train_loss_obj_neg_unscaled', record.get('train_loss_obj_neg'))
+
+            objectness_losses.append(None if obj_loss is None else float(obj_loss))
+            unknown_losses.append(None if unk_loss is None else float(unk_loss))
+            pseudo_losses.append(None if pseudo_loss is None else float(pseudo_loss))
+            negative_losses.append(None if neg_loss is None else float(neg_loss))
+
+    if not epochs:
+        return
+
+    # 1) 总损失
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, total_losses, marker='o', linewidth=2, label='train_loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training Total Loss Trend')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(plots_dir / 'training_loss_total_trend.png', dpi=200)
+    plt.close()
+
+    # 2) 开放世界相关损失分量
+    component_series = {
+        # 'objectness_ll': objectness_losses,
+        'unknown': unknown_losses,
+        'pseudo_pos': pseudo_losses,
+        'pseudo_neg': negative_losses,
+    }
+    has_component = any(any(v is not None for v in vals) for vals in component_series.values())
+    if has_component:
+        plt.figure(figsize=(10, 6))
+        for name, vals in component_series.items():
+            xs = [e for e, v in zip(epochs, vals) if v is not None]
+            ys = [v for v in vals if v is not None]
+            if xs:
+                plt.plot(xs, ys, marker='o', linewidth=1.8, label=name)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Open-World Loss Components')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'training_loss_openworld_components.png', dpi=200)
+        plt.close()
+        
+        # 这里单独画objectness_ll是因为它的数值范围可能和其他loss分量差很多，放在一起可能不好看
+        plt.figure(figsize=(10, 6))
+        xs = [e for e, v in zip(epochs, objectness_losses) if v is not None]
+        ys = [v for v in objectness_losses if v is not None]
+        plt.plot(xs, ys, marker='o', linewidth=1.8, label='objectness_ll')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Objectness Loss Trend')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'training_loss_objectness_trend.png', dpi=200)
+        plt.close()
+
+def _plot_pseudo_stat_trends(metrics_jsonl_path: Path, plots_dir: Path):
+    if not metrics_jsonl_path.exists():
+        return
+
+    count_keys = [
+        'train_stat_num_dummy_pos',
+        'train_stat_num_dummy_neg',
+        'train_stat_num_valid_unmatched',
+        'train_stat_num_pos_candidates',
+        'train_stat_num_batch_selected_pos',
+    ]
+    thresh_keys = ['train_stat_pos_thresh_mean']
+
+    count_data = {k: {'x': [], 'y': []} for k in count_keys}
+    thresh_data = {k: {'x': [], 'y': []} for k in thresh_keys}
+
+    for line in metrics_jsonl_path.read_text().splitlines():
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+
+        epoch = record.get('epoch')
+        if epoch is None:
+            continue
+
+        for key in count_keys:
+            val = record.get(key)
+            if val is not None:
+                count_data[key]['x'].append(epoch)
+                count_data[key]['y'].append(float(val))
+
+        for key in thresh_keys:
+            val = record.get(key)
+            if val is not None:
+                thresh_data[key]['x'].append(epoch)
+                thresh_data[key]['y'].append(float(val))
+
+    # 1) 数量型统计
+    if any(v['x'] for v in count_data.values()):
+        plt.figure(figsize=(11, 7))
+        display_names = {
+            'train_stat_num_dummy_pos': 'dummy_pos',
+            'train_stat_num_dummy_neg': 'dummy_neg',
+            'train_stat_num_valid_unmatched': 'valid_unmatched',
+            'train_stat_num_pos_candidates': 'pos_candidates',
+            'train_stat_num_batch_selected_pos': 'batch_selected_pos',
+        }
+        for key, v in count_data.items():
+            if v['x']:
+                plt.plot(v['x'], v['y'], marker='o', linewidth=1.8, label=display_names.get(key, key))
+        plt.xlabel('Epoch')
+        plt.ylabel('Count')
+        plt.title('Pseudo-Supervision Count Statistics')
+        plt.grid(True, alpha=0.3)
+        plt.legend(fontsize=9)
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'pseudo_stat_counts.png', dpi=200)
+        plt.close()
+
+    # 2) 阈值型统计
+    if any(v['x'] for v in thresh_data.values()):
+        plt.figure(figsize=(10, 6))
+        for key, v in thresh_data.items():
+            if v['x']:
+                plt.plot(v['x'], v['y'], marker='o', linewidth=2, label='pos_thresh_mean')
+        plt.xlabel('Epoch')
+        plt.ylabel('Threshold')
+        plt.title('Pseudo-Supervision Threshold Trend')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'pseudo_stat_thresholds.png', dpi=200)
+        plt.close()
+
+def _refresh_metric_plots(output_dir: Path):
+    plots_dir = output_dir / 'plots'
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    metrics_jsonl_path = output_dir / METRICS_JSONL
+
+    history = _read_metrics_history(metrics_jsonl_path)
+    _plot_percent_metric_trends(history, plots_dir)
+    _plot_openworld_metric_trends(history, plots_dir)
+    _plot_current_metric_bars(history, plots_dir)
+    _plot_training_loss_trends(metrics_jsonl_path, plots_dir)
+    _plot_pseudo_stat_trends(metrics_jsonl_path, plots_dir)
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Deformable DETR Detector', add_help=False)
     ################ Deformable DETR ################
@@ -62,7 +403,7 @@ def get_args_parser():
     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
     parser.add_argument('--batch_size', default=5, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=51, type=int)
+    parser.add_argument('--epochs', default=41, type=int)
     parser.add_argument('--lr_drop', default=35, type=int)
     parser.add_argument('--lr_drop_epochs', default=None, type=int, nargs='+')
     parser.add_argument('--clip_max_norm', default=0.1, type=float, help='gradient clipping max norm')
@@ -105,12 +446,9 @@ def get_args_parser():
     parser.add_argument('--resume', default='', help='resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')
     parser.add_argument('--eval', action='store_true')
-    parser.add_argument('--viz', action='store_true')
+    parser.add_argument('--viz', default=True, action='store_true')
     parser.add_argument('--viz_num_samples', default=12, type=int)
     parser.add_argument('--viz_tb_images', default=4, type=int)
-    parser.add_argument('--viz_score_thresh', default=0.20, type=float)
-    parser.add_argument('--viz_max_query_points', default=2500, type=int)
-    parser.add_argument('--viz_max_feature_points', default=2500, type=int)
     parser.add_argument('--eval_every', default=5, type=int)
     parser.add_argument('--num_workers', default=3, type=int)
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
@@ -135,13 +473,12 @@ def get_args_parser():
     parser.add_argument('--unk_conf_w', default=1.0, type=float)
 
     ################ PROB OWOD ################
-    parser.add_argument('--model_type', default='prob', type=str, choices=['prob', 'uod', 'probplus'])
-    # deprecated but kept for CLI compatibility; ignored.
+    parser.add_argument('--model_type', default='prob', type=str, choices=['prob', 'uod', 'uod_paramless'])
     parser.add_argument('--wandb_name', default='', type=str)
     parser.add_argument('--wandb_project', default='', type=str)
 
-    parser.add_argument('--obj_loss_coef', default=1, type=float)
-    parser.add_argument('--obj_temp', default=1, type=float)
+    parser.add_argument('--obj_loss_coef', default=8e-4, type=float)
+    parser.add_argument('--obj_temp', default=1.3, type=float)
     parser.add_argument('--freeze_prob_model', default=False, action='store_true', help='freeze probabilistic estimation')
 
     parser.add_argument('--num_inst_per_class', default=50, type=int, help='number of instances per class')
@@ -157,6 +494,8 @@ def get_args_parser():
     parser.add_argument('--uod_enable_pseudo', default=False, action='store_true', help='enable pseudo unknown supervision')
     parser.add_argument('--uod_enable_batch_dynamic', default=False, action='store_true', help='enable batch-level dynamic pseudo allocation')
     parser.add_argument('--uod_enable_decorr', default=False, action='store_true', help='enable triplet decoupled optimization')
+    parser.add_argument('--uod_enable_cls_soft_attn', default=False, action='store_true', help='attenuate classification loss on pseudo-positive queries')
+    parser.add_argument('--uod_enable_odqe', default=False, action='store_true', help='enable object-aware task decouple query enhancement(ODQE) module')
 
     parser.add_argument('--unk_loss_coef', default=0.3, type=float, help='weight of matched-known negative unknownness loss')
     parser.add_argument('--uod_pseudo_unk_loss_coef', default=0.4, type=float, help='weight of pseudo-unknown unknownness loss')
@@ -166,8 +505,8 @@ def get_args_parser():
     parser.add_argument('--uod_orth_loss_coef', default=0.05, type=float, help='weight of feature orthogonality loss')
     parser.add_argument('--uod_decorr_loss_coef', default=0.05, type=float, help='weight of prediction decorrelation loss')
 
-    parser.add_argument('--uod_start_epoch', default=8, type=int, help='epoch to start pseudo supervision')
-    parser.add_argument('--uod_neg_warmup_epochs', default=3, type=int, help='delay reliable-background losses after pseudo start')
+    parser.add_argument('--uod_start_epoch', default=3, type=int, help='epoch to start pseudo supervision')
+    parser.add_argument('--uod_neg_warmup_epochs', default=2, type=int, help='delay reliable-background losses after pseudo start')
     parser.add_argument('--uod_pos_quantile', default=0.25, type=float, help='matched energy quantile used as threshold base')
     parser.add_argument('--uod_pos_scale', default=1.2, type=float, help='positive threshold scale')
     parser.add_argument('--uod_min_pos_thresh', default=0.08, type=float, help='minimum pseudo-positive energy threshold')
@@ -182,6 +521,8 @@ def get_args_parser():
     parser.add_argument('--uod_min_area', default=0.002, type=float, help='min normalized area for pseudo candidates')
     parser.add_argument('--uod_min_side', default=0.05, type=float, help='min normalized side length for pseudo candidates')
     parser.add_argument('--uod_max_aspect_ratio', default=4.0, type=float, help='max aspect ratio for pseudo candidates')
+    parser.add_argument('--uod_cls_soft_attn_alpha', default=0.8, type=float, help='strength of pseudo-positive classification attenuation')
+    parser.add_argument('--uod_cls_soft_attn_min', default=0.1, type=float, help='minimum query weight under classification attenuation')
 
     return parser
 
@@ -262,111 +603,22 @@ def _log_test_stats_to_tb(writer, test_stats, epoch):
         if key == 'metrics' and isinstance(val, dict):
             for mk, mv in val.items():
                 if isinstance(mv, (int, float)):
-                    writer.add_scalar(f'eval_metrics/{mk}', mv, epoch)
+                    tag = 'A-OSE' if mk == 'AOSA' else mk
+                    writer.add_scalar(f'eval_metrics/{tag}', mv, epoch)
         elif isinstance(val, (int, float)):
             writer.add_scalar(f'eval/{key}', val, epoch)
 
-
-
-def _read_log_jsonl(log_path):
-    rows = []
-    if not os.path.exists(log_path):
-        return rows
-    with open(log_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                continue
-    return rows
-
-
-def _extract_series(rows, key_chain):
-    xs, ys = [], []
-    for row in rows:
-        cur = row
-        ok = True
-        for k in key_chain:
-            if isinstance(cur, dict) and k in cur:
-                cur = cur[k]
-            else:
-                ok = False
-                break
-        if ok and isinstance(cur, (int, float)) and 'epoch' in row:
-            xs.append(int(row['epoch']))
-            ys.append(float(cur))
-    return xs, ys
-
-
-def _save_history_plots(output_dir, writer=None):
-    log_path = os.path.join(output_dir, 'log.txt')
-    rows = _read_log_jsonl(log_path)
-    if not rows:
-        return
-    plot_dir = os.path.join(output_dir, 'plots')
-    os.makedirs(plot_dir, exist_ok=True)
-
-    plot_groups = [
-        ('open_world_metric_trends.png', [
-            ('U_R50', ['test_metrics', 'U_R50']),
-            ('U_AP50', ['test_metrics', 'U_AP50']),
-            ('K_AP50', ['test_metrics', 'K_AP50']),
-            ('PK_AP50', ['test_metrics', 'PK_AP50']),
-            ('WI', ['test_metrics', 'WI']),
-            ('AOSA', ['test_metrics', 'AOSA']),
-        ], 'Open-world metric trends'),
-        ('training_loss_trends.png', [
-            ('train_loss', ['train_loss']),
-            ('train_loss_ce', ['train_loss_ce']),
-            ('train_loss_bbox', ['train_loss_bbox']),
-            ('train_loss_giou', ['train_loss_giou']),
-            ('train_loss_obj_ll', ['train_loss_obj_ll']),
-        ], 'Training loss trends'),
-        ('pseudo_stat_trends.png', [
-            ('dummy_pos', ['train_stat_num_dummy_pos']),
-            ('dummy_neg', ['train_stat_num_dummy_neg']),
-            ('valid_unmatched', ['train_stat_num_valid_unmatched']),
-            ('pos_candidates', ['train_stat_num_pos_candidates']),
-            ('batch_selected_pos', ['train_stat_num_batch_selected_pos']),
-            ('pos_thresh_mean', ['train_stat_pos_thresh_mean']),
-        ], 'Pseudo supervision statistics'),
-    ]
-
-    for filename, series_cfg, title in plot_groups:
-        fig, ax = plt.subplots(1, 1, figsize=(9, 4.5))
-        plotted = False
-        for name, chain in series_cfg:
-            xs, ys = _extract_series(rows, chain)
-            if xs:
-                ax.plot(xs, ys, marker='o', label=name)
-                plotted = True
-        if not plotted:
-            plt.close(fig)
-            continue
-        ax.set_title(title)
-        ax.set_xlabel('epoch')
-        ax.grid(alpha=0.2)
-        ax.legend(fontsize=8)
-        fig.tight_layout()
-        out_path = os.path.join(plot_dir, filename)
-        fig.savefig(out_path, dpi=180, bbox_inches='tight')
-        if writer is not None:
-            try:
-                writer.add_figure(f'history/{filename[:-4]}', fig, global_step=len(rows))
-            except Exception:
-                pass
-        plt.close(fig)
-
+def rprint(msg):
+    rank = int(os.environ.get("RANK", -1))
+    print(f"[rank {rank}] {msg}", flush=True)
+    
 def main(args):
     utils.init_distributed_mode(args)
     output_dir = Path(args.output_dir)
     if args.output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
-        
-    setup_logging(output=args.output_dir, distributed_rank=utils.get_rank(), abbrev_name='PROB-UOD')
+    setup_logging(output=args.output_dir, distributed_rank=utils.get_rank(), abbrev_name='PROB')
+    logging.info('Arguments:\n%s', args)
 
     writer = None
     if utils.is_main_process() and args.output_dir:
@@ -378,9 +630,7 @@ def main(args):
         logging.info('TensorBoard log dir: %s', tb_log_dir)
     args.writer = writer
 
-    logging.info('git:\n  %s\n', utils.get_sha())
-    logging.info('args:\n  %s\n', args)
-
+    logging.info('git\n  %s\n', utils.get_sha())
     if args.frozen_weights is not None:
         assert args.masks, 'Frozen training is meant for segmentation only'
 
@@ -442,8 +692,7 @@ def main(args):
         }
     ]
     optimizer = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9,
-                                weight_decay=args.weight_decay) if args.sgd else \
-                torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
+                                weight_decay=args.weight_decay) if args.sgd else torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
 
     if args.distributed:
@@ -464,7 +713,7 @@ def main(args):
         logging.info('%s', msg)
         args.start_epoch = checkpoint.get('epoch', -1) + 1
         if args.eval:
-            test_stats, coco_evaluator = evaluate(model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args, writer=writer, epoch=args.start_epoch)
+            test_stats, coco_evaluator = evaluate(model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args, epoch=args.start_epoch-1)
             _log_test_stats_to_tb(writer, test_stats, args.start_epoch)
             return
 
@@ -492,12 +741,13 @@ def main(args):
             lr_scheduler.step(lr_scheduler.last_epoch)
             args.start_epoch = checkpoint['epoch'] + 1
         if args.eval:
-            test_stats, coco_evaluator = evaluate(model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args, writer=writer, epoch=args.start_epoch)
+            test_stats, coco_evaluator = evaluate(model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args, epoch=args.start_epoch-1)
             _log_test_stats_to_tb(writer, test_stats, args.start_epoch)
             if args.output_dir and coco_evaluator is not None:
                 utils.save_on_master(coco_evaluator.coco_eval['bbox'].eval, output_dir / 'eval.pth')
             return
 
+    
     if args.freeze_prob_model:
         if isinstance(model_without_ddp.prob_obj_head, torch.nn.ModuleList):
             for obj_head in model_without_ddp.prob_obj_head:
@@ -508,6 +758,7 @@ def main(args):
                 model_without_ddp.prob_obj_head.freeze_prob_model()
 
     logging.info('Start training from epoch %s to %s', args.start_epoch, args.epochs)
+    
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -523,7 +774,7 @@ def main(args):
             checkpoint_paths = [output_dir / 'checkpoint.pth']
             should_eval = (epoch + 1) % args.lr_drop == 0 or (epoch % args.eval_every == 0 or epoch == 0 or epoch == 1 or (args.epochs - epoch) < 1)
             if should_eval:
-                test_stats, coco_evaluator = evaluate(model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args, writer=writer, epoch=args.start_epoch)
+                test_stats, coco_evaluator = evaluate(model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args, epoch=epoch)
                 _log_test_stats_to_tb(writer, test_stats, epoch)
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
             elif epoch > args.epochs - 6:
@@ -545,10 +796,32 @@ def main(args):
                      'n_parameters': n_parameters}
 
         if args.output_dir and utils.is_main_process():
-            with (output_dir / 'log.txt').open('a') as f:
+            with (output_dir / METRICS_JSONL).open('a') as f:
                 f.write(json.dumps(log_stats) + '\n')
+            
+            record = {
+                'epoch': epoch,
+                'train_loss': float(train_stats.get('loss', 0.0)) if isinstance(train_stats, dict) else None,
+                'train_loss_obj_ll': train_stats.get('loss_obj_ll') if isinstance(train_stats, dict) else None,
+                'train_loss_unk': train_stats.get('loss_unk') if isinstance(train_stats, dict) else None,
+                'train_loss_obj_pseudo': train_stats.get('loss_obj_pseudo') if isinstance(train_stats, dict) else None,
+                'train_loss_obj_neg': train_stats.get('loss_obj_neg') if isinstance(train_stats, dict) else None,
+                'train_stat_num_dummy_pos': train_stats.get('stat_num_dummy_pos') if isinstance(train_stats, dict) else None,
+                'train_stat_num_dummy_neg': train_stats.get('stat_num_dummy_neg') if isinstance(train_stats, dict) else None,
+                'train_stat_num_valid_unmatched': train_stats.get('stat_num_valid_unmatched') if isinstance(train_stats, dict) else None,
+                'train_stat_num_pos_candidates': train_stats.get('stat_num_pos_candidates') if isinstance(train_stats, dict) else None,
+                'train_stat_num_batch_selected_pos': train_stats.get('stat_num_batch_selected_pos') if isinstance(train_stats, dict) else None,
+                'train_stat_pos_thresh_mean': train_stats.get('stat_pos_thresh_mean') if isinstance(train_stats, dict) else None,
+                'test_metrics': test_stats.get('metrics', {}) if isinstance(test_stats, dict) else {},
+            }
+            with (output_dir / METRICS_JSONL).open('a') as f:
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+                
             if args.viz:
-                _save_history_plots(args.output_dir, writer=writer)
+                try:
+                    _refresh_metric_plots(output_dir)
+                except Exception as e:
+                    logging.error('Failed to refresh metric plots: %s', e)
             if args.dataset in ['owod', 'owdetr', 'TOWOD', 'OWDETR'] and epoch % args.eval_every == 0 and epoch > 0:
                 if coco_evaluator is not None:
                     (output_dir / 'eval').mkdir(exist_ok=True)

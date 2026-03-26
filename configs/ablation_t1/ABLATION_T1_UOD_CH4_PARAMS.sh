@@ -12,7 +12,7 @@
 set -x
 set -euo pipefail
 
-BASE_EXP_DIR="${1:-exps/MOWODB/UOD_ABL_T1_CH4_PARAMS}"
+BASE_EXP_DIR="${1:-/mnt/data/kky/output/PROB/exps/MOWODB/UOD_ABL_T1_CH4_PARAMS}"
 shift $(( $# > 0 ? 1 : 0 )) || true
 PY_ARGS="${@:1}"
 
@@ -25,7 +25,7 @@ BASE_ARGS="\
   --epochs 41 \
   --batch_size 5 \
   --eval_every 5 \
-  --num_workers 16 \
+  --num_workers 8 \
   --obj_loss_coef 8e-4 \
   --obj_temp 1.3 \
   --model_type uod --uod_enable_unknown --uod_enable_pseudo --uod_enable_batch_dynamic --uod_enable_decorr \

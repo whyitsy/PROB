@@ -8,6 +8,8 @@ def build_model(args, mode='owdetr'):
         from .prob_deformable_detr import build
     elif mode == 'uod':
         from .prob_deformable_detr_uod import build
+    elif mode == 'uod_paramless':
+        from .prob_deformable_detr_uod_paramless import build
     else:
         from .deformable_detr import build
     return build(args)

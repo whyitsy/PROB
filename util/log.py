@@ -37,13 +37,13 @@ def setup_logging(output=None, distributed_rank=0, abbrev_name="PROB"):
         
     # 配置根日志器
     logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
     if logger.hasHandlers():
         logger.handlers.clear()
-    logger.setLevel(logging.DEBUG)
     
     # 文件处理器：所有进程记录 DEBUG 及以上
     file_handler = logging.FileHandler(filename)
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.INFO)
     file_formatter = logging.Formatter('[%(asctime)s] - %(name)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)   

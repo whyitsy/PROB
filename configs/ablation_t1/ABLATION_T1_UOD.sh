@@ -19,7 +19,7 @@ echo running T1 ablations for UOD
 set -x
 set -euo pipefail
 
-EXP_ROOT="${1:-/mnt/data/kky/output/PROB/exps/MOWODB/UOD_ABL_T1}"
+EXP_ROOT="${1:-/mnt/data/kky/output/PROB/exps/MOWODB/UOD_ABL_T1_OVERALL}"
 shift $(( $# > 0 ? 1 : 0 )) || true
 PY_ARGS="${@:1}"
 COMMON="--dataset TOWOD --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 20 --train_set owod_t1_train --test_set owod_all_task_test --epochs 41 --obj_loss_coef 8e-4 --obj_temp 1.3 --viz --viz_num_samples 12 --viz_tb_images 4"
