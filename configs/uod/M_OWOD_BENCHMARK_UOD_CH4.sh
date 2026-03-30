@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 第四章方法（创新点2）的完整四阶段主实验脚本.
-# 在第三章基础上，再打开 uod_enable_decorr，同时加入 uod_orth_loss_coef 和 uod_decorr_loss_coef。它的作用是给你第四章整章主结果，并验证“第四章 = 第三章 + 解耦优化”。
+# 在第三章基础上，再打开 uod_enable_decorr，同时加入 uod_decorr_loss_coef。它的作用是给你第四章整章主结果，并验证“第四章 = 第三章 + 解耦优化”。
 echo running chapter-4 UOD training, M-OWODB dataset
 set -x
 
@@ -10,11 +10,11 @@ TAG=UOD_CH4
 PY_ARGS=${@:1}
 
 COMMON_UOD_ARGS="--model_type uod --uod_enable_unknown --uod_enable_pseudo --uod_enable_batch_dynamic --uod_enable_decorr \
- --unk_loss_coef 0.3 --uod_pseudo_unk_loss_coef 0.4 --uod_bg_unk_loss_coef 0.2 \
- --uod_pseudo_obj_loss_coef 0.3 --uod_obj_neg_loss_coef 0.2 \
- --uod_orth_loss_coef 0.05 --uod_decorr_loss_coef 0.05 \
+ --unk_loss_coef 0.3 --uod_pseudo_unk_loss_coef 0.4  \
+ --uod_pseudo_obj_loss_coef 0.3  \
+ --uod_decorr_loss_coef 0.05 \
  --uod_start_epoch 8 --uod_neg_warmup_epochs 3 \
- --uod_pos_quantile 0.25 --uod_pos_scale 1.2 --uod_min_pos_thresh 0.08 \
+ --uod_min_pos_thresh 0.08 \
  --uod_known_reject_thresh 0.15 --uod_neg_margin 0.8 \
  --uod_pos_per_img_cap 1 --uod_neg_per_img 1 --uod_batch_topk_max 8 --uod_batch_topk_ratio 0.25"
 

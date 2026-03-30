@@ -186,11 +186,21 @@ class DeformableTransformer(nn.Module):
         hs, inter_references = self.decoder(tgt, reference_points, memory, spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten)
 
         inter_references_out = inter_references
+        # ==========================================================
+        # 【修改点 1】：打包 Encoder 输出信息，供后续 OADF (CH4) 模块使用
+        # ==========================================================
+        enc_info = {
+            'memory': memory,
+            'spatial_shapes': spatial_shapes,
+            'level_start_index': level_start_index,
+            'valid_ratios': valid_ratios,
+            'padding_mask': mask_flatten
+        }
 
         if self.two_stage:
-            return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact
+            return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact, enc_info
 
-        return hs, init_reference_out, inter_references_out, None, None
+        return hs, init_reference_out, inter_references_out, None, None, enc_info
         # return hs, init_reference_out, inter_references_out, attention_feature, None, None
 
 

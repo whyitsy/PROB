@@ -1,19 +1,16 @@
 # ------------------------------------------------------------------------
 # PROB: Probabilistic Objectness for Open World Object Detection
 # Official training entry adapted for tensorboard-only logging and UOD methods.
+# Refactored to keep plotting / visualization logic in util modules.
 # ------------------------------------------------------------------------
 import argparse
 import datetime
-import json
 import logging
 import os
 import random
 import time
 from pathlib import Path
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -26,19 +23,12 @@ from datasets.coco import make_coco_transforms
 from datasets.torchvision_datasets.open_world import OWDetection
 from engine import evaluate, get_exemplar_replay, train_one_epoch
 from util.log import setup_logging
+from util.plot_metrics import append_json_record, refresh_metric_plots
 from models import build_model
 
 
 METRICS_JSONL = 'metrics_log.jsonl'
-
-
-def _safe_float(x):
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
+STEP_METRICS_JSONL = 'metrics_step.jsonl'
 
 
 def _sanitize_for_checkpoint(obj):
@@ -70,327 +60,34 @@ def _safe_float(x):
         return None
 
 
-def _read_metrics_history(metrics_jsonl_path: Path):
-    history = []
-    if not metrics_jsonl_path.exists():
-        return history
-
-    for line in metrics_jsonl_path.read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except Exception:
-            continue
-
-        metrics = record.get('test_metrics', {}) or {}
-        epoch = record.get('epoch', None)
-        if epoch is None or not isinstance(metrics, dict) or not metrics:
-            continue
-
-        history.append({
-            'epoch': int(epoch),
-            'Current AP50': _safe_float(metrics.get('CK_AP50')),
-            'Known AP50': _safe_float(metrics.get('K_AP50')),
-            'Unknown Recall50': _safe_float(metrics.get('U_R50')),
-            'WI@0.8': _safe_float(metrics.get('WI')),
-            'A-OSE': _safe_float(metrics.get('AOSA', metrics.get('A-OSE'))),
-        })
-
-    history.sort(key=lambda x: x['epoch'])
-    return history
-
-def _filter_valid_series(history, key):
-    xs, ys = [], []
-    for item in history:
-        val = item.get(key)
-        if val is None:
-            continue
-        xs.append(item['epoch'])
-        ys.append(val)
-    return xs, ys
-
-
-def _plot_percent_metric_trends(history, plots_dir: Path):
-    keys = ['Current AP50', 'Known AP50', 'Unknown Recall50']
-    has_any = any(_filter_valid_series(history, k)[0] for k in keys)
-    if not has_any:
+def _log_test_stats_to_tb(writer, test_stats, epoch):
+    if writer is None:
         return
+    for key, val in test_stats.items():
+        if key == 'metrics' and isinstance(val, dict):
+            for mk, mv in val.items():
+                if isinstance(mv, (int, float)):
+                    tag = 'A-OSE' if mk == 'AOSA' else mk
+                    writer.add_scalar(f'eval_metrics/{tag}', mv, epoch)
+        elif isinstance(val, (int, float)):
+            writer.add_scalar(f'eval/{key}', val, epoch)
 
-    plt.figure(figsize=(10, 6))
-    for key in keys:
-        xs, ys = _filter_valid_series(history, key)
-        if xs:
-            plt.plot(xs, ys, marker='o', linewidth=2, label=key)
 
-    plt.xlabel('Epoch')
-    plt.ylabel('Percentage (%)')
-    plt.title('Open-World Percentage Metrics')
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(plots_dir / 'open_world_metric_trends_percent.png', dpi=200)
-    plt.close()
-    
-def _plot_openworld_metric_trends(history, plots_dir: Path):
-    xs_wi, ys_wi = _filter_valid_series(history, 'WI@0.8')
-    xs_ose, ys_ose = _filter_valid_series(history, 'A-OSE')
-    if not xs_wi and not xs_ose:
-        return
+def _sum_optional_floats(*vals):
+    xs = []
+    for v in vals:
+        v = _safe_float(v)
+        if v is not None:
+            xs.append(v)
+    return None if len(xs) == 0 else float(sum(xs))
 
-    fig, ax1 = plt.subplots(figsize=(10, 6))
 
-    lines = []
-    labels = []
-
-    if xs_wi:
-        l1 = ax1.plot(xs_wi, ys_wi, marker='o', linewidth=2,
-                      label='WI@Recall0.8, IoU50')
-        lines += l1
-        labels += [line.get_label() for line in l1]
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Wilderness Impact (lower is better)')
-    ax1.grid(True, alpha=0.3)
-
-    ax2 = ax1.twinx()
-    if xs_ose:
-        l2 = ax2.plot(xs_ose, ys_ose, marker='s', linewidth=2,
-                      label='A-OSE@IoU50')
-        lines += l2
-        labels += [line.get_label() for line in l2]
-    ax2.set_ylabel('Absolute Open-Set Error (lower is better)')
-
-    if lines:
-        ax1.legend(lines, labels, loc='best')
-
-    plt.title('Open-World Error Metrics')
-    fig.tight_layout()
-    fig.savefig(plots_dir / 'open_world_metric_trends_openworld.png', dpi=200)
-    plt.close(fig)
-
-def _plot_current_metric_bars(history, plots_dir: Path):
-    if not history:
-        return
-    latest = history[-1]
-
-    # 百分比指标
-    percent_items = [
-        ('Current AP50', latest.get('Current AP50')),
-        ('Known AP50', latest.get('Known AP50')),
-        ('Unknown Recall50', latest.get('Unknown Recall50')),
-    ]
-    percent_items = [(k, v) for k, v in percent_items if v is not None]
-    if percent_items:
-        plt.figure(figsize=(8, 5))
-        labels = [k for k, _ in percent_items]
-        values = [v for _, v in percent_items]
-        plt.bar(labels, values)
-        plt.ylabel('Percentage (%)')
-        plt.title(f'Current Percentage Metrics (Epoch {latest["epoch"]})')
-        plt.xticks(rotation=15)
-        plt.tight_layout()
-        plt.savefig(plots_dir / 'current_metrics_bar_percent.png', dpi=200)
-        plt.close()
-
-    # 开放世界误差指标
-    wi_val = latest.get('WI@0.8')
-    ose_val = latest.get('A-OSE')
-    if wi_val is not None or ose_val is not None:
-        fig, ax1 = plt.subplots(figsize=(8, 5))
-        ax1.set_xticks([0, 1])
-        ax1.set_xticklabels(['WI@0.8', 'A-OSE'], rotation=15)
-        ax1.set_ylabel('WI@0.8 (lower is better)')
-
-        if wi_val is not None:
-            ax1.bar([0], [wi_val], width=0.5)
-
-        if ose_val is not None:
-            ax2 = ax1.twinx()
-            ax2.bar([1], [ose_val], width=0.5)
-            ax2.set_ylabel('A-OSE (lower is better)')
-
-        fig.suptitle(f'Current Open-World Error Metrics (Epoch {latest["epoch"]})')
-        fig.tight_layout()
-        fig.savefig(plots_dir / 'current_metrics_bar_openworld.png', dpi=200)
-        plt.close(fig)
-        
-        
-def _plot_training_loss_trends(metrics_jsonl_path: Path, plots_dir: Path):
-    if not metrics_jsonl_path.exists():
-        return
-
-    epochs = []
-    total_losses = []
-    objectness_losses = []
-    unknown_losses = []
-    pseudo_losses = []
-    negative_losses = []
-
-    for line in metrics_jsonl_path.read_text().splitlines():
-        try:
-            record = json.loads(line)
-        except Exception:
-            continue
-
-        epoch = record.get('epoch')
-        if epoch is None:
-            continue
-
-        train_loss = record.get('train_loss')
-        if train_loss is not None:
-            epochs.append(epoch)
-            total_losses.append(float(train_loss))
-
-            obj_loss = record.get('train_loss_obj_ll_unscaled', record.get('train_loss_obj_ll'))
-            unk_loss = record.get('train_loss_unk_unscaled', record.get('train_loss_unk'))
-            pseudo_loss = record.get('train_loss_obj_pseudo_unscaled', record.get('train_loss_obj_pseudo'))
-            neg_loss = record.get('train_loss_obj_neg_unscaled', record.get('train_loss_obj_neg'))
-
-            objectness_losses.append(None if obj_loss is None else float(obj_loss))
-            unknown_losses.append(None if unk_loss is None else float(unk_loss))
-            pseudo_losses.append(None if pseudo_loss is None else float(pseudo_loss))
-            negative_losses.append(None if neg_loss is None else float(neg_loss))
-
-    if not epochs:
-        return
-
-    # 1) 总损失
-    plt.figure(figsize=(10, 6))
-    plt.plot(epochs, total_losses, marker='o', linewidth=2, label='train_loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training Total Loss Trend')
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(plots_dir / 'training_loss_total_trend.png', dpi=200)
-    plt.close()
-
-    # 2) 开放世界相关损失分量
-    component_series = {
-        # 'objectness_ll': objectness_losses,
-        'unknown': unknown_losses,
-        'pseudo_pos': pseudo_losses,
-        'pseudo_neg': negative_losses,
-    }
-    has_component = any(any(v is not None for v in vals) for vals in component_series.values())
-    if has_component:
-        plt.figure(figsize=(10, 6))
-        for name, vals in component_series.items():
-            xs = [e for e, v in zip(epochs, vals) if v is not None]
-            ys = [v for v in vals if v is not None]
-            if xs:
-                plt.plot(xs, ys, marker='o', linewidth=1.8, label=name)
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Open-World Loss Components')
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(plots_dir / 'training_loss_openworld_components.png', dpi=200)
-        plt.close()
-        
-        # 这里单独画objectness_ll是因为它的数值范围可能和其他loss分量差很多，放在一起可能不好看
-        plt.figure(figsize=(10, 6))
-        xs = [e for e, v in zip(epochs, objectness_losses) if v is not None]
-        ys = [v for v in objectness_losses if v is not None]
-        plt.plot(xs, ys, marker='o', linewidth=1.8, label='objectness_ll')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Objectness Loss Trend')
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(plots_dir / 'training_loss_objectness_trend.png', dpi=200)
-        plt.close()
-
-def _plot_pseudo_stat_trends(metrics_jsonl_path: Path, plots_dir: Path):
-    if not metrics_jsonl_path.exists():
-        return
-
-    count_keys = [
-        'train_stat_num_dummy_pos',
-        'train_stat_num_dummy_neg',
-        'train_stat_num_valid_unmatched',
-        'train_stat_num_pos_candidates',
-        'train_stat_num_batch_selected_pos',
-    ]
-    thresh_keys = ['train_stat_pos_thresh_mean']
-
-    count_data = {k: {'x': [], 'y': []} for k in count_keys}
-    thresh_data = {k: {'x': [], 'y': []} for k in thresh_keys}
-
-    for line in metrics_jsonl_path.read_text().splitlines():
-        try:
-            record = json.loads(line)
-        except Exception:
-            continue
-
-        epoch = record.get('epoch')
-        if epoch is None:
-            continue
-
-        for key in count_keys:
-            val = record.get(key)
-            if val is not None:
-                count_data[key]['x'].append(epoch)
-                count_data[key]['y'].append(float(val))
-
-        for key in thresh_keys:
-            val = record.get(key)
-            if val is not None:
-                thresh_data[key]['x'].append(epoch)
-                thresh_data[key]['y'].append(float(val))
-
-    # 1) 数量型统计
-    if any(v['x'] for v in count_data.values()):
-        plt.figure(figsize=(11, 7))
-        display_names = {
-            'train_stat_num_dummy_pos': 'dummy_pos',
-            'train_stat_num_dummy_neg': 'dummy_neg',
-            'train_stat_num_valid_unmatched': 'valid_unmatched',
-            'train_stat_num_pos_candidates': 'pos_candidates',
-            'train_stat_num_batch_selected_pos': 'batch_selected_pos',
-        }
-        for key, v in count_data.items():
-            if v['x']:
-                plt.plot(v['x'], v['y'], marker='o', linewidth=1.8, label=display_names.get(key, key))
-        plt.xlabel('Epoch')
-        plt.ylabel('Count')
-        plt.title('Pseudo-Supervision Count Statistics')
-        plt.grid(True, alpha=0.3)
-        plt.legend(fontsize=9)
-        plt.tight_layout()
-        plt.savefig(plots_dir / 'pseudo_stat_counts.png', dpi=200)
-        plt.close()
-
-    # 2) 阈值型统计
-    if any(v['x'] for v in thresh_data.values()):
-        plt.figure(figsize=(10, 6))
-        for key, v in thresh_data.items():
-            if v['x']:
-                plt.plot(v['x'], v['y'], marker='o', linewidth=2, label='pos_thresh_mean')
-        plt.xlabel('Epoch')
-        plt.ylabel('Threshold')
-        plt.title('Pseudo-Supervision Threshold Trend')
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(plots_dir / 'pseudo_stat_thresholds.png', dpi=200)
-        plt.close()
-
-def _refresh_metric_plots(output_dir: Path):
-    plots_dir = output_dir / 'plots'
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    metrics_jsonl_path = output_dir / METRICS_JSONL
-
-    history = _read_metrics_history(metrics_jsonl_path)
-    _plot_percent_metric_trends(history, plots_dir)
-    _plot_openworld_metric_trends(history, plots_dir)
-    _plot_current_metric_bars(history, plots_dir)
-    _plot_training_loss_trends(metrics_jsonl_path, plots_dir)
-    _plot_pseudo_stat_trends(metrics_jsonl_path, plots_dir)
+def _safe_div(num, den):
+    num = _safe_float(num)
+    den = _safe_float(den)
+    if num is None or den is None or abs(den) < 1e-12:
+        return None
+    return float(num / den)
 
 
 def get_args_parser():
@@ -449,6 +146,15 @@ def get_args_parser():
     parser.add_argument('--viz', default=True, action='store_true')
     parser.add_argument('--viz_num_samples', default=12, type=int)
     parser.add_argument('--viz_tb_images', default=4, type=int)
+    parser.add_argument('--viz_score_thresh', default=0.0, type=float, help='display threshold for qualitative pred_* visualizations; set to 0.0 to align with postprocess outputs')
+    parser.add_argument('--viz_error_iou_thresh', default=0.5, type=float, help='IoU threshold used to mark qualitative open-world error cases')
+    parser.add_argument('--viz_candidate_mode', default='both', type=str, choices=['mining', 'final_unknown', 'both'], help='candidate visualization mode: pseudo-mining aligned, final unknown aligned, or both')
+    parser.add_argument('--viz_candidate_topk', default=10, type=int, help='maximum number of candidate boxes shown per image')
+    parser.add_argument('--viz_candidate_nms_iou', default=0.6, type=float, help='IoU threshold for deduplicating visualization candidates')
+    parser.add_argument('--viz_max_query_points', default=2500, type=int, help='maximum query samples cached for visualization plots')
+    parser.add_argument('--viz_max_feature_points', default=2500, type=int, help='maximum feature samples cached for PCA/t-SNE visualizations')
+    parser.add_argument('--step_metrics_jsonl', default='metrics_step.jsonl', type=str)
+    parser.add_argument('--step_histogram_every', default=100, type=int)
     parser.add_argument('--eval_every', default=5, type=int)
     parser.add_argument('--num_workers', default=3, type=int)
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
@@ -473,9 +179,7 @@ def get_args_parser():
     parser.add_argument('--unk_conf_w', default=1.0, type=float)
 
     ################ PROB OWOD ################
-    parser.add_argument('--model_type', default='prob', type=str, choices=['prob', 'uod', 'uod_paramless'])
-    parser.add_argument('--wandb_name', default='', type=str)
-    parser.add_argument('--wandb_project', default='', type=str)
+    parser.add_argument('--model_type', default='prob', type=str, choices=['prob', 'uod', 'bg'])
 
     parser.add_argument('--obj_loss_coef', default=8e-4, type=float)
     parser.add_argument('--obj_temp', default=1.3, type=float)
@@ -497,32 +201,44 @@ def get_args_parser():
     parser.add_argument('--uod_enable_cls_soft_attn', default=False, action='store_true', help='attenuate classification loss on pseudo-positive queries')
     parser.add_argument('--uod_enable_odqe', default=False, action='store_true', help='enable object-aware task decouple query enhancement(ODQE) module')
 
-    parser.add_argument('--unk_loss_coef', default=0.3, type=float, help='weight of matched-known negative unknownness loss')
-    parser.add_argument('--uod_pseudo_unk_loss_coef', default=0.4, type=float, help='weight of pseudo-unknown unknownness loss')
-    parser.add_argument('--uod_bg_unk_loss_coef', default=0.2, type=float, help='weight of reliable-background unknownness negative loss')
-    parser.add_argument('--uod_pseudo_obj_loss_coef', default=0.3, type=float, help='weight of pseudo-positive objectness loss')
-    parser.add_argument('--uod_obj_neg_loss_coef', default=0.2, type=float, help='weight of reliable-background objectness loss')
-    parser.add_argument('--uod_orth_loss_coef', default=0.05, type=float, help='weight of feature orthogonality loss')
-    parser.add_argument('--uod_decorr_loss_coef', default=0.05, type=float, help='weight of prediction decorrelation loss')
+    parser.add_argument('--uod_known_unk_suppress_init', default=0.5, type=float, help='initial coefficient for suppressing known scores by unknownness')
+    parser.add_argument('--uod_unknown_known_suppress_init', default=0.5, type=float, help='initial coefficient for suppressing unknown scores by max-known score')
+    parser.add_argument('--uod_odqe_decay_min', default=0.1, type=float, help='minimum ODQE context contribution on the final decoder layer')
+    parser.add_argument('--uod_odqe_decay_power', default=1.0, type=float, help='power factor for ODQE layer decay schedule')
+    parser.add_argument('--uod_haux_low_obj_coef', default=0.35, type=float, help='aux weight multiplier for low-level objectness pseudo supervision')
+    parser.add_argument('--uod_haux_mid_unknown_coef', default=0.45, type=float, help='aux weight multiplier for mid-level unknown supervision')
+    parser.add_argument('--uod_haux_high_unknown_coef', default=0.7, type=float, help='aux weight multiplier for high-level unknown supervision')
+    parser.add_argument('--uod_haux_high_decorr_coef', default=0.5, type=float, help='aux weight multiplier for high-level decorrelation supervision')
+
+    parser.add_argument('--unk_loss_coef', default=10, type=float, help='weight of matched-known negative unknownness loss')
+    parser.add_argument('--uod_pseudo_unk_loss_coef', default=100, type=float, help='weight of pseudo-unknown unknownness loss')
+    parser.add_argument('--uod_pseudo_obj_loss_coef', default=10, type=float, help='weight of pseudo-positive objectness loss')
+    parser.add_argument('--uod_obj_neg_loss_coef', default=1.0, type=float, help='weight of reliable-background objectness negative loss')
+    parser.add_argument('--uod_decorr_loss_coef', default=2, type=float, help='weight of prediction decorrelation loss')
 
     parser.add_argument('--uod_start_epoch', default=3, type=int, help='epoch to start pseudo supervision')
-    parser.add_argument('--uod_neg_warmup_epochs', default=2, type=int, help='delay reliable-background losses after pseudo start')
-    parser.add_argument('--uod_pos_quantile', default=0.25, type=float, help='matched energy quantile used as threshold base')
-    parser.add_argument('--uod_pos_scale', default=1.2, type=float, help='positive threshold scale')
+    parser.add_argument('--uod_neg_warmup_epochs', default=2, type=int, help='delay reliable-background objectness negatives after pseudo start')
+    
     parser.add_argument('--uod_min_pos_thresh', default=0.08, type=float, help='minimum pseudo-positive energy threshold')
     parser.add_argument('--uod_known_reject_thresh', default=0.15, type=float, help='maximum known score for pseudo-unknown candidates')
-    parser.add_argument('--uod_neg_margin', default=0.8, type=float, help='margin for reliable background negative mining')
+    parser.add_argument('--uod_neg_margin', default=0.12, type=float, help='margin for reliable-background objectness negatives in normalized energy space')
     parser.add_argument('--uod_pos_per_img_cap', default=1, type=int, help='max pseudo positives per image')
-    parser.add_argument('--uod_neg_per_img', default=1, type=int, help='max reliable background negatives per image')
+    parser.add_argument('--uod_neg_per_img', default=2, type=int, help='max reliable-background negatives per image')
+    parser.add_argument('--uod_neg_known_max', default=0.12, type=float, help='maximum max-known probability allowed for reliable-background negatives')
+    parser.add_argument('--uod_neg_unk_max', default=0.10, type=float, help='maximum unknownness probability allowed for reliable-background negatives')
+    parser.add_argument('--uod_neg_max_pseudo_iou', default=0.25, type=float, help='max IoU to selected pseudo positives for reliable-background negatives')
     parser.add_argument('--uod_batch_topk_max', default=8, type=int, help='max pseudo positives selected per batch')
     parser.add_argument('--uod_batch_topk_ratio', default=0.25, type=float, help='dynamic ratio for batch-level pseudo selection')
     parser.add_argument('--uod_max_iou', default=0.2, type=float, help='max IoU with GT for pseudo candidates')
     parser.add_argument('--uod_max_iof', default=0.4, type=float, help='max IoF with GT for pseudo candidates')
-    parser.add_argument('--uod_min_area', default=0.002, type=float, help='min normalized area for pseudo candidates')
-    parser.add_argument('--uod_min_side', default=0.05, type=float, help='min normalized side length for pseudo candidates')
-    parser.add_argument('--uod_max_aspect_ratio', default=4.0, type=float, help='max aspect ratio for pseudo candidates')
+    parser.add_argument('--uod_min_area', default=0.002, type=float, help='min normalized area for pseudo/negative candidates')
+    parser.add_argument('--uod_min_side', default=0.05, type=float, help='min normalized side length for pseudo/negative candidates')
+    parser.add_argument('--uod_max_aspect_ratio', default=4.0, type=float, help='max aspect ratio for pseudo/negative candidates')
+    parser.add_argument('--uod_candidate_nms_iou', default=0.6, type=float, help='IoU threshold for deduplicating pseudo-positive candidates per image before batch/global allocation')
     parser.add_argument('--uod_cls_soft_attn_alpha', default=0.8, type=float, help='strength of pseudo-positive classification attenuation')
     parser.add_argument('--uod_cls_soft_attn_min', default=0.1, type=float, help='minimum query weight under classification attenuation')
+    parser.add_argument('--uod_pos_unk_min', default=0.05, type=float, help='minimum raw unknownness probability required for pseudo-positive candidates')
+    parser.add_argument('--uod_postprocess_unknown_ratio', default=0.95, type=float, help='query-wise routing ratio for choosing unknown over best-known in postprocess')
 
     return parser
 
@@ -608,10 +324,22 @@ def _log_test_stats_to_tb(writer, test_stats, epoch):
         elif isinstance(val, (int, float)):
             writer.add_scalar(f'eval/{key}', val, epoch)
 
-def rprint(msg):
-    rank = int(os.environ.get("RANK", -1))
-    print(f"[rank {rank}] {msg}", flush=True)
-    
+def _sum_optional_floats(*vals):
+    xs = []
+    for v in vals:
+        v = _safe_float(v)
+        if v is not None:
+            xs.append(v)
+    return None if len(xs) == 0 else float(sum(xs))
+
+def _safe_div(num, den):
+    num = _safe_float(num)
+    den = _safe_float(den)
+    if num is None or den is None or abs(den) < 1e-12:
+        return None
+    return float(num / den)
+
+
 def main(args):
     utils.init_distributed_mode(args)
     output_dir = Path(args.output_dir)
@@ -630,7 +358,7 @@ def main(args):
         logging.info('TensorBoard log dir: %s', tb_log_dir)
     args.writer = writer
 
-    logging.info('git\n  %s\n', utils.get_sha())
+    logging.info('git:  %s\n', utils.get_sha())
     if args.frozen_weights is not None:
         assert args.masks, 'Frozen training is meant for segmentation only'
 
@@ -643,6 +371,11 @@ def main(args):
 
     model, criterion, postprocessors, exemplar_selection = build_model(args, mode=args.model_type)
     model.to(device)
+    # 打印指定模型指定行数的参数信息，方便调试
+    
+    # for idx, (name, param) in enumerate(model.named_parameters()):
+    #     if 235 < idx <= 245:  # 只打印第236-255行的参数信息
+    #         logging.info(f"[{idx}]: {name}")
 
     model_without_ddp = model
     logging.info('%s', model_without_ddp)
@@ -790,38 +523,91 @@ def main(args):
                     'args': ckpt_args,
                 }, checkpoint_path)
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
 
         if args.output_dir and utils.is_main_process():
-            with (output_dir / METRICS_JSONL).open('a') as f:
-                f.write(json.dumps(log_stats) + '\n')
-            
+            metric_dict = test_stats.get('metrics', {}) if isinstance(test_stats, dict) else {}
+
             record = {
                 'epoch': epoch,
-                'train_loss': float(train_stats.get('loss', 0.0)) if isinstance(train_stats, dict) else None,
-                'train_loss_obj_ll': train_stats.get('loss_obj_ll') if isinstance(train_stats, dict) else None,
-                'train_loss_unk': train_stats.get('loss_unk') if isinstance(train_stats, dict) else None,
-                'train_loss_obj_pseudo': train_stats.get('loss_obj_pseudo') if isinstance(train_stats, dict) else None,
-                'train_loss_obj_neg': train_stats.get('loss_obj_neg') if isinstance(train_stats, dict) else None,
-                'train_stat_num_dummy_pos': train_stats.get('stat_num_dummy_pos') if isinstance(train_stats, dict) else None,
-                'train_stat_num_dummy_neg': train_stats.get('stat_num_dummy_neg') if isinstance(train_stats, dict) else None,
-                'train_stat_num_valid_unmatched': train_stats.get('stat_num_valid_unmatched') if isinstance(train_stats, dict) else None,
-                'train_stat_num_pos_candidates': train_stats.get('stat_num_pos_candidates') if isinstance(train_stats, dict) else None,
-                'train_stat_num_batch_selected_pos': train_stats.get('stat_num_batch_selected_pos') if isinstance(train_stats, dict) else None,
-                'train_stat_pos_thresh_mean': train_stats.get('stat_pos_thresh_mean') if isinstance(train_stats, dict) else None,
-                'test_metrics': test_stats.get('metrics', {}) if isinstance(test_stats, dict) else {},
+                'n_parameters': n_parameters,
+
+                # ---------- train basic ----------
+                'train_loss': _safe_float(train_stats.get('loss')) if isinstance(train_stats, dict) else None,
+                'train_lr': _safe_float(train_stats.get('lr')) if isinstance(train_stats, dict) else None,
+                'train_grad_norm': _safe_float(train_stats.get('grad_norm')) if isinstance(train_stats, dict) else None,
+                'train_class_error': _safe_float(train_stats.get('class_error')) if isinstance(train_stats, dict) else None,
+
+                # ---------- base losses ----------
+                'train_loss_ce': _safe_float(train_stats.get('loss_ce')) if isinstance(train_stats, dict) else None,
+                'train_loss_ce_unscaled': _safe_float(train_stats.get('loss_ce_unscaled')) if isinstance(train_stats, dict) else None,
+                'train_loss_bbox': _safe_float(train_stats.get('loss_bbox')) if isinstance(train_stats, dict) else None,
+                'train_loss_bbox_unscaled': _safe_float(train_stats.get('loss_bbox_unscaled')) if isinstance(train_stats, dict) else None,
+                'train_loss_giou': _safe_float(train_stats.get('loss_giou')) if isinstance(train_stats, dict) else None,
+                'train_loss_giou_unscaled': _safe_float(train_stats.get('loss_giou_unscaled')) if isinstance(train_stats, dict) else None,
+                'train_loss_obj_ll': _safe_float(train_stats.get('loss_obj_ll')) if isinstance(train_stats, dict) else None,
+                'train_loss_obj_ll_unscaled': _safe_float(train_stats.get('loss_obj_ll_unscaled')) if isinstance(train_stats, dict) else None,
+
+                # ---------- unknownness ----------
+                'train_loss_unk_known': _safe_float(train_stats.get('loss_unk_known')) if isinstance(train_stats, dict) else None,
+                'train_loss_unk_known_unscaled': _safe_float(train_stats.get('loss_unk_known_unscaled')) if isinstance(train_stats, dict) else None,
+                'train_loss_unk_pseudo': _safe_float(train_stats.get('loss_unk_pseudo')) if isinstance(train_stats, dict) else None,
+                'train_loss_unk_pseudo_unscaled': _safe_float(train_stats.get('loss_unk_pseudo_unscaled')) if isinstance(train_stats, dict) else None,
+
+                'train_loss_unk': _sum_optional_floats(
+                    train_stats.get('loss_unk_known'),
+                    train_stats.get('loss_unk_pseudo'),
+                ) if isinstance(train_stats, dict) else None,
+
+                'train_loss_unk_unscaled': _sum_optional_floats(
+                    train_stats.get('loss_unk_known_unscaled'),
+                    train_stats.get('loss_unk_pseudo_unscaled'),
+                ) if isinstance(train_stats, dict) else None,
+
+                # ---------- pseudo objectness ----------
+                'train_loss_obj_pseudo': _safe_float(train_stats.get('loss_obj_pseudo')) if isinstance(train_stats, dict) else None,
+                'train_loss_obj_pseudo_unscaled': _safe_float(train_stats.get('loss_obj_pseudo_unscaled')) if isinstance(train_stats, dict) else None,
+                'train_loss_obj_neg': _safe_float(train_stats.get('loss_obj_neg')) if isinstance(train_stats, dict) else None,
+                'train_loss_obj_neg_unscaled': _safe_float(train_stats.get('loss_obj_neg_unscaled')) if isinstance(train_stats, dict) else None,
+
+                # ---------- chapter 4 ----------
+                'train_loss_decorr': _safe_float(train_stats.get('loss_decorr')) if isinstance(train_stats, dict) else None,
+                'train_loss_decorr_unscaled': _safe_float(train_stats.get('loss_decorr_unscaled')) if isinstance(train_stats, dict) else None,
+                'train_known_unk_suppress_coeff': _safe_float(train_stats.get('known_unk_suppress_coeff')) if isinstance(train_stats, dict) else None,
+                'train_unknown_known_suppress_coeff': _safe_float(train_stats.get('unknown_known_suppress_coeff')) if isinstance(train_stats, dict) else None,
+                'train_gate_mean': _safe_float(train_stats.get('gate_mean')) if isinstance(train_stats, dict) else None,
+
+                # ---------- pseudo mining stats ----------
+                'train_stat_num_dummy_pos': _safe_float(train_stats.get('stat_num_dummy_pos')) if isinstance(train_stats, dict) else None,
+                'train_stat_num_dummy_neg': _safe_float(train_stats.get('stat_num_dummy_neg')) if isinstance(train_stats, dict) else None,
+                'train_stat_num_valid_unmatched': _safe_float(train_stats.get('stat_num_valid_unmatched')) if isinstance(train_stats, dict) else None,
+                'train_stat_num_pos_candidates': _safe_float(train_stats.get('stat_num_pos_candidates')) if isinstance(train_stats, dict) else None,
+                'train_stat_num_neg_candidates': _safe_float(train_stats.get('stat_num_neg_candidates')) if isinstance(train_stats, dict) else None,
+                'train_stat_num_batch_selected_pos': _safe_float(train_stats.get('stat_num_batch_selected_pos')) if isinstance(train_stats, dict) else None,
+                'train_stat_pos_thresh_mean': _safe_float(train_stats.get('stat_pos_thresh_mean')) if isinstance(train_stats, dict) else None,
+
+                # ---------- pseudo efficiency ----------
+                'train_pseudo_selection_ratio': _safe_div(
+                    train_stats.get('stat_num_batch_selected_pos'),
+                    train_stats.get('stat_num_valid_unmatched')
+                ) if isinstance(train_stats, dict) else None,
+
+                'train_pseudo_accept_ratio': _safe_div(
+                    train_stats.get('stat_num_batch_selected_pos'),
+                    train_stats.get('stat_num_pos_candidates')
+                ) if isinstance(train_stats, dict) else None,
+
+                # ---------- eval metrics ----------
+                'test_metrics': metric_dict,
             }
-            with (output_dir / METRICS_JSONL).open('a') as f:
-                f.write(json.dumps(record, ensure_ascii=False) + '\n')
-                
+
+            append_json_record(output_dir / METRICS_JSONL, record)
+
             if args.viz:
                 try:
-                    _refresh_metric_plots(output_dir)
+                    refresh_metric_plots(output_dir, metrics_filename=METRICS_JSONL, step_metrics_filename=args.step_metrics_jsonl)
                 except Exception as e:
                     logging.error('Failed to refresh metric plots: %s', e)
+                    
             if args.dataset in ['owod', 'owdetr', 'TOWOD', 'OWDETR'] and epoch % args.eval_every == 0 and epoch > 0:
                 if coco_evaluator is not None:
                     (output_dir / 'eval').mkdir(exist_ok=True)
@@ -848,4 +634,14 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    main(args)
+    try:
+        main(args)
+    except Exception as e:
+        logging.error('An error occurred during execution: %s', e, exc_info=True)
+        raise
+    finally:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.destroy_process_group()
+            logging.info("Distributed process group destroyed successfully.")
+    

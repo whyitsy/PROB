@@ -11,10 +11,10 @@ TAG=UOD_CH3
 PY_ARGS=${@:1}
 
 COMMON_UOD_ARGS="--model_type uod --uod_enable_unknown --uod_enable_pseudo --uod_enable_batch_dynamic \
- --unk_loss_coef 0.3 --uod_pseudo_unk_loss_coef 0.4 --uod_bg_unk_loss_coef 0.2 \
- --uod_pseudo_obj_loss_coef 0.3 --uod_obj_neg_loss_coef 0.2 \
+ --unk_loss_coef 0.3 --uod_pseudo_unk_loss_coef 0.4  \
+ --uod_pseudo_obj_loss_coef 0.3 \
  --uod_start_epoch 8 --uod_neg_warmup_epochs 3 \
- --uod_pos_quantile 0.25 --uod_pos_scale 1.2 --uod_min_pos_thresh 0.08 \
+ --uod_min_pos_thresh 0.08 \
  --uod_known_reject_thresh 0.15 --uod_neg_margin 0.8 \
  --uod_pos_per_img_cap 1 --uod_neg_per_img 1 --uod_batch_topk_max 8 --uod_batch_topk_ratio 0.25"
 

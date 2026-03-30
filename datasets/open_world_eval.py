@@ -49,9 +49,9 @@ class OWEvaluator:
             self.known_classes = self._class_names[:self.num_seen_classes]
 
             logger.info("Testing data details:")
-            logger.info("total classes\t, unknown index\t, known classes\t, all classes: ")
-            logger.info(f"{self.total_num_class}, {self.unknown_class_index}, {self.known_classes}, {self.voc_gt.CLASS_NAMES}")
-
+            logger.info(f"total classes: {self.total_num_class}, unknown index: {self.unknown_class_index}, known classe: {self.known_classes}")
+            logger.info(f"CLASS_NAMES: {self.voc_gt.CLASS_NAMES}")
+    
 
     def update(self, predictions):
         for img_id, pred in predictions.items():
