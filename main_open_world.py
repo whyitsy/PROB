@@ -210,9 +210,9 @@ def get_args_parser():
     parser.add_argument('--uod_haux_high_unknown_coef', default=0.7, type=float, help='aux weight multiplier for high-level unknown supervision')
     parser.add_argument('--uod_haux_high_decorr_coef', default=0.5, type=float, help='aux weight multiplier for high-level decorrelation supervision')
 
-    parser.add_argument('--unk_loss_coef', default=10, type=float, help='weight of matched-known negative unknownness loss')
-    parser.add_argument('--uod_pseudo_unk_loss_coef', default=100, type=float, help='weight of pseudo-unknown unknownness loss')
-    parser.add_argument('--uod_pseudo_obj_loss_coef', default=10, type=float, help='weight of pseudo-positive objectness loss')
+    parser.add_argument('--unk_loss_coef', default=8e-4, type=float, help='weight of matched-known negative unknownness loss')
+    parser.add_argument('--uod_pseudo_unk_loss_coef', default=0.5, type=float, help='weight of pseudo-unknown unknownness loss')
+    parser.add_argument('--uod_pseudo_obj_loss_coef', default=1, type=float, help='weight of pseudo-positive objectness loss')
     parser.add_argument('--uod_obj_neg_loss_coef', default=1.0, type=float, help='weight of reliable-background objectness negative loss')
     parser.add_argument('--uod_decorr_loss_coef', default=2, type=float, help='weight of prediction decorrelation loss')
 
@@ -232,8 +232,7 @@ def get_args_parser():
     parser.add_argument('--uod_max_iou', default=0.2, type=float, help='max IoU with GT for pseudo candidates')
     parser.add_argument('--uod_max_iof', default=0.4, type=float, help='max IoF with GT for pseudo candidates')
     parser.add_argument('--uod_min_area', default=0.002, type=float, help='min normalized area for pseudo/negative candidates')
-    parser.add_argument('--uod_min_side', default=0.05, type=float, help='min normalized side length for pseudo/negative candidates')
-    parser.add_argument('--uod_max_aspect_ratio', default=4.0, type=float, help='max aspect ratio for pseudo/negative candidates')
+    parser.add_argument('--uod_max_aspect_ratio', default=5.0, type=float, help='max aspect ratio for pseudo/negative candidates')
     parser.add_argument('--uod_candidate_nms_iou', default=0.6, type=float, help='IoU threshold for deduplicating pseudo-positive candidates per image before batch/global allocation')
     parser.add_argument('--uod_cls_soft_attn_alpha', default=0.8, type=float, help='strength of pseudo-positive classification attenuation')
     parser.add_argument('--uod_cls_soft_attn_min', default=0.1, type=float, help='minimum query weight under classification attenuation')
@@ -358,7 +357,7 @@ def main(args):
         logging.info('TensorBoard log dir: %s', tb_log_dir)
     args.writer = writer
 
-    logging.info('git:  %s\n', utils.get_sha())
+    logging.info('git:\n  %s\n', utils.get_sha())
     if args.frozen_weights is not None:
         assert args.masks, 'Frozen training is meant for segmentation only'
 

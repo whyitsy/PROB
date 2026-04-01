@@ -345,52 +345,85 @@ def _append_limited(dst, values, max_len):
         values = values[:remain]
     dst.extend(values)
 
+def _select_mining_aligned_candidates_from_criterion(outputs, targets, criterion, epoch, image_idx, img_hw, args):
+    outputs_for_match = {'pred_logits': outputs['pred_logits'], 'pred_boxes': outputs['pred_boxes']}
+    indices = criterion.matcher(outputs_for_match, targets)
+    mine_out = criterion._mine_uod_pseudo(outputs, targets, indices, epoch)
+    dummy_pos_indices, _, dummy_pos_weights, dummy_pos_boxes, _, _ = mine_out
+
+    if image_idx >= len(dummy_pos_indices) or len(dummy_pos_indices[image_idx]) == 0:
+        return np.zeros((0, 4), dtype=np.float32), [], [], [], []
+
+    q_idx = torch.as_tensor(dummy_pos_indices[image_idx], dtype=torch.long, device=outputs['pred_boxes'].device)
+    boxes_cxcywh = dummy_pos_boxes[image_idx].detach().cpu()
+    boxes_xyxy = _cxcywh_to_abs_xyxy(boxes_cxcywh, img_hw)
+
+    fused = _compute_vis_fused(outputs, image_idx, args, invalid_cls_logits=getattr(criterion, 'invalid_cls_logits', []))
+    if fused is None:
+        return boxes_xyxy, [0.0] * len(boxes_xyxy), [0.0] * len(boxes_xyxy), [0.0] * len(boxes_xyxy), dummy_pos_weights[image_idx]
+
+    obj_scores = fused['obj_prob'][q_idx.cpu()].tolist()
+    cls_scores = fused['cls_max'][q_idx.cpu()].tolist()
+    unk_scores = fused['unk_prob'][q_idx.cpu()].tolist()
+    sel_scores = list(dummy_pos_weights[image_idx])
+    return boxes_xyxy, obj_scores, cls_scores, unk_scores, sel_scores
 
 def collect_eval_stats(vis_state, outputs, targets, criterion, args):
     if len(vis_state['obj_prob']) >= vis_state['max_query_points'] and len(vis_state['proj_obj']) >= vis_state['max_feature_points']:
         return
-    obj_temp = float(getattr(args, 'obj_temp', 1.0))
+
     hidden_dim = float(getattr(args, 'hidden_dim', 256))
-    obj_prob = torch.exp(-(obj_temp / hidden_dim) * outputs['pred_obj'].detach())
-    pred_unk = outputs.get('pred_unk', None)
-    unk_prob = torch.sigmoid(pred_unk.detach()) if pred_unk is not None else torch.zeros_like(obj_prob)
+    obj_temp = float(getattr(args, 'obj_temp', 1.0)) / hidden_dim
+    known_temp = float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / hidden_dim
+
+    obj_prob = _energy_to_prob(outputs['pred_obj'].detach(), obj_temp)
+    if 'pred_known' in outputs:
+        knownness_prob = _energy_to_prob(outputs['pred_known'].detach(), known_temp)
+        unk_prob = (1.0 - knownness_prob).clamp(min=0.0, max=1.0)
+    else:
+        pred_unk = outputs.get('pred_unk', None)
+        unk_prob = torch.sigmoid(pred_unk.detach()) if pred_unk is not None else torch.zeros_like(obj_prob)
+
     cls_prob = outputs['pred_logits'].detach().sigmoid().clone()
     invalid_cls = getattr(criterion, 'invalid_cls_logits', [])
     if len(invalid_cls) > 0:
         cls_prob[:, :, invalid_cls] = 0.0
     cls_prob[:, :, -1] = 0.0
     cls_max = cls_prob.max(-1).values
+
     outputs_for_match = {'pred_logits': outputs['pred_logits'], 'pred_boxes': outputs['pred_boxes']}
     indices = criterion.matcher(outputs_for_match, targets)
     matched_mask = torch.zeros_like(obj_prob, dtype=torch.bool)
     for b, (src, _) in enumerate(indices):
         if len(src) > 0:
             matched_mask[b, src] = True
+
     obj_np = obj_prob.flatten().cpu().numpy()
     unk_np = unk_prob.flatten().cpu().numpy()
     cls_np = cls_max.flatten().cpu().numpy()
     matched_np = matched_mask.flatten().cpu().numpy()
     group_np = np.where(matched_np, 0, np.where(unk_np > 0.5, 1, 2)).astype(np.int64)
+
     _append_limited(vis_state['obj_prob'], obj_np.tolist(), vis_state['max_query_points'])
     _append_limited(vis_state['unk_prob'], unk_np.tolist(), vis_state['max_query_points'])
     _append_limited(vis_state['cls_max'], cls_np.tolist(), vis_state['max_query_points'])
     _append_limited(vis_state['group'], group_np.tolist(), vis_state['max_query_points'])
+
     if 'proj_obj' in outputs and len(vis_state['proj_obj']) < vis_state['max_feature_points']:
         proj_obj = outputs['proj_obj'].detach().flatten(0, 1).cpu().numpy()
-        proj_unk = outputs['proj_unk'].detach().flatten(0, 1).cpu().numpy()
+        proj_known = outputs.get('proj_known', outputs.get('proj_unk')).detach().flatten(0, 1).cpu().numpy()
         proj_cls = outputs['proj_cls'].detach().flatten(0, 1).cpu().numpy()
         group_feat = group_np
         remain = vis_state['max_feature_points'] - len(vis_state['proj_obj'])
         if remain < len(proj_obj):
             proj_obj = proj_obj[:remain]
-            proj_unk = proj_unk[:remain]
+            proj_known = proj_known[:remain]
             proj_cls = proj_cls[:remain]
             group_feat = group_feat[:remain]
         vis_state['proj_obj'].extend(list(proj_obj))
-        vis_state['proj_unk'].extend(list(proj_unk))
+        vis_state['proj_unk'].extend(list(proj_known))
         vis_state['proj_cls'].extend(list(proj_cls))
         vis_state['feat_group'].extend(group_feat.tolist())
-
 
 def _box_iou_np(boxes1, boxes2):
     if boxes1 is None or boxes2 is None or len(boxes1) == 0 or len(boxes2) == 0:
@@ -441,39 +474,42 @@ def _compute_vis_fused(outputs, image_idx, args, invalid_cls_logits=None):
     if pred_logits is None or pred_obj is None or pred_boxes is None:
         return None
     invalid_cls_logits = list(invalid_cls_logits or [])
-    obj_temp = float(getattr(args, 'obj_temp', 1.0))
     hidden_dim = float(getattr(args, 'hidden_dim', 256))
-    temperature = obj_temp / hidden_dim
+    obj_temp = float(getattr(args, 'obj_temp', 1.0)) / hidden_dim
+    known_temp = float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / hidden_dim
+
     logits = pred_logits[image_idx].detach().clone().cpu()
     if len(invalid_cls_logits) > 0:
         logits[:, invalid_cls_logits] = -10e10
-    obj_prob = torch.exp(-temperature * pred_obj[image_idx].detach().cpu())
-    known_prob = logits.sigmoid()
+
+    obj_prob = _energy_to_prob(pred_obj[image_idx].detach().cpu(), obj_temp)
+    class_prob = logits.sigmoid()
     if len(invalid_cls_logits) > 0:
-        known_prob[:, invalid_cls_logits] = 0.0
-    if known_prob.shape[-1] > 0:
-        known_prob[:, -1] = 0.0
-    pred_unk = outputs.get('pred_unk', None)
-    unk_prob = torch.sigmoid(pred_unk[image_idx].detach().cpu()) if pred_unk is not None else torch.zeros_like(obj_prob)
-    known_coeff = outputs.get('known_unk_suppress_coeff', torch.tensor(0.5, dtype=obj_prob.dtype))
-    unknown_coeff = outputs.get('unknown_known_suppress_coeff', torch.tensor(0.5, dtype=obj_prob.dtype))
-    known_coeff = float(known_coeff.detach().cpu().item()) if torch.is_tensor(known_coeff) else float(known_coeff)
-    unknown_coeff = float(unknown_coeff.detach().cpu().item()) if torch.is_tensor(unknown_coeff) else float(unknown_coeff)
-    known_suppress = torch.clamp(1.0 - known_coeff * unk_prob.unsqueeze(-1), min=0.0, max=1.0)
-    known_scores = obj_prob.unsqueeze(-1) * known_prob * known_suppress
-    if known_prob.shape[-1] > 1:
-        max_known_prob = known_prob[:, :-1].max(dim=-1).values
+        class_prob[:, invalid_cls_logits] = 0.0
+    if class_prob.shape[-1] > 0:
+        class_prob[:, -1] = 0.0
+
+    pred_known = outputs.get('pred_known', None)
+    if pred_known is not None:
+        known_prob = _energy_to_prob(pred_known[image_idx].detach().cpu(), known_temp)
     else:
-        max_known_prob = torch.zeros_like(obj_prob)
-    unknown_suppress = torch.clamp(1.0 - unknown_coeff * max_known_prob, min=0.0, max=1.0)
-    unknown_score = obj_prob * unk_prob * unknown_suppress
+        pred_unk = outputs.get('pred_unk', None)
+        unk_prob_compat = torch.sigmoid(pred_unk[image_idx].detach().cpu()) if pred_unk is not None else torch.zeros_like(obj_prob)
+        known_prob = (1.0 - unk_prob_compat).clamp(min=1e-6, max=1.0)
+
+    unk_prob = (1.0 - known_prob).clamp(min=0.0, max=1.0)
+    known_scores = obj_prob.unsqueeze(-1) * known_prob.unsqueeze(-1) * class_prob
+    cls_max = class_prob.max(dim=-1).values if class_prob.shape[-1] > 0 else torch.zeros_like(obj_prob)
+    unknown_score = obj_prob * unk_prob
     return {
         'obj_prob': obj_prob,
-        'known_prob': known_prob,
-        'cls_max': max_known_prob,
+        'known_prob': class_prob,
+        'knownness_prob': known_prob,
+        'cls_max': cls_max,
         'unk_prob': unk_prob,
         'unknown_score': unknown_score,
         'pred_boxes': pred_boxes[image_idx].detach().cpu(),
+        'known_scores': known_scores,
     }
 
 
@@ -647,8 +683,10 @@ def _select_high_obj_low_known_candidates(outputs, image_idx, img_hw, args):
     boxes = _cxcywh_to_abs_xyxy(pred_boxes[image_idx][idx], img_hw)
     return boxes, obj_prob[idx].tolist(), cls_max[idx].tolist(), unk_prob[idx].tolist()
 
+def _energy_to_prob(energy, temperature):
+    return torch.exp(-temperature * energy).clamp(min=1e-6, max=1.0)
 
-def save_eval_qualitative(vis_state, samples, targets, vis_results, outputs, args, out_dir, writer=None, step=0):
+def save_eval_qualitative(vis_state, samples, targets, vis_results, outputs, criterion, args, out_dir, writer=None, step=0, epoch=0):
     max_samples = int(getattr(args, 'viz_num_samples', 12))
     tb_max = int(getattr(args, 'viz_tb_images', 4))
     unk_label = int(getattr(args, 'num_classes', 81) - 1)
@@ -667,20 +705,25 @@ def save_eval_qualitative(vis_state, samples, targets, vis_results, outputs, arg
         pred_scores = pred['scores'].detach().cpu().numpy()[keep]
         known_mask = pred_labels != unk_label if len(pred_labels) > 0 else np.array([], dtype=bool)
         unknown_mask = pred_labels == unk_label if len(pred_labels) > 0 else np.array([], dtype=bool)
+
         pred_all = _draw_boxes(img_np, pred_boxes=pred_boxes, pred_labels=pred_labels, pred_scores=pred_scores, unk_label=unk_label, title='All Predictions')
         pred_known = _draw_boxes(img_np, pred_boxes=pred_boxes[known_mask], pred_labels=pred_labels[known_mask], pred_scores=pred_scores[known_mask], unk_label=unk_label, title='Known Predictions')
         pred_unknown = _draw_boxes(img_np, pred_boxes=pred_boxes[unknown_mask], pred_labels=pred_labels[unknown_mask], pred_scores=pred_scores[unknown_mask], unk_label=unk_label, title='Unknown Predictions')
         gt_only = _draw_boxes(img_np, gt_boxes=gt_boxes, gt_labels=gt_labels, unk_label=unk_label, title='Ground Truth')
         overlay = _draw_boxes(img_np, pred_boxes=pred_boxes, pred_labels=pred_labels, pred_scores=pred_scores, gt_boxes=gt_boxes, gt_labels=gt_labels, unk_label=unk_label, title='Pred + GT')
+
         errors = _extract_error_cases(pred_boxes, pred_labels, pred_scores, gt_boxes, gt_labels, unk_label, iou_thr=float(getattr(args, 'viz_error_iou_thresh', 0.5)))
         u2k_pred_idx = np.array(sorted(set(errors['unknown_to_known_pred_idx'])), dtype=np.int64)
         u2k_gt_idx = np.array(sorted(set(errors['unknown_to_known_gt_idx'])), dtype=np.int64)
         k2u_pred_idx = np.array(sorted(set(errors['known_to_unknown_pred_idx'])), dtype=np.int64)
         k2u_gt_idx = np.array(sorted(set(errors['known_to_unknown_gt_idx'])), dtype=np.int64)
+
         err_unknown_to_known = _draw_boxes(img_np, pred_boxes=pred_boxes[u2k_pred_idx] if len(u2k_pred_idx) > 0 else None, pred_labels=pred_labels[u2k_pred_idx] if len(u2k_pred_idx) > 0 else None, pred_scores=pred_scores[u2k_pred_idx] if len(u2k_pred_idx) > 0 else None, gt_boxes=gt_boxes[u2k_gt_idx] if len(u2k_gt_idx) > 0 else None, gt_labels=gt_labels[u2k_gt_idx] if len(u2k_gt_idx) > 0 else None, unk_label=unk_label, title='Error: Unknown -> Known')
         err_known_to_unknown = _draw_boxes(img_np, pred_boxes=pred_boxes[k2u_pred_idx] if len(k2u_pred_idx) > 0 else None, pred_labels=pred_labels[k2u_pred_idx] if len(k2u_pred_idx) > 0 else None, pred_scores=pred_scores[k2u_pred_idx] if len(k2u_pred_idx) > 0 else None, gt_boxes=gt_boxes[k2u_gt_idx] if len(k2u_gt_idx) > 0 else None, gt_labels=gt_labels[k2u_gt_idx] if len(k2u_gt_idx) > 0 else None, unk_label=unk_label, title='Error: Known -> Unknown')
-        cand_boxes, cand_obj, cand_cls, cand_unk = _select_high_obj_low_known_candidates(outputs, i, img_hw, args)
-        cand_img = _draw_candidate_boxes(img_np, cand_boxes, cand_obj, cand_cls, cand_unk, title='Candidates: High obj / Low known')
+
+        cand_boxes, cand_obj, cand_cls, cand_unk, cand_sel = _select_mining_aligned_candidates_from_criterion(outputs, targets, criterion, epoch, i, img_hw, args)
+        cand_img = _draw_candidate_boxes(img_np, cand_boxes, cand_obj, cand_cls, cand_unk, title='Mining-aligned pseudo candidates')
+
         stem = os.path.join(out_dir, f'{image_id:012d}')
         _save_image(pred_all, stem + '_pred_all.png')
         _save_image(pred_known, stem + '_pred_known.png')
@@ -689,19 +732,39 @@ def save_eval_qualitative(vis_state, samples, targets, vis_results, outputs, arg
         _save_image(overlay, stem + '_overlay.png')
         _save_image(err_unknown_to_known, stem + '_error_unknown_to_known.png')
         _save_image(err_known_to_unknown, stem + '_error_known_to_unknown.png')
-        _save_image(cand_img, stem + '_candidate_highobj_lowknown.png')
+        _save_image(cand_img, stem + '_candidate_mining_aligned.png')
+
         panel_path = stem + '_panel.png'
-        _make_panel([(gt_only, 'Ground Truth'), (pred_all, 'All Predictions'), (pred_known, 'Known Predictions'), (pred_unknown, 'Unknown Predictions')], panel_path, tile_hw=(420, 280), cols=2)
+        _make_panel([
+            (gt_only, 'Ground Truth'),
+            (pred_all, 'All Predictions'),
+            (pred_known, 'Known Predictions'),
+            (pred_unknown, 'Unknown Predictions')
+        ], panel_path, tile_hw=(420, 280), cols=2)
+
         error_panel_path = stem + '_panel_errors.png'
-        _make_panel([(overlay, 'Pred + GT'), (err_unknown_to_known, 'Error: Unknown -> Known'), (err_known_to_unknown, 'Error: Known -> Unknown'), (cand_img, 'High-obj Low-known Candidates')], error_panel_path, tile_hw=(420, 280), cols=2)
+        _make_panel([
+            (overlay, 'Pred + GT'),
+            (err_unknown_to_known, 'Error: Unknown -> Known'),
+            (err_known_to_unknown, 'Error: Known -> Unknown'),
+            (cand_img, 'Mining-aligned Pseudo Candidates')
+        ], error_panel_path, tile_hw=(420, 280), cols=2)
+
         vis_state['saved_images'].append(error_panel_path)
         vis_state['saved_panels'].append(panel_path)
-        vis_state['error_rows'].append({'image_id': image_id, 'num_pred': int(len(pred_boxes)), 'num_gt': int(len(gt_boxes)), 'num_unknown_to_known': int(len(u2k_gt_idx)), 'num_known_to_unknown': int(len(k2u_gt_idx)), 'num_candidates': int(len(cand_boxes))})
+        vis_state['error_rows'].append({
+            'image_id': image_id,
+            'num_pred': int(len(pred_boxes)),
+            'num_gt': int(len(gt_boxes)),
+            'num_unknown_to_known': int(len(u2k_gt_idx)),
+            'num_known_to_unknown': int(len(k2u_gt_idx)),
+            'num_candidates': int(len(cand_boxes)),
+        })
         if writer is not None and vis_state['num_saved'] < tb_max:
             writer.add_image(f'eval_qualitative/{image_id:012d}_panel', np.array(Image.open(panel_path)), global_step=step, dataformats='HWC')
             writer.add_image(f'eval_qualitative/{image_id:012d}_panel_errors', np.array(Image.open(error_panel_path)), global_step=step, dataformats='HWC')
         vis_state['num_saved'] += 1
-
+        
 
 def finalize_eval_visualizations(vis_state, output_dir, epoch, writer=None):
     out_dir = os.path.join(output_dir, 'visualizations', f'epoch_{int(epoch):04d}')

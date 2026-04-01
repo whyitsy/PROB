@@ -18,29 +18,32 @@ COMMON_ARGS="\
   --uod_odqe_decay_min 0.1 --uod_odqe_decay_power 1.0 \
   "
 
-# python -u main_open_world.py \
+# torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
+#     main_open_world.py \
 #   --output_dir "${BASE_EXP_DIR}/C4_0_MinimalUOD" \
 #   ${COMMON_ARGS} \
 #   ${PY_ARGS}
 # sleep 30
 
-# python -u main_open_world.py \
+# torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
+#     main_open_world.py \
 #   --output_dir "${BASE_EXP_DIR}/C4_1_ODQEOnly" \
 #   --uod_enable_odqe \
 #   ${COMMON_ARGS} \
 #   ${PY_ARGS}
 # sleep 30
 
-# python -u main_open_world.py \
+# torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
+#     main_open_world.py \
 #   --output_dir "${BASE_EXP_DIR}/C4_2_DecorrOnly" \
 #   --uod_enable_decorr \
 #   ${COMMON_ARGS} \
 #   ${PY_ARGS}
 # sleep 30
 
-torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
-  main_open_world.py \
-  --output_dir "${BASE_EXP_DIR}/C4_3_ODQE_Decorr" \
-  --uod_enable_odqe --uod_enable_decorr \
-  ${COMMON_ARGS} \
-  ${PY_ARGS}
+# torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
+#   main_open_world.py \
+#   --output_dir "${BASE_EXP_DIR}/C4_3_ODQE_Decorr" \
+#   --uod_enable_odqe --uod_enable_decorr \
+#   ${COMMON_ARGS} \
+#   ${PY_ARGS}

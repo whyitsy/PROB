@@ -1,13 +1,11 @@
-
 # ------------------------------------------------------------------------
-# UOD: simplified explicit unknownness modeling on top of PROB.
-# - ambiguous unmatched queries are ignored in classification loss
-# - pseudo unknowns receive cross-layer box consistency supervision
-# - unknownness is modeled through a knownness-energy head
-# - postprocess is simplified back to PROB-style fused-score flatten top-k
+# UOD: Explicit Unknownness Modeling + Decoupled Optimization on PROB.
+# Chapter 3: explicit unknownness + sparse pseudo supervision + batch dynamic allocation
+# Chapter 4: add triplet decoupled optimization
 # ------------------------------------------------------------------------
 import copy
 import math
+import logging
 
 import torch
 import torch.nn.functional as F
@@ -16,7 +14,7 @@ from torch import nn
 from util import box_ops
 from util.misc import (NestedTensor, accuracy, get_world_size, interpolate,
                        inverse_sigmoid, is_dist_avail_and_initialized,
-                       nested_tensor_from_tensor_list,  is_main_process)
+                       nested_tensor_from_tensor_list)
 
 from models.ops.modules import MSDeformAttn
 from .backbone import build_backbone
@@ -44,52 +42,38 @@ class MLP(nn.Module):
         return x
 
 
-def _energy_to_prob(energy, temperature):
-    return torch.exp(-temperature * energy).clamp(min=1e-6, max=1.0)
+def _inverse_sigmoid_clamped(x, eps=1e-4):
+    x = float(max(eps, min(1 - eps, x)))
+    return math.log(x / (1 - x))
 
 
-def _unknown_logit_from_known_energy(known_energy, temperature):
-    known_prob = _energy_to_prob(known_energy, temperature).clamp(min=1e-6, max=1 - 1e-6)
-    unk_prob = (1.0 - known_prob).clamp(min=1e-6, max=1 - 1e-6)
-    return torch.log(unk_prob / (1.0 - unk_prob))
-
-
-def _compute_uod_fused_probabilities(pred_logits, pred_obj, pred_known, invalid_cls_logits, temperature):
+def _compute_uod_fused_probabilities(pred_logits, pred_obj, pred_unk, invalid_cls_logits, temperature,
+                                     known_unk_suppress_coeff, unknown_known_suppress_coeff):
     logits = pred_logits.clone()
     logits[:, :, invalid_cls_logits] = -10e10
-
-    obj_prob = _energy_to_prob(pred_obj, temperature)
-    class_prob = logits.sigmoid().clone()
+    obj_prob = torch.exp(-temperature * pred_obj)
+    known_prob = logits.sigmoid().clone()
     if len(invalid_cls_logits) > 0:
-        class_prob[:, :, invalid_cls_logits] = 0.0
-    if class_prob.shape[-1] > 0:
-        class_prob[:, :, -1] = 0.0
-
-    if pred_known is None:
-        knownness_prob = torch.ones_like(obj_prob)
+        known_prob[:, :, invalid_cls_logits] = 0.0
+    if known_prob.shape[-1] > 0:
+        known_prob[:, :, -1] = 0.0
+    unk_prob = torch.sigmoid(pred_unk) if pred_unk is not None else torch.zeros_like(obj_prob)
+    known_suppress = torch.clamp(1.0 - known_unk_suppress_coeff * unk_prob.unsqueeze(-1), min=0.0, max=1.0)
+    known_scores = obj_prob.unsqueeze(-1) * known_prob * known_suppress
+    if known_prob.shape[-1] > 1:
+        max_known_prob = known_prob[:, :, :-1].max(dim=-1).values
     else:
-        knownness_prob = _energy_to_prob(pred_known, temperature)
-
-    unknown_prob = (1.0 - knownness_prob).clamp(min=0.0, max=1.0)
-    known_scores = obj_prob.unsqueeze(-1) * knownness_prob.unsqueeze(-1) * class_prob
-    if class_prob.shape[-1] > 1:
-        max_known_cls_prob = class_prob[:, :, :-1].max(dim=-1).values
-    elif class_prob.shape[-1] > 0:
-        max_known_cls_prob = class_prob.squeeze(-1)
-    else:
-        max_known_cls_prob = torch.zeros_like(obj_prob)
-    unknown_score = obj_prob * unknown_prob * 15
-
-    fused = known_scores.clone()
+        max_known_prob = torch.zeros_like(obj_prob)
+    unknown_suppress = torch.clamp(1.0 - unknown_known_suppress_coeff * max_known_prob, min=0.0, max=1.0)
+    unknown_score = obj_prob * unk_prob * unknown_suppress
+    fused = known_scores.clone() 
     if fused.shape[-1] > 0:
         fused[:, :, -1] = unknown_score
-
     return {
         'obj_prob': obj_prob,
-        'class_prob': class_prob,
-        'knownness_prob': knownness_prob,
-        'unknown_prob': unknown_prob,
-        'max_known_cls_prob': max_known_cls_prob,
+        'known_prob': known_prob,
+        'unk_prob': unk_prob,
+        'max_known_prob': max_known_prob,
         'known_scores': known_scores,
         'unknown_score': unknown_score,
         'fused_prob': fused,
@@ -110,22 +94,26 @@ class DeformableDETRUOD(nn.Module):
         self.with_box_refine = with_box_refine
         self.two_stage = two_stage
         self.enable_odqe = bool(getattr(args, 'uod_enable_odqe', False))
-        self.energy_temperature = float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / float(hidden_dim)
 
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        self.unk_embed = nn.Linear(hidden_dim, 1)
         self.prob_obj_head = ProbObjectnessHead(hidden_dim)
-        self.known_energy_head = ProbObjectnessHead(hidden_dim)
+
+        init_known_unk = _inverse_sigmoid_clamped(getattr(args, 'uod_known_unk_suppress_init', 0.5))
+        init_unknown_known = _inverse_sigmoid_clamped(getattr(args, 'uod_unknown_known_suppress_init', 0.5))
+        self.known_unk_suppress_logit = nn.Parameter(torch.tensor(init_known_unk, dtype=torch.float32))
+        self.unknown_known_suppress_logit = nn.Parameter(torch.tensor(init_unknown_known, dtype=torch.float32))
 
         if self.enable_odqe:
             self.context_attn = MSDeformAttn(hidden_dim, num_feature_levels, n_heads=8, n_points=4)
             self.gate_mlp = MLP(hidden_dim * 2, hidden_dim, hidden_dim, 2)
             self.ffn_obj = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
-            self.ffn_known = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
+            self.ffn_unk = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
             self.ffn_cls = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
         else:
             self.obj_proj = nn.Linear(hidden_dim, hidden_dim)
-            self.known_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.unk_proj = nn.Linear(hidden_dim, hidden_dim)
             self.cls_proj = nn.Linear(hidden_dim, hidden_dim)
 
         if not two_stage:
@@ -159,6 +147,7 @@ class DeformableDETRUOD(nn.Module):
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         self.class_embed.bias.data = torch.ones(num_classes) * bias_value
+        self.unk_embed.bias.data.fill_(-2.0)
         nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
         nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
         for proj in self.input_proj:
@@ -169,17 +158,17 @@ class DeformableDETRUOD(nn.Module):
         if with_box_refine:
             self.class_embed = _get_clones(self.class_embed, num_pred)
             self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
+            self.unk_embed = _get_clones(self.unk_embed, num_pred)
             self.prob_obj_head = _get_clones(self.prob_obj_head, num_pred)
-            self.known_energy_head = _get_clones(self.known_energy_head, num_pred)
             if self.enable_odqe:
                 self.context_attn = _get_clones(self.context_attn, num_pred)
                 self.gate_mlp = _get_clones(self.gate_mlp, num_pred)
                 self.ffn_obj = _get_clones(self.ffn_obj, num_pred)
-                self.ffn_known = _get_clones(self.ffn_known, num_pred)
+                self.ffn_unk = _get_clones(self.ffn_unk, num_pred)
                 self.ffn_cls = _get_clones(self.ffn_cls, num_pred)
             else:
                 self.obj_proj = _get_clones(self.obj_proj, num_pred)
-                self.known_proj = _get_clones(self.known_proj, num_pred)
+                self.unk_proj = _get_clones(self.unk_proj, num_pred)
                 self.cls_proj = _get_clones(self.cls_proj, num_pred)
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
             self.transformer.decoder.bbox_embed = self.bbox_embed
@@ -187,17 +176,17 @@ class DeformableDETRUOD(nn.Module):
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:], -2.0)
             self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
             self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
+            self.unk_embed = nn.ModuleList([self.unk_embed for _ in range(num_pred)])
             self.prob_obj_head = nn.ModuleList([self.prob_obj_head for _ in range(num_pred)])
-            self.known_energy_head = nn.ModuleList([self.known_energy_head for _ in range(num_pred)])
             if self.enable_odqe:
                 self.context_attn = nn.ModuleList([self.context_attn for _ in range(num_pred)])
                 self.gate_mlp = nn.ModuleList([self.gate_mlp for _ in range(num_pred)])
                 self.ffn_obj = nn.ModuleList([self.ffn_obj for _ in range(num_pred)])
-                self.ffn_known = nn.ModuleList([self.ffn_known for _ in range(num_pred)])
+                self.ffn_unk = nn.ModuleList([self.ffn_unk for _ in range(num_pred)])
                 self.ffn_cls = nn.ModuleList([self.ffn_cls for _ in range(num_pred)])
             else:
                 self.obj_proj = nn.ModuleList([self.obj_proj for _ in range(num_pred)])
-                self.known_proj = nn.ModuleList([self.known_proj for _ in range(num_pred)])
+                self.unk_proj = nn.ModuleList([self.unk_proj for _ in range(num_pred)])
                 self.cls_proj = nn.ModuleList([self.cls_proj for _ in range(num_pred)])
             self.transformer.decoder.bbox_embed = None
         if two_stage:
@@ -222,6 +211,9 @@ class DeformableDETRUOD(nn.Module):
         if ref_sig.shape[-1] == 4:
             return ref_sig[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[:, None]
         return ref_sig[:, :, None] * valid_ratios[:, None]
+
+    def _calibration_coeffs(self):
+        return torch.sigmoid(self.known_unk_suppress_logit), torch.sigmoid(self.unknown_known_suppress_logit)
 
     def forward(self, samples: NestedTensor):
         if not isinstance(samples, NestedTensor):
@@ -256,9 +248,8 @@ class DeformableDETRUOD(nn.Module):
         valid_ratios = enc_info['valid_ratios']
         padding_mask = enc_info['padding_mask']
 
-        outputs_classes, outputs_coords = [], []
-        outputs_objectness, outputs_known = [], []
-        outputs_obj_feats, outputs_known_feats, outputs_cls_feats = [], [], []
+        outputs_classes, outputs_coords, outputs_objectness, outputs_unknownness = [], [], [], []
+        outputs_obj_feats, outputs_unk_feats, outputs_cls_feats = [], [], []
         gate_means = []
 
         for lvl in range(hs.shape[0]):
@@ -273,18 +264,18 @@ class DeformableDETRUOD(nn.Module):
                 q_tilde = q + layer_decay * g_q * c_q
                 gate_means.append((layer_decay * g_q).mean())
                 obj_feat = self.ffn_obj[lvl](q_tilde)
-                known_feat = self.ffn_known[lvl](q_tilde)
+                unk_feat = self.ffn_unk[lvl](q_tilde)
                 cls_feat = self.ffn_cls[lvl](q_tilde)
                 hs_for_bbox = q_tilde
             else:
                 obj_feat = self.obj_proj[lvl](q)
-                known_feat = self.known_proj[lvl](q)
+                unk_feat = self.unk_proj[lvl](q)
                 cls_feat = self.cls_proj[lvl](q)
                 hs_for_bbox = q
 
             outputs_class = self.class_embed[lvl](cls_feat)
             outputs_objectness_lvl = self.prob_obj_head[lvl](obj_feat)
-            outputs_known_lvl = self.known_energy_head[lvl](known_feat)
+            outputs_unknownness_lvl = self.unk_embed[lvl](unk_feat).squeeze(-1)
             tmp = self.bbox_embed[lvl](hs_for_bbox)
             if reference.shape[-1] == 4:
                 tmp += reference
@@ -295,36 +286,37 @@ class DeformableDETRUOD(nn.Module):
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
             outputs_objectness.append(outputs_objectness_lvl)
-            outputs_known.append(outputs_known_lvl)
+            outputs_unknownness.append(outputs_unknownness_lvl)
             outputs_obj_feats.append(obj_feat)
-            outputs_known_feats.append(known_feat)
+            outputs_unk_feats.append(unk_feat)
             outputs_cls_feats.append(cls_feat)
 
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
         outputs_objectness = torch.stack(outputs_objectness)
-        outputs_known = torch.stack(outputs_known)
+        outputs_unknownness = torch.stack(outputs_unknownness)
+        known_coeff, unknown_coeff = self._calibration_coeffs()
         gate_mean_per_layer = torch.stack(gate_means) if gate_means else None
 
-        pred_unk_compat = _unknown_logit_from_known_energy(outputs_known[-1], self.energy_temperature)
         out = {
             'pred_logits': outputs_class[-1],
             'pred_boxes': outputs_coord[-1],
             'pred_obj': outputs_objectness[-1],
-            'pred_known': outputs_known[-1],
-            'pred_unk': pred_unk_compat,
+            'pred_unk': outputs_unknownness[-1],
             'proj_obj': outputs_obj_feats[-1],
-            'proj_known': outputs_known_feats[-1],
-            'proj_unk': outputs_known_feats[-1],
+            'proj_unk': outputs_unk_feats[-1],
             'proj_cls': outputs_cls_feats[-1],
+            'known_unk_suppress_coeff': known_coeff,
+            'unknown_known_suppress_coeff': unknown_coeff,
         }
         if gate_mean_per_layer is not None:
             out['gate_mean_per_layer'] = gate_mean_per_layer
             out['gate_mean'] = gate_mean_per_layer.mean()
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(
-                outputs_class, outputs_coord, outputs_objectness, outputs_known,
-                outputs_obj_feats, outputs_known_feats, outputs_cls_feats,
+                outputs_class, outputs_coord, outputs_objectness, outputs_unknownness,
+                outputs_obj_feats, outputs_unk_feats, outputs_cls_feats,
+                known_coeff, unknown_coeff,
             )
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
@@ -332,20 +324,20 @@ class DeformableDETRUOD(nn.Module):
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord, objectness, knownness,
-                      obj_feats, known_feats, cls_feats):
+    def _set_aux_loss(self, outputs_class, outputs_coord, objectness, unknownness,
+                      obj_feats, unk_feats, cls_feats, known_coeff, unknown_coeff):
         aux = []
-        for a, b, c, d, po, pk, pc in zip(outputs_class[:-1], objectness[:-1], outputs_coord[:-1], knownness[:-1], obj_feats[:-1], known_feats[:-1], cls_feats[:-1]):
+        for a, b, c, d, po, pu, pc in zip(outputs_class[:-1], objectness[:-1], outputs_coord[:-1], unknownness[:-1], obj_feats[:-1], unk_feats[:-1], cls_feats[:-1]):
             aux.append({
                 'pred_logits': a,
                 'pred_obj': b,
-                'pred_known': d,
-                'pred_unk': _unknown_logit_from_known_energy(d, self.energy_temperature),
+                'pred_unk': d,
                 'pred_boxes': c,
                 'proj_obj': po,
-                'proj_known': pk,
-                'proj_unk': pk,
+                'proj_unk': pu,
                 'proj_cls': pc,
+                'known_unk_suppress_coeff': known_coeff,
+                'unknown_known_suppress_coeff': unknown_coeff,
             })
         return aux
 
@@ -370,11 +362,12 @@ class SetCriterion(nn.Module):
         self.enable_batch_dynamic = bool(getattr(args, 'uod_enable_batch_dynamic', False))
         self.enable_decorr = bool(getattr(args, 'uod_enable_decorr', False))
         self.obj_temperature = float(getattr(args, 'obj_temp', 1.0)) / float(hidden_dim)
-        self.known_temperature = float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / float(hidden_dim)
         self.num_aux_layers = max(int(getattr(args, 'dec_layers', 6)) - 1, 0)
 
         self.uod_start_epoch = int(getattr(args, 'uod_start_epoch', 8))
         self.uod_neg_warmup_epochs = int(getattr(args, 'uod_neg_warmup_epochs', 3))
+        self.uod_pos_quantile = float(getattr(args, 'uod_pos_quantile', 0.25))
+        self.uod_pos_scale = float(getattr(args, 'uod_pos_scale', 1.2))
         self.uod_min_pos_thresh = float(getattr(args, 'uod_min_pos_thresh', 0.08))
         self.uod_known_reject_thresh = float(getattr(args, 'uod_known_reject_thresh', 0.15))
         self.uod_neg_margin = float(getattr(args, 'uod_neg_margin', 0.8))
@@ -385,23 +378,41 @@ class SetCriterion(nn.Module):
         self.uod_max_iou = float(getattr(args, 'uod_max_iou', 0.2))
         self.uod_max_iof = float(getattr(args, 'uod_max_iof', 0.4))
         self.uod_min_area = float(getattr(args, 'uod_min_area', 0.002))
-        self.uod_min_side = float(getattr(args, 'uod_min_side', 0.05))
-        self.uod_max_aspect_ratio = float(getattr(args, 'uod_max_aspect_ratio', 4.0))
+        self.uod_max_aspect_ratio = float(getattr(args, 'uod_max_aspect_ratio', 5.0))
         self.uod_candidate_nms_iou = float(getattr(args, 'uod_candidate_nms_iou', 0.6))
         self.uod_pos_unk_min = float(getattr(args, 'uod_pos_unk_min', 0.05))
         self.enable_cls_soft_attn = bool(getattr(args, 'uod_enable_cls_soft_attn', False))
         self.uod_cls_soft_attn_alpha = float(getattr(args, 'uod_cls_soft_attn_alpha', 0.5))
         self.uod_cls_soft_attn_min = float(getattr(args, 'uod_cls_soft_attn_min', 0.25))
-        self.uod_neg_max_pseudo_iou = float(getattr(args, 'uod_neg_max_pseudo_iou', 0.3))
+        self.uod_neg_max_pseudo_iou =  float(getattr(args, 'uod_neg_max_pseudo_iou', 0.3))
         self.uod_neg_known_max = float(getattr(args, 'uod_neg_known_max', 0.7))
+        self.uod_neg_unk_max = float(getattr(args, 'uod_neg_unk_max', 0.5))
+
+    def _get_calibration_coeffs(self, outputs):
+        known_coeff = outputs.get('known_unk_suppress_coeff', None)
+        unknown_coeff = outputs.get('unknown_known_suppress_coeff', None)
+        device = outputs['pred_logits'].device
+        dtype = outputs['pred_logits'].dtype
+        if known_coeff is None:
+            known_coeff = torch.tensor(0.5, device=device, dtype=dtype)
+        if unknown_coeff is None:
+            unknown_coeff = torch.tensor(0.5, device=device, dtype=dtype)
+        return known_coeff.to(device=device, dtype=dtype), unknown_coeff.to(device=device, dtype=dtype)
 
     def _compute_fused_probabilities(self, outputs):
+        pred_unk = outputs.get('pred_unk', None)
+        if pred_unk is None:
+            zero = torch.zeros_like(outputs['pred_obj'])
+            pred_unk = zero
+        known_coeff, unknown_coeff = self._get_calibration_coeffs(outputs)
         return _compute_uod_fused_probabilities(
             outputs['pred_logits'],
             outputs['pred_obj'],
-            outputs.get('pred_known', None),
+            pred_unk,
             self.invalid_cls_logits,
             self.obj_temperature,
+            known_coeff,
+            unknown_coeff,
         )
 
     def _aux_stage(self, layer_idx):
@@ -417,19 +428,11 @@ class SetCriterion(nn.Module):
 
     def _aux_losses_for_layer(self, layer_idx):
         stage = self._aux_stage(layer_idx)
-        losses = ['labels', 'boxes', 'cardinality', 'obj_likelihood']
-        if self.enable_unknown:
-            losses.append('unk_known')
-        if self.enable_pseudo:
-            losses.append('obj_pseudo')
-        if stage in ['mid', 'high']:
-            if self.enable_pseudo and self.enable_unknown:
-                losses.append('unk_pseudo')
-            if self.enable_pseudo:
-                losses.append('boxes_pseudo_cons')
-        if stage == 'high' and self.enable_decorr:
-            losses.append('decorr')
-        return losses
+        if stage == 'low':
+            return ['labels', 'boxes', 'cardinality', 'obj_likelihood', 'obj_pseudo']
+        if stage == 'mid':
+            return ['labels', 'boxes', 'cardinality', 'obj_likelihood', 'obj_pseudo', 'unk_known', 'unk_pseudo']
+        return ['labels', 'boxes', 'cardinality', 'obj_likelihood', 'obj_pseudo', 'unk_known', 'unk_pseudo', 'decorr']
 
     def _sigmoid_focal_loss_query_weight(self, inputs, targets, num_boxes, query_weights=None, alpha: float = 0.25, gamma: float = 2.0):
         prob = inputs.sigmoid()
@@ -445,53 +448,61 @@ class SetCriterion(nn.Module):
             loss = loss * query_weights.unsqueeze(-1)
         return loss.mean(1).sum() / num_boxes
 
+
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True,
-                    dummy_pos_indices=None, dummy_pos_weights=None,
-                    ignore_query_indices=None, **kwargs):
+                    dummy_pos_indices=None, dummy_pos_weights=None, **kwargs):
         assert 'pred_logits' in outputs
         temp_src_logits = outputs['pred_logits'].clone()
         temp_src_logits[:, :, self.invalid_cls_logits] = -10e10
         src_logits = temp_src_logits
 
         idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t['labels'][J] for t, (_, J) in zip(targets, indices)]) if len(indices) > 0 else torch.empty(0, dtype=torch.long, device=src_logits.device)
+        target_classes_o = torch.cat([t['labels'][J] for t, (_, J) in zip(targets, indices)])
 
-        C = src_logits.shape[-1]
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
-        if len(target_classes_o) > 0:
-            target_classes[idx] = target_classes_o
+        # target_classes = torch.full(src_logits.shape[:2], self.num_classes - 1, dtype=torch.int64, device=src_logits.device)
+        # target_classes[idx] = target_classes_o
+        # target_classes_onehot = torch.zeros(src_logits.shape, dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
+        # target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
+        C = src_logits.shape[-1]  # 当前 logits 维度，通常等于 self.num_classes
 
-        target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], C + 1],
-                                            dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
+        target_classes = torch.full(
+            src_logits.shape[:2],
+            self.num_classes,   # 额外背景索引
+            dtype=torch.int64,
+            device=src_logits.device
+        )
+        target_classes[idx] = target_classes_o
+
+        target_classes_onehot = torch.zeros(
+            [src_logits.shape[0], src_logits.shape[1], C + 1],
+            dtype=src_logits.dtype,
+            layout=src_logits.layout,
+            device=src_logits.device
+        )
         target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
+
+        # 去掉额外背景维度，unmatched 变成全 0
         target_classes_onehot = target_classes_onehot[:, :, :-1]
 
-        need_query_weights = (ignore_query_indices is not None) or (self.enable_cls_soft_attn and dummy_pos_indices is not None)
         query_weights = None
-        if need_query_weights:
+        if self.enable_cls_soft_attn and dummy_pos_indices is not None:
             query_weights = torch.ones(src_logits.shape[:2], dtype=src_logits.dtype, device=src_logits.device)
-
-            if ignore_query_indices is not None:
-                for b_idx, q_list in enumerate(ignore_query_indices):
-                    if len(q_list) == 0:
-                        continue
-                    q = torch.as_tensor(q_list, dtype=torch.long, device=src_logits.device)
-                    query_weights[b_idx, q] = 0.0
-
-            if self.enable_cls_soft_attn and dummy_pos_indices is not None:
-                for b_idx, q_list in enumerate(dummy_pos_indices):
-                    if len(q_list) == 0:
-                        continue
-                    q = torch.as_tensor(q_list, dtype=torch.long, device=src_logits.device)
-                    if dummy_pos_weights is not None and b_idx < len(dummy_pos_weights) and len(dummy_pos_weights[b_idx]) == len(q_list):
-                        conf = torch.as_tensor(dummy_pos_weights[b_idx], dtype=src_logits.dtype, device=src_logits.device)
-                    else:
-                        conf = torch.ones(len(q_list), dtype=src_logits.dtype, device=src_logits.device)
-                    attn = 1.0 - self.uod_cls_soft_attn_alpha * conf
-                    attn = torch.clamp(attn, min=self.uod_cls_soft_attn_min, max=1.0)
-                    hard_mask = conf >= 0.8
-                    attn[hard_mask] = 0.0
-                    query_weights[b_idx, q] = torch.minimum(query_weights[b_idx, q], attn)
+            for b_idx, q_list in enumerate(dummy_pos_indices):
+                if len(q_list) == 0:
+                    continue
+                q = torch.as_tensor(q_list, dtype=torch.long, device=src_logits.device)
+                if dummy_pos_weights is not None and b_idx < len(dummy_pos_weights) and len(dummy_pos_weights[b_idx]) == len(q_list):
+                    conf = torch.as_tensor(dummy_pos_weights[b_idx], dtype=src_logits.dtype, device=src_logits.device)
+                else:
+                    conf = torch.ones(len(q_list), dtype=src_logits.dtype, device=src_logits.device)
+                
+                attn = 1.0 - self.uod_cls_soft_attn_alpha * conf
+                attn = torch.clamp(attn, min=self.uod_cls_soft_attn_min, max=1.0)
+                # 两段式, 如果置信度很高, 直接硬豁免.
+                hard_mask = conf >= 0.8
+                attn[hard_mask] = 0.0
+                
+                query_weights[b_idx, q] = attn
 
         if query_weights is None:
             loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha,
@@ -508,16 +519,14 @@ class SetCriterion(nn.Module):
             losses['class_error'] = src_logits.sum() * 0.0
         return losses
 
+    
     @torch.no_grad()
     def loss_cardinality(self, outputs, targets, indices, num_boxes):
         pred_logits = outputs['pred_logits']
         device = pred_logits.device
         tgt_lengths = torch.as_tensor([len(v['labels']) for v in targets], device=device)
         fused = self._compute_fused_probabilities(outputs)
-        if fused['known_scores'].shape[-1] > 1:
-            known_max = fused['known_scores'][:, :, :-1].max(dim=-1).values
-        else:
-            known_max = fused['known_scores'].max(dim=-1).values
+        known_max = fused['known_scores'][:, :, :-1].max(dim=-1).values if fused['known_scores'].shape[-1] > 1 else fused['known_scores'].squeeze(-1)
         unk_score = fused['unknown_score']
         card_pred = ((known_max > 0.05) | (unk_score > 0.05)).sum(1)
         card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
@@ -526,9 +535,6 @@ class SetCriterion(nn.Module):
     def loss_boxes(self, outputs, targets, indices, num_boxes):
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
-        if idx[0].numel() == 0:
-            zero = outputs['pred_boxes'].sum() * 0.0
-            return {'loss_bbox': zero, 'loss_giou': zero}
         src_boxes = outputs['pred_boxes'][idx]
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
@@ -536,7 +542,8 @@ class SetCriterion(nn.Module):
         losses = {'loss_bbox': loss_bbox.sum() / num_boxes}
 
         loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
-            box_ops.box_cxcywh_to_xyxy(src_boxes), box_ops.box_cxcywh_to_xyxy(target_boxes)))
+            box_ops.box_cxcywh_to_xyxy(src_boxes),
+            box_ops.box_cxcywh_to_xyxy(target_boxes)))
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
@@ -567,14 +574,22 @@ class SetCriterion(nn.Module):
         return {'loss_obj_ll': torch.clamp(pred_obj, min=self.min_obj).sum() / num_boxes}
 
     def loss_unk_known(self, outputs, targets, indices, num_boxes, **kwargs):
-        if (not self.enable_unknown) or 'pred_known' not in outputs:
+        if (not self.enable_unknown) or 'pred_unk' not in outputs:
             zero = outputs['pred_logits'].sum() * 0.0
             return {'loss_unk_known': zero}
         idx = self._get_src_permutation_idx(indices)
-        pred_known = outputs['pred_known'][idx]
-        if pred_known.numel() == 0:
-            return {'loss_unk_known': outputs['pred_known'].sum() * 0.0}
-        return {'loss_unk_known': torch.clamp(pred_known, min=self.min_obj).sum() / num_boxes}
+        pred_unk = outputs['pred_unk'][idx]
+        if pred_unk.numel() == 0:
+            return {'loss_unk_known': outputs['pred_unk'].sum() * 0.0}
+        raw_loss = F.binary_cross_entropy_with_logits(pred_unk, torch.zeros_like(pred_unk))
+        fused = self._compute_fused_probabilities(outputs)
+        batch_idx, src_idx = idx
+        target_classes_o = torch.cat([t['labels'][J] for t, (_, J) in zip(targets, indices)])
+        fused_unk = fused['unknown_score'][batch_idx, src_idx]
+        fused_known = fused['known_scores'][batch_idx, src_idx, target_classes_o]
+        fused_unk_loss = F.binary_cross_entropy(fused_unk.clamp(1e-6, 1 - 1e-6), torch.zeros_like(fused_unk))
+        fused_known_loss = F.binary_cross_entropy(fused_known.clamp(1e-6, 1 - 1e-6), torch.ones_like(fused_known))
+        return {'loss_unk_known': raw_loss + 0.5 * (fused_unk_loss + fused_known_loss)}
 
     @staticmethod
     def _pairwise_iof(boxes1, boxes2):
@@ -593,38 +608,8 @@ class SetCriterion(nn.Module):
         area = w * h
         side = min(w, h)
         ar = max(w / max(h, 1e-6), h / max(w, 1e-6))
-        return area >= self.uod_min_area and side >= self.uod_min_side and ar <= self.uod_max_aspect_ratio
+        return area >= self.uod_min_area and ar <= self.uod_max_aspect_ratio
 
-    def _center_prior(self, box_cxcywh):
-        """
-        Gentle center prior with a flat central rectangle.
-        """
-        cx = float(box_cxcywh[0].item())
-        cy = float(box_cxcywh[1].item())
-
-        # ---- main knobs ----
-        rx = 0.38   # half width of central rectangle
-        ry = 0.30   # half height of central rectangle
-        min_prior = 0.65
-        decay_strength = 0.2
-        # --------------------
-
-        # No penalty inside the central rectangle
-        dx = max(0.0, abs(cx - 0.5) - rx)
-        dy = max(0.0, abs(cy - 0.5) - ry)
-
-        # Normalize by the remaining margin to the border
-        nx = dx / max(0.5 - rx, 1e-6)
-        ny = dy / max(0.5 - ry, 1e-6)
-
-        # Rectangle-style outside distance
-        r = max(nx, ny)
-
-        # Mild quadratic decay outside the rectangle
-        prior = 1.0 - decay_strength * (r ** 2)
-
-        return max(min_prior, min(1.0, prior))
-    
     def _deduplicate_pos_candidates(self, pred_boxes_img, candidates, iou_thr):
         if len(candidates) <= 1 or iou_thr is None or iou_thr <= 0:
             return candidates
@@ -664,30 +649,22 @@ class SetCriterion(nn.Module):
         dummy_pos_indices = [[] for _ in range(batch_size)]
         dummy_neg_indices = [[] for _ in range(batch_size)]
         dummy_pos_weights = [[] for _ in range(batch_size)]
-        dummy_pos_boxes = [outputs['pred_boxes'].new_zeros((0, 4)) for _ in range(batch_size)]
-        ignore_query_indices = [[] for _ in range(batch_size)]
         stats = {
-            'num_dummy_pos': 0.0,
-            'num_dummy_neg': 0.0,
-            'num_ignore_queries': 0.0,
-            'num_valid_unmatched': 0.0,
-            'num_pos_candidates': 0.0,
-            'num_neg_candidates': 0.0,
-            'num_batch_selected_pos': 0.0,
-            'pos_thresh_sum': 0.0,
-            'num_thresh': 0.0,
+            'num_dummy_pos': 0.0, 'num_dummy_neg': 0.0,
+            'num_valid_unmatched': 0.0, 'num_pos_candidates': 0.0, 'num_neg_candidates': 0.0,
+            'num_batch_selected_pos': 0.0, 'pos_thresh_sum': 0.0, 'num_thresh': 0.0,
         }
 
         if (not self.enable_pseudo) or epoch < self.uod_start_epoch:
-            return dummy_pos_indices, dummy_neg_indices, dummy_pos_weights, dummy_pos_boxes, ignore_query_indices, stats
+            return dummy_pos_indices, dummy_neg_indices, dummy_pos_weights, stats
 
         energy = outputs['pred_obj'].detach() / float(self.hidden_dim)
         pred_boxes = outputs['pred_boxes'].detach()
         fused = self._compute_fused_probabilities(outputs)
         obj_prob = fused['obj_prob'].detach()
-        unknown_prob = fused['unknown_prob'].detach()
+        unk_prob = fused['unk_prob'].detach()
         unknown_score = fused['unknown_score'].detach()
-        known_max = fused['max_known_cls_prob'].detach()
+        known_max = fused['max_known_prob'].detach()
         num_queries = energy.shape[1]
 
         all_pos_candidates = []
@@ -733,7 +710,7 @@ class SetCriterion(nn.Module):
             for q in valid:
                 e = energy[i, q].item()
                 k = known_max[i, q].item()
-                u = unknown_prob[i, q].item()
+                u = unk_prob[i, q].item()
                 us = unknown_score[i, q].item()
                 if u < self.uod_pos_unk_min:
                     continue
@@ -742,9 +719,7 @@ class SetCriterion(nn.Module):
                     known_rel = max(0.0, min(1.0, (self.uod_known_reject_thresh - k) / max(self.uod_known_reject_thresh, 1e-6)))
                     iou_rel = 1.0 - max(0.0, min(1.0, iou_map[q] / max(self.uod_max_iou, 1e-6)))
                     unk_rel = max(0.0, min(1.0, u))
-                    center_rel = self._center_prior(pred_boxes[i, q])
                     conf = (energy_rel * known_rel * iou_rel * max(unk_rel, 1e-6)) ** (1.0 / 4.0)
-                    conf = conf * (0.8 + 0.2 * center_rel)
                     pos_candidates.append((i, q, conf, e, k, u, us))
 
             pos_candidates = self._deduplicate_pos_candidates(pred_boxes[i], pos_candidates, self.uod_candidate_nms_iou)
@@ -778,11 +753,6 @@ class SetCriterion(nn.Module):
                 dummy_pos_weights[i] = [float(max(0.2, min(1.0, conf))) for _, _, conf, _, _, _, _ in pos_candidates]
             stats['num_batch_selected_pos'] = float(sum(len(v) for v in dummy_pos_indices))
 
-        for i in range(batch_size):
-            if len(dummy_pos_indices[i]) > 0:
-                q = torch.as_tensor(dummy_pos_indices[i], dtype=torch.long, device=pred_boxes.device)
-                dummy_pos_boxes[i] = pred_boxes[i, q].detach()
-
         stats['num_dummy_pos'] = float(sum(len(v) for v in dummy_pos_indices))
 
         if epoch >= self.uod_start_epoch + self.uod_neg_warmup_epochs:
@@ -797,33 +767,24 @@ class SetCriterion(nn.Module):
                 neg_candidates = []
                 for q in remaining:
                     k = known_max[i, q].item()
+                    u = unk_prob[i, q].item()
                     obj = obj_prob[i, q].item()
                     e = energy[i, q].item()
                     if k > self.uod_neg_known_max:
                         continue
-                    neg_candidates.append((q, obj, e, k))
+                    if u > self.uod_neg_unk_max:
+                        continue
+                    neg_candidates.append((q, obj, e, k, u))
 
                 stats['num_neg_candidates'] += float(len(neg_candidates))
-                neg_candidates.sort(key=lambda x: (-x[1], x[2], x[3]))
+                neg_candidates.sort(key=lambda x: (-x[1], x[2], x[3], x[4]))
                 neg_candidates = neg_candidates[:self.uod_neg_per_img]
-                dummy_neg_indices[i] = [q for q, _, _, _ in neg_candidates]
+                dummy_neg_indices[i] = [q for q, _, _, _, _ in neg_candidates]
                 stats['num_dummy_neg'] += float(len(dummy_neg_indices[i]))
 
-        for i in range(batch_size):
-            pos_set = set(dummy_pos_indices[i])
-            neg_set = set(dummy_neg_indices[i])
-            ignore = []
-            valid = per_img_cache[i]['valid'] if i < len(per_img_cache) else []
-            for q in valid:
-                if q in pos_set or q in neg_set:
-                    continue
-                if obj_prob[i, q].item() > 0.05 and unknown_prob[i, q].item() >= self.uod_pos_unk_min and known_max[i, q].item() < self.uod_known_reject_thresh:
-                    ignore.append(q)
-            ignore_query_indices[i] = ignore
-            stats['num_ignore_queries'] += float(len(ignore))
+        return dummy_pos_indices, dummy_neg_indices, dummy_pos_weights, stats
 
-        return dummy_pos_indices, dummy_neg_indices, dummy_pos_weights, dummy_pos_boxes, ignore_query_indices, stats
-
+    
     def loss_obj_pseudo(self, outputs, targets, indices, num_boxes,
                         dummy_pos_indices=None, dummy_pos_weights=None, **kwargs):
         assert 'pred_obj' in outputs
@@ -879,12 +840,12 @@ class SetCriterion(nn.Module):
 
     def loss_unk_pseudo(self, outputs, targets, indices, num_boxes,
                         dummy_pos_indices=None, dummy_pos_weights=None, **kwargs):
-        if (not self.enable_unknown) or 'pred_known' not in outputs:
+        if (not self.enable_unknown) or 'pred_unk' not in outputs:
             zero = outputs['pred_logits'].sum() * 0.0
             return {'loss_unk_pseudo': zero}
-        device = outputs['pred_known'].device
-        dtype = outputs['pred_known'].dtype
-        zero = outputs['pred_known'].sum() * 0.0
+        device = outputs['pred_unk'].device
+        dtype = outputs['pred_unk'].dtype
+        zero = outputs['pred_unk'].sum() * 0.0
         if dummy_pos_indices is None:
             return {'loss_unk_pseudo': zero}
 
@@ -903,62 +864,37 @@ class SetCriterion(nn.Module):
         b = torch.cat(sel_b)
         q = torch.cat(sel_q)
         w = torch.cat(sel_w)
-        known_energy = outputs['pred_known'][b, q]
-        known_prob = _energy_to_prob(known_energy, self.known_temperature)
-        return {'loss_unk_pseudo': (known_prob * w).sum() / (w.sum() + 1e-6)}
+        logits = outputs['pred_unk'][b, q]
+        target = torch.ones_like(logits)
+        raw_loss = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
+        fused = self._compute_fused_probabilities(outputs)
+        fused_unk = fused['unknown_score'][b, q].clamp(1e-6, 1 - 1e-6)
+        fused_loss = F.binary_cross_entropy(fused_unk, torch.ones_like(fused_unk), reduction='none')
+        loss = raw_loss + 0.5 * fused_loss
+        return {'loss_unk_pseudo': (loss * w).sum() / (w.sum() + 1e-6)}
+  
+    def _feature_orth_loss(self, a, b):
+        if a is None or b is None or a.numel() == 0 or b.numel() == 0:
+            return a.sum() * 0.0 if a is not None else torch.tensor(0.0)
+        a = F.normalize(a.reshape(-1, a.shape[-1]), dim=-1)
+        b = F.normalize(b.reshape(-1, b.shape[-1]), dim=-1)
+        return torch.abs((a * b).sum(-1)).mean() # 使用L1替换L2正则, 避免L2导致梯度消失
 
-    def loss_boxes_pseudo_cons(self, outputs, targets, indices, num_boxes,
-                               dummy_pos_indices=None, dummy_pos_boxes=None, **kwargs):
-        zero = outputs['pred_boxes'].sum() * 0.0
-        if dummy_pos_indices is None or dummy_pos_boxes is None:
-            return {'loss_bbox_pseudo_cons': zero, 'loss_giou_pseudo_cons': zero}
-
-        sel_b, sel_q, tgt_boxes = [], [], []
-        device = outputs['pred_boxes'].device
-        for b_idx, q_list in enumerate(dummy_pos_indices):
-            if len(q_list) == 0:
-                continue
-            if b_idx >= len(dummy_pos_boxes):
-                continue
-            target_box_tensor = dummy_pos_boxes[b_idx]
-            if target_box_tensor is None or target_box_tensor.numel() == 0:
-                continue
-            q = torch.as_tensor(q_list, dtype=torch.long, device=device)
-            target_box_tensor = target_box_tensor.to(device=device, dtype=outputs['pred_boxes'].dtype)
-            n = min(q.shape[0], target_box_tensor.shape[0])
-            if n <= 0:
-                continue
-            sel_b.append(torch.full((n,), b_idx, dtype=torch.long, device=device))
-            sel_q.append(q[:n])
-            tgt_boxes.append(target_box_tensor[:n])
-
-        if len(sel_b) == 0:
-            return {'loss_bbox_pseudo_cons': zero, 'loss_giou_pseudo_cons': zero}
-
-        b = torch.cat(sel_b)
-        q = torch.cat(sel_q)
-        target_boxes = torch.cat(tgt_boxes, dim=0)
-        src_boxes = outputs['pred_boxes'][b, q]
-
-        num_pseudo = max(float(target_boxes.shape[0]), 1.0)
-        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none').sum() / num_pseudo
-        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
-            box_ops.box_cxcywh_to_xyxy(src_boxes),
-            box_ops.box_cxcywh_to_xyxy(target_boxes)))
-        loss_giou = loss_giou.sum() / num_pseudo
-        return {'loss_bbox_pseudo_cons': loss_bbox, 'loss_giou_pseudo_cons': loss_giou}
 
     def _corr_loss(self, x, y, mask=None):
+        """计算皮尔逊相关系数平方，支持掩码过滤纯背景"""
         if x.numel() == 0 or y.numel() == 0:
             return x.sum() * 0.0
+            
         if mask is not None:
-            if mask.sum() < 2:
+            if mask.sum() < 2: # 样本太少无法算方差
                 return x.sum() * 0.0
             x = x[mask]
             y = y[mask]
         else:
             x = x.reshape(-1)
             y = y.reshape(-1)
+            
         x = x - x.mean()
         y = y - y.mean()
         denom = (x.std(unbiased=False) * y.std(unbiased=False) + 1e-6)
@@ -966,13 +902,13 @@ class SetCriterion(nn.Module):
         return corr.pow(2)
 
     def loss_decorr(self, outputs, targets, indices, num_boxes, **kwargs):
-        if (not self.enable_decorr) or ('pred_known' not in outputs):
+        if (not self.enable_decorr) or ('pred_unk' not in outputs):
             zero = outputs['pred_logits'].sum() * 0.0
             return {'loss_decorr': zero}
         fused = self._compute_fused_probabilities(outputs)
-        cls_max = fused['max_known_cls_prob']
+        cls_max = fused['known_scores'][:, :, :-1].max(dim=-1).values if fused['known_scores'].shape[-1] > 1 else fused['known_scores'].squeeze(-1)
         obj_prob = fused['obj_prob']
-        unk_prob = fused['unknown_prob']
+        unk_prob = fused['unknown_score']
         fg_mask = obj_prob > 0.05
         loss_cls_unk = self._corr_loss(cls_max, unk_prob, mask=fg_mask)
         loss_cls_obj = self._corr_loss(cls_max, obj_prob, mask=fg_mask)
@@ -1000,9 +936,8 @@ class SetCriterion(nn.Module):
             'obj_pseudo': self.loss_obj_pseudo,
             'obj_neg': self.loss_obj_neg,
             'unk_pseudo': self.loss_unk_pseudo,
-            'boxes_pseudo_cons': self.loss_boxes_pseudo_cons,
             'decorr': self.loss_decorr,
-            'masks': self.loss_masks
+            'masks': self.loss_masks,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -1017,14 +952,12 @@ class SetCriterion(nn.Module):
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
 
-        dummy_pos_indices, dummy_neg_indices, dummy_pos_weights, dummy_pos_boxes, ignore_query_indices, mine_stats = self._mine_uod_pseudo(outputs, targets, indices, epoch)
+        dummy_pos_indices, dummy_neg_indices, dummy_pos_weights, mine_stats = self._mine_uod_pseudo(outputs, targets, indices, epoch)
         losses = {}
         for loss in self.losses:
             kwargs = {}
-            if loss == 'labels':
-                kwargs['ignore_query_indices'] = ignore_query_indices
-                if self.enable_cls_soft_attn:
-                    kwargs.update({'dummy_pos_indices': dummy_pos_indices, 'dummy_pos_weights': dummy_pos_weights})
+            if loss == 'labels' and self.enable_cls_soft_attn:
+                kwargs.update({'dummy_pos_indices': dummy_pos_indices, 'dummy_pos_weights': dummy_pos_weights})
             if loss in ['obj_pseudo', 'unk_pseudo']:
                 kwargs.update({'dummy_pos_indices': dummy_pos_indices, 'dummy_pos_weights': dummy_pos_weights})
             if loss == 'obj_neg':
@@ -1039,13 +972,10 @@ class SetCriterion(nn.Module):
                     kwargs = {}
                     if loss == 'labels':
                         kwargs['log'] = False
-                        kwargs['ignore_query_indices'] = ignore_query_indices
                         if self.enable_cls_soft_attn and stage != 'low':
                             kwargs.update({'dummy_pos_indices': dummy_pos_indices, 'dummy_pos_weights': dummy_pos_weights})
                     if loss in ['obj_pseudo', 'unk_pseudo']:
                         kwargs.update({'dummy_pos_indices': dummy_pos_indices, 'dummy_pos_weights': dummy_pos_weights})
-                    if loss == 'boxes_pseudo_cons':
-                        kwargs.update({'dummy_pos_indices': dummy_pos_indices, 'dummy_pos_boxes': dummy_pos_boxes})
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices_aux, num_boxes, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
@@ -1080,11 +1010,11 @@ class SetCriterion(nn.Module):
                 mine_stats['num_cls_soft'] = 0.0
 
         device = outputs['pred_logits'].device
+        coeff_known, coeff_unknown = self._get_calibration_coeffs(outputs)
         gate_mean = outputs.get('gate_mean', None)
         losses.update({
             'stat_num_dummy_pos': torch.tensor(float(mine_stats.get('num_dummy_pos', 0.0)), device=device),
             'stat_num_dummy_neg': torch.tensor(float(mine_stats.get('num_dummy_neg', 0.0)), device=device),
-            'stat_num_ignore_queries': torch.tensor(float(mine_stats.get('num_ignore_queries', 0.0)), device=device),
             'stat_num_valid_unmatched': torch.tensor(float(mine_stats.get('num_valid_unmatched', 0.0)), device=device),
             'stat_num_pos_candidates': torch.tensor(float(mine_stats.get('num_pos_candidates', 0.0)), device=device),
             'stat_num_neg_candidates': torch.tensor(float(mine_stats.get('num_neg_candidates', 0.0)), device=device),
@@ -1092,272 +1022,63 @@ class SetCriterion(nn.Module):
             'stat_pos_thresh_mean': torch.tensor(float(mine_stats.get('pos_thresh_sum', 0.0)) / max(float(mine_stats.get('num_thresh', 0.0)), 1.0), device=device),
             'stat_cls_attn_mean': torch.tensor(float(mine_stats.get('cls_attn_mean', 1.0)), device=device),
             'stat_num_cls_soft': torch.tensor(float(mine_stats.get('num_cls_soft', 0.0)), device=device),
+            'known_unk_suppress_coeff': coeff_known,
+            'unknown_known_suppress_coeff': coeff_unknown,
             'gate_mean': gate_mean if gate_mean is not None else torch.tensor(0.0, device=device),
         })
         return losses
 
 
 class PostProcess(nn.Module):
-    def __init__(self, invalid_cls_logits, temperature=1, pred_per_im=100):
+    def __init__(self, invalid_cls_logits, temperature=1, pred_per_im=100, unknown_routing_ratio=0.95):
         super().__init__()
         self.temperature = temperature
         self.invalid_cls_logits = invalid_cls_logits
         self.pred_per_im = pred_per_im
+        self.unknown_routing_ratio = float(unknown_routing_ratio)
 
-    def _print_query_table_for_topk_one_image(
-        self,
-        name,
-        sort_score_2d,
-        obj_prob_2d,
-        knownness_prob_2d,
-        unknown_prob_2d,
-        max_known_cls_prob_2d,
-        class_prob_3d,
-        boxes_3d,
-        k=10,
-        image_index=0,
-    ):
-        b = image_index
-        Q = sort_score_2d.shape[1]
-        vals, idx = torch.topk(sort_score_2d[b], k=min(k, Q), dim=0)
-        vals = vals.detach().cpu()
-        idx = idx.detach().cpu()
-
-        print(f"\n[DEBUG][img={b}] {name} top-{len(idx)}")
-        print(" rank | query | sort_score | obj | known | unk | cls_max | cls_argmax | box[cx cy w h]")
-        print("-" * 110)
-
-        for rank, (q, sv) in enumerate(zip(idx.tolist(), vals.tolist()), start=1):
-            cls_argmax = int(torch.argmax(class_prob_3d[b, q]).detach().cpu().item())
-            box = boxes_3d[b, q].detach().cpu().tolist()
-            obj_v = float(obj_prob_2d[b, q].detach().cpu().item())
-            known_v = float(knownness_prob_2d[b, q].detach().cpu().item())
-            unk_v = float(unknown_prob_2d[b, q].detach().cpu().item())
-            clsmax_v = float(max_known_cls_prob_2d[b, q].detach().cpu().item())
-
-            print(
-                f"{rank:>5d} | {q:>5d} | {sv:>10.6f} | "
-                f"{obj_v:>6.4f} | {known_v:>6.4f} | {unk_v:>6.4f} | "
-                f"{clsmax_v:>7.4f} | {cls_argmax:>10d} | "
-                f"[{box[0]:.3f}, {box[1]:.3f}, {box[2]:.3f}, {box[3]:.3f}]"
-            )
-    
     @torch.no_grad()
     def forward(self, outputs, target_sizes):
         out_logits, pred_obj, out_bbox = outputs['pred_logits'], outputs['pred_obj'], outputs['pred_boxes']
-        pred_known = outputs.get('pred_known', None)
+        pred_unk = outputs.get('pred_unk', None)
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
-
+        known_coeff = outputs.get('known_unk_suppress_coeff', torch.tensor(0.5, device=out_logits.device, dtype=out_logits.dtype))
+        unknown_coeff = outputs.get('unknown_known_suppress_coeff', torch.tensor(0.5, device=out_logits.device, dtype=out_logits.dtype))
+        # ===== manual calibration for eval-only ablation =====
+        # force_known_unk = 1      # a
+        # force_unknown_known = 0  # b
+        # known_coeff = torch.tensor(force_known_unk, device=out_logits.device, dtype=out_logits.dtype)
+        # unknown_coeff = torch.tensor(force_unknown_known, device=out_logits.device, dtype=out_logits.dtype)
         fused = _compute_uod_fused_probabilities(
             out_logits,
             pred_obj,
-            pred_known,
+            pred_unk if pred_unk is not None else torch.zeros_like(pred_obj),
             self.invalid_cls_logits,
             self.temperature,
+            known_coeff.to(device=out_logits.device, dtype=out_logits.dtype),
+            unknown_coeff.to(device=out_logits.device, dtype=out_logits.dtype),
         )
-        # normalized boxes before scaling
-        # if is_main_process():
-        #     debug_boxes = out_bbox
 
-        #     self._print_query_table_for_topk_one_image(
-        #         name="obj_prob",
-        #         sort_score_2d=fused["obj_prob"],
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=debug_boxes,
-        #         k=10,
-        #     )
+        known_scores = fused['known_scores'][:, :, :-1].clone() if fused['known_scores'].shape[-1] > 1 else fused['known_scores'].clone()
+        if len(self.invalid_cls_logits) > 0 and known_scores.shape[-1] > 0:
+            valid_invalid = [idx for idx in self.invalid_cls_logits if idx < known_scores.shape[-1]]
+            if len(valid_invalid) > 0:
+                known_scores[:, :, valid_invalid] = -1.0
+        best_known_scores, best_known_labels = known_scores.max(dim=-1)
+        best_known_scores = best_known_scores.clamp(min=0.0)
+        unknown_scores = fused['unknown_score']
 
-        #     self._print_query_table_for_topk_one_image(
-        #         name="knownness_prob",
-        #         sort_score_2d=fused["knownness_prob"],
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=debug_boxes,
-        #         k=10,
-        #     )
+        choose_unknown = unknown_scores >= (self.unknown_routing_ratio * best_known_scores)
+        query_scores = torch.where(choose_unknown, unknown_scores, best_known_scores)
+        query_labels = best_known_labels.clone()
+        query_labels[choose_unknown] = out_logits.shape[-1] - 1
 
-        #     self._print_query_table_for_topk_one_image(
-        #         name="unknown_prob",
-        #         sort_score_2d=fused["unknown_prob"],
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=debug_boxes,
-        #         k=10,
-        #     )
-        
-        #     self._print_query_table_for_topk_one_image(
-        #         name="max_known_cls_prob",
-        #         sort_score_2d=fused["max_known_cls_prob"],
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=debug_boxes,
-        #         k=10,
-        #     )
-
-        #     self._print_query_table_for_topk_one_image(
-        #         name="unknown_score",
-        #         sort_score_2d=fused["unknown_score"],
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=debug_boxes,
-        #         k=10,
-        #     )
-        #     self._print_query_table_for_topk_one_image(
-        #         name="top_unknown_candidates",
-        #         sort_score_2d=fused["unknown_score"],
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=out_bbox,
-        #         k=10,
-        #     )
-        #     best_known_score = fused["known_scores"].max(dim=-1).values
-
-        #     self._print_query_table_for_topk_one_image(
-        #         name="top_known_candidates",
-        #         sort_score_2d=best_known_score,
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=out_bbox,
-        #         k=10,
-        #     )
-            
-        #     conflict_score = fused["obj_prob"] * fused["unknown_prob"]
-
-        #     self._print_query_table_for_topk_one_image(
-        #         name="high_obj_high_unknown",
-        #         sort_score_2d=conflict_score,
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=out_bbox,
-        #         k=10,
-        #     )
-        prob = fused['fused_prob']
-
-        k = min(self.pred_per_im, prob.shape[1] * max(prob.shape[2], 1))
-        topk_values, topk_indexes = torch.topk(prob.view(prob.shape[0], -1), k, dim=1)
-        scores = topk_values
-
-        topk_boxes = topk_indexes // prob.shape[2]
-        labels = topk_indexes % prob.shape[2]
+        k = min(self.pred_per_im, query_scores.shape[1])
+        scores, topk_queries = torch.topk(query_scores, k, dim=1)
+        labels = torch.gather(query_labels, 1, topk_queries)
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
-        boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
-        
-        #         # ---------------------------------------------------------
-        # # C: known / unknown 分开 top-k
-        # # D: 给 unknown 独立阈值
-        # # ---------------------------------------------------------
-        #         # ---------------------------------------------------------
-        # # C: known / unknown 分开 top-k
-        # # D: 给 unknown 独立阈值
-        # # ---------------------------------------------------------
-        # unk_label = out_logits.shape[2] - 1
-
-        # known_scores = fused['known_scores']
-        # if known_scores.shape[-1] > 1:
-        #     known_scores = known_scores[:, :, :-1]   # 去掉最后 unknown 槽位
-        # unknown_scores = fused['unknown_score']
-        # obj_prob = fused['obj_prob']
-
-        # # -----------------------------
-        # # Geometry filter for UNKNOWN only
-        # # -----------------------------
-        # boxes_cxcywh = out_bbox  # [B, Q, 4], normalized
-        # cx = boxes_cxcywh[..., 0]
-        # cy = boxes_cxcywh[..., 1]
-        # w  = boxes_cxcywh[..., 2]
-        # h  = boxes_cxcywh[..., 3]
-
-        # area = w * h
-        # min_side = torch.minimum(w, h)
-        # aspect = torch.maximum(
-        #     w / torch.clamp(h, min=1e-6),
-        #     h / torch.clamp(w, min=1e-6)
-        # )
-
-        # # 这组比你现在略收紧一点，更适合 unknown 输出
-        # min_area = 0.002
-        # max_area = 0.45
-        # min_side_thr = 0.05
-        # max_aspect = 5.0
-
-        # valid_geom = (
-        #     (area >= min_area) &
-        #     (area <= max_area) &
-        #     (min_side >= min_side_thr) &
-        #     (aspect <= max_aspect)
-        # )
-
-        # unknown_scores = torch.where(
-        #     valid_geom,
-        #     unknown_scores,
-        #     unknown_scores.new_full(unknown_scores.shape, -1e8)
-        # )
-
-        # # ---- D: unknown 独立阈值 ----
-        # unk_thresh = 0.20
-        # obj_thresh = 0.55
-        # unknown_scores = torch.where(
-        #     (unknown_scores > unk_thresh) & (obj_prob > obj_thresh),
-        #     unknown_scores,
-        #     unknown_scores.new_full(unknown_scores.shape, -1e8)
-        # )
-
-        # # ---- C: 分开预算 ----
-        # topk_known = 70
-        # topk_unknown = 30
-
-        # known_flat = known_scores.flatten(1)  # [B, Q * C_known]
-        # k_known = min(topk_known, known_flat.shape[1])
-        # k_unknown = min(topk_unknown, unknown_scores.shape[1])
-
-        # known_vals, known_idx = torch.topk(known_flat, k_known, dim=1)
-        # unk_vals, unk_idx = torch.topk(unknown_scores, k_unknown, dim=1)
-
-        # scores = torch.cat([known_vals, unk_vals], dim=1)
-        # labels = torch.cat([
-        #     known_idx % known_scores.shape[-1],
-        #     torch.full_like(unk_idx, unk_label)
-        # ], dim=1)
-        # topk_boxes = torch.cat([
-        #     known_idx // known_scores.shape[-1],
-        #     unk_idx
-        # ], dim=1)
-
-        # # 最终统一按分数再排一次
-        # scores, order = scores.sort(dim=1, descending=True)
-        # labels = labels.gather(1, order)
-        # topk_boxes = topk_boxes.gather(1, order)
-
-
-        # boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
-        # boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
-
+        boxes = torch.gather(boxes, 1, topk_queries.unsqueeze(-1).repeat(1, 1, 4))
         img_h, img_w = target_sizes.unbind(1)
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
         boxes = boxes * scale_fct[:, None, :]
@@ -1375,12 +1096,16 @@ class ExemplarSelection(nn.Module):
         print('running with exemplar_replay_selection')
 
     def calc_energy_per_image(self, outputs, targets, indices):
+        known_coeff = outputs.get('known_unk_suppress_coeff', torch.tensor(0.5, device=outputs['pred_logits'].device, dtype=outputs['pred_logits'].dtype))
+        unknown_coeff = outputs.get('unknown_known_suppress_coeff', torch.tensor(0.5, device=outputs['pred_logits'].device, dtype=outputs['pred_logits'].dtype))
         fused = _compute_uod_fused_probabilities(
             outputs['pred_logits'],
             outputs['pred_obj'],
-            outputs.get('pred_known', None),
+            outputs.get('pred_unk', torch.zeros_like(outputs['pred_obj'])),
             self.invalid_cls_logits,
             self.temperature,
+            known_coeff.to(device=outputs['pred_logits'].device, dtype=outputs['pred_logits'].dtype),
+            unknown_coeff.to(device=outputs['pred_logits'].device, dtype=outputs['pred_logits'].dtype),
         )
         image_sorted_scores = {}
         for i in range(len(targets)):
@@ -1433,13 +1158,8 @@ def build(args):
     if getattr(args, 'uod_enable_pseudo', False):
         weight_dict['loss_obj_pseudo'] = getattr(args, 'uod_pseudo_obj_loss_coef', 0.3)
         weight_dict['loss_obj_neg'] = getattr(args, 'uod_obj_neg_loss_coef', 1.0)
-        if getattr(args, 'uod_enable_unknown', False):
-            weight_dict['loss_unk_pseudo'] = getattr(args, 'uod_pseudo_unk_loss_coef', 0.4)
-        weight_dict['loss_bbox_pseudo_cons'] = getattr(args, 'uod_pseudo_bbox_loss_coef', args.bbox_loss_coef * 0.5)
-        weight_dict['loss_giou_pseudo_cons'] = getattr(args, 'uod_pseudo_giou_loss_coef', args.giou_loss_coef * 0.25)
-        losses.extend(['obj_pseudo', 'obj_neg'])
-        if getattr(args, 'uod_enable_unknown', False):
-            losses.append('unk_pseudo')
+        weight_dict['loss_unk_pseudo'] = getattr(args, 'uod_pseudo_unk_loss_coef', 0.4)
+        losses.extend(['obj_pseudo', 'obj_neg', 'unk_pseudo'])
     if getattr(args, 'uod_enable_decorr', False):
         weight_dict['loss_decorr'] = getattr(args, 'uod_decorr_loss_coef', 0.05)
         losses.append('decorr')
@@ -1460,8 +1180,6 @@ def build(args):
             aux_weight_dict[f'loss_bbox_{i}'] = weight_dict['loss_bbox']
             aux_weight_dict[f'loss_giou_{i}'] = weight_dict['loss_giou']
             aux_weight_dict[f'loss_obj_ll_{i}'] = weight_dict['loss_obj_ll']
-            if 'loss_unk_known' in weight_dict:
-                aux_weight_dict[f'loss_unk_known_{i}'] = weight_dict['loss_unk_known']
             if 'loss_obj_pseudo' in weight_dict:
                 if stage == 'low':
                     aux_weight_dict[f'loss_obj_pseudo_{i}'] = weight_dict['loss_obj_pseudo'] * float(getattr(args, 'uod_haux_low_obj_coef', 0.35))
@@ -1469,13 +1187,12 @@ def build(args):
                     aux_weight_dict[f'loss_obj_pseudo_{i}'] = weight_dict['loss_obj_pseudo'] * float(getattr(args, 'uod_haux_mid_unknown_coef', 0.45))
                 else:
                     aux_weight_dict[f'loss_obj_pseudo_{i}'] = weight_dict['loss_obj_pseudo'] * float(getattr(args, 'uod_haux_high_unknown_coef', 0.7))
+            if stage in ['mid', 'high'] and 'loss_unk_known' in weight_dict:
+                coef = float(getattr(args, 'uod_haux_mid_unknown_coef', 0.45)) if stage == 'mid' else float(getattr(args, 'uod_haux_high_unknown_coef', 0.7))
+                aux_weight_dict[f'loss_unk_known_{i}'] = weight_dict['loss_unk_known'] * coef
             if stage in ['mid', 'high'] and 'loss_unk_pseudo' in weight_dict:
                 coef = float(getattr(args, 'uod_haux_mid_unknown_coef', 0.45)) if stage == 'mid' else float(getattr(args, 'uod_haux_high_unknown_coef', 0.7))
                 aux_weight_dict[f'loss_unk_pseudo_{i}'] = weight_dict['loss_unk_pseudo'] * coef
-            if stage in ['mid', 'high'] and 'loss_bbox_pseudo_cons' in weight_dict:
-                coef = float(getattr(args, 'uod_haux_mid_unknown_coef', 0.45)) if stage == 'mid' else float(getattr(args, 'uod_haux_high_unknown_coef', 0.7))
-                aux_weight_dict[f'loss_bbox_pseudo_cons_{i}'] = weight_dict['loss_bbox_pseudo_cons'] * coef
-                aux_weight_dict[f'loss_giou_pseudo_cons_{i}'] = weight_dict['loss_giou_pseudo_cons'] * coef
             if stage == 'high' and 'loss_decorr' in weight_dict:
                 aux_weight_dict[f'loss_decorr_{i}'] = weight_dict['loss_decorr'] * float(getattr(args, 'uod_haux_high_decorr_coef', 0.5))
         aux_weight_dict.update({k + '_enc': v for k, v in weight_dict.items() if k in ['loss_ce', 'loss_bbox', 'loss_giou']})
@@ -1488,6 +1205,7 @@ def build(args):
         invalid_cls_logits,
         temperature=args.obj_temp / args.hidden_dim,
         pred_per_im=args.num_queries,
+        unknown_routing_ratio=getattr(args, 'uod_postprocess_unknown_ratio', 0.95),
     )}
     exemplar_selection = ExemplarSelection(args, num_classes, matcher, invalid_cls_logits,
                                            temperature=args.obj_temp / args.hidden_dim)

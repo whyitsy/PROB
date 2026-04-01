@@ -99,7 +99,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
         loss_dict_reduced = utils.reduce_dict(loss_dict)
-        loss_dict_reduced_unscaled = {f'{k}_unscaled': v for k, v in loss_dict_reduced.items()}
+        loss_dict_reduced_unscaled = {f'{k}_unscaled': v for k, v in loss_dict_reduced.items() if k in weight_dict}
         loss_dict_reduced_scaled = {k: v * weight_dict[k]
                                     for k, v in loss_dict_reduced.items() if k in weight_dict}
         losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
@@ -214,7 +214,19 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         if vis_state is not None:
             collect_eval_stats(vis_state, outputs, targets, criterion, args)
             vis_dir = os.path.join(output_dir, 'eval', 'visualizations', f'epoch_{int(epoch):04d}', 'qualitative')
-            save_eval_qualitative(vis_state, samples, targets, vis_results, outputs, args=args, out_dir=vis_dir, writer=writer, step=epoch)
+            save_eval_qualitative(
+                vis_state,
+                samples,
+                targets,
+                vis_results,
+                outputs,
+                criterion=criterion,
+                args=args,
+                out_dir=vis_dir,
+                writer=writer,
+                step=epoch,
+                epoch=epoch,
+            )
 
     metric_logger.synchronize_between_processes()
     if coco_evaluator is not None:
