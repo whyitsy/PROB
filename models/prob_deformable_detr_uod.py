@@ -16,7 +16,7 @@ from torch import nn
 from util import box_ops
 from util.misc import (NestedTensor, accuracy, get_world_size, interpolate,
                        inverse_sigmoid, is_dist_avail_and_initialized,
-                       nested_tensor_from_tensor_list,  is_main_process)
+                       nested_tensor_from_tensor_list)
 
 from models.ops.modules import MSDeformAttn
 from .backbone import build_backbone
@@ -42,6 +42,21 @@ class MLP(nn.Module):
         for i, layer in enumerate(self.layers):
             x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
+
+
+class _ZeroBBoxDelta(nn.Module):
+    """Zero bbox delta head used to keep two-stage proposal generation enabled
+    while preserving with_box_refine=False behavior in the decoder.
+
+    When two_stage=True and with_box_refine=False, the transformer still needs
+    a bbox head at index decoder.num_layers to generate encoder proposals.
+    However, assigning the regular bbox heads to decoder.bbox_embed would also
+    activate iterative refinement inside the decoder. This module returns zeros
+    for per-layer decoder deltas so reference points stay unchanged.
+    """
+
+    def forward(self, x):
+        return x.new_zeros(*x.shape[:-1], 4)
 
 
 def _energy_to_prob(energy, temperature):
@@ -165,57 +180,73 @@ class DeformableDETRUOD(nn.Module):
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
             nn.init.constant_(proj[0].bias, 0)
 
-        num_pred = (transformer.decoder.num_layers + 1) if two_stage else transformer.decoder.num_layers
+        num_decoder_pred = transformer.decoder.num_layers
+        num_total_pred = (transformer.decoder.num_layers + 1) if two_stage else transformer.decoder.num_layers
+
         if with_box_refine:
-            self.class_embed = _get_clones(self.class_embed, num_pred)
-            self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
-            self.prob_obj_head = _get_clones(self.prob_obj_head, num_pred)
-            self.known_energy_head = _get_clones(self.known_energy_head, num_pred)
+            # class / bbox need one extra slot for two-stage encoder proposals
+            self.class_embed = _get_clones(self.class_embed, num_total_pred)
+            self.bbox_embed = _get_clones(self.bbox_embed, num_total_pred)
+
+            # decoder-only heads: only decoder layers need them
+            self.prob_obj_head = _get_clones(self.prob_obj_head, num_decoder_pred)
+            self.known_energy_head = _get_clones(self.known_energy_head, num_decoder_pred)
+
             if self.enable_odqe:
-                self.context_attn = _get_clones(self.context_attn, num_pred)
-                self.gate_mlp = _get_clones(self.gate_mlp, num_pred)
-                self.ffn_obj = _get_clones(self.ffn_obj, num_pred)
-                self.ffn_known = _get_clones(self.ffn_known, num_pred)
-                self.ffn_cls = _get_clones(self.ffn_cls, num_pred)
+                self.context_attn = _get_clones(self.context_attn, num_decoder_pred)
+                self.gate_mlp = _get_clones(self.gate_mlp, num_decoder_pred)
+                self.ffn_obj = _get_clones(self.ffn_obj, num_decoder_pred)
+                self.ffn_known = _get_clones(self.ffn_known, num_decoder_pred)
+                self.ffn_cls = _get_clones(self.ffn_cls, num_decoder_pred)
             else:
-                self.obj_proj = _get_clones(self.obj_proj, num_pred)
-                self.known_proj = _get_clones(self.known_proj, num_pred)
-                self.cls_proj = _get_clones(self.cls_proj, num_pred)
+                self.obj_proj = _get_clones(self.obj_proj, num_decoder_pred)
+                self.known_proj = _get_clones(self.known_proj, num_decoder_pred)
+                self.cls_proj = _get_clones(self.cls_proj, num_decoder_pred)
+
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
             self.transformer.decoder.bbox_embed = self.bbox_embed
+
         else:
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:], -2.0)
-            self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
-            self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
-            self.prob_obj_head = nn.ModuleList([self.prob_obj_head for _ in range(num_pred)])
-            self.known_energy_head = nn.ModuleList([self.known_energy_head for _ in range(num_pred)])
+
+            # class / bbox need encoder-proposal slot if two_stage
+            self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_total_pred)])
+            self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_total_pred)])
+
+            # decoder-only heads
+            self.prob_obj_head = nn.ModuleList([self.prob_obj_head for _ in range(num_decoder_pred)])
+            self.known_energy_head = nn.ModuleList([self.known_energy_head for _ in range(num_decoder_pred)])
+
             if self.enable_odqe:
-                self.context_attn = nn.ModuleList([self.context_attn for _ in range(num_pred)])
-                self.gate_mlp = nn.ModuleList([self.gate_mlp for _ in range(num_pred)])
-                self.ffn_obj = nn.ModuleList([self.ffn_obj for _ in range(num_pred)])
-                self.ffn_known = nn.ModuleList([self.ffn_known for _ in range(num_pred)])
-                self.ffn_cls = nn.ModuleList([self.ffn_cls for _ in range(num_pred)])
+                self.context_attn = nn.ModuleList([self.context_attn for _ in range(num_decoder_pred)])
+                self.gate_mlp = nn.ModuleList([self.gate_mlp for _ in range(num_decoder_pred)])
+                self.ffn_obj = nn.ModuleList([self.ffn_obj for _ in range(num_decoder_pred)])
+                self.ffn_known = nn.ModuleList([self.ffn_known for _ in range(num_decoder_pred)])
+                self.ffn_cls = nn.ModuleList([self.ffn_cls for _ in range(num_decoder_pred)])
             else:
-                self.obj_proj = nn.ModuleList([self.obj_proj for _ in range(num_pred)])
-                self.known_proj = nn.ModuleList([self.known_proj for _ in range(num_pred)])
-                self.cls_proj = nn.ModuleList([self.cls_proj for _ in range(num_pred)])
+                self.obj_proj = nn.ModuleList([self.obj_proj for _ in range(num_decoder_pred)])
+                self.known_proj = nn.ModuleList([self.known_proj for _ in range(num_decoder_pred)])
+                self.cls_proj = nn.ModuleList([self.cls_proj for _ in range(num_decoder_pred)])
+
             self.transformer.decoder.bbox_embed = None
+
         if two_stage:
             self.transformer.decoder.class_embed = self.class_embed
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
 
+        # odqe decay should also be decoder-only
         if self.enable_odqe:
             decay_min = float(getattr(args, 'uod_odqe_decay_min', 0.1))
             decay_power = float(getattr(args, 'uod_odqe_decay_power', 1.0))
-            if num_pred == 1:
+            if num_decoder_pred == 1:
                 decay = torch.ones(1)
             else:
-                positions = torch.linspace(0.0, 1.0, steps=num_pred)
+                positions = torch.linspace(0.0, 1.0, steps=num_decoder_pred)
                 decay = 1.0 - (1.0 - decay_min) * positions.pow(decay_power)
             self.register_buffer('odqe_layer_decay', decay)
         else:
-            self.register_buffer('odqe_layer_decay', torch.ones(num_pred))
+            self.register_buffer('odqe_layer_decay', torch.ones(num_decoder_pred))
 
     def _context_reference_input(self, reference, valid_ratios):
         ref_sig = reference.sigmoid()
@@ -595,36 +626,6 @@ class SetCriterion(nn.Module):
         ar = max(w / max(h, 1e-6), h / max(w, 1e-6))
         return area >= self.uod_min_area and side >= self.uod_min_side and ar <= self.uod_max_aspect_ratio
 
-    def _center_prior(self, box_cxcywh):
-        """
-        Gentle center prior with a flat central rectangle.
-        """
-        cx = float(box_cxcywh[0].item())
-        cy = float(box_cxcywh[1].item())
-
-        # ---- main knobs ----
-        rx = 0.38   # half width of central rectangle
-        ry = 0.30   # half height of central rectangle
-        min_prior = 0.65
-        decay_strength = 0.2
-        # --------------------
-
-        # No penalty inside the central rectangle
-        dx = max(0.0, abs(cx - 0.5) - rx)
-        dy = max(0.0, abs(cy - 0.5) - ry)
-
-        # Normalize by the remaining margin to the border
-        nx = dx / max(0.5 - rx, 1e-6)
-        ny = dy / max(0.5 - ry, 1e-6)
-
-        # Rectangle-style outside distance
-        r = max(nx, ny)
-
-        # Mild quadratic decay outside the rectangle
-        prior = 1.0 - decay_strength * (r ** 2)
-
-        return max(min_prior, min(1.0, prior))
-    
     def _deduplicate_pos_candidates(self, pred_boxes_img, candidates, iou_thr):
         if len(candidates) <= 1 or iou_thr is None or iou_thr <= 0:
             return candidates
@@ -742,9 +743,7 @@ class SetCriterion(nn.Module):
                     known_rel = max(0.0, min(1.0, (self.uod_known_reject_thresh - k) / max(self.uod_known_reject_thresh, 1e-6)))
                     iou_rel = 1.0 - max(0.0, min(1.0, iou_map[q] / max(self.uod_max_iou, 1e-6)))
                     unk_rel = max(0.0, min(1.0, u))
-                    center_rel = self._center_prior(pred_boxes[i, q])
                     conf = (energy_rel * known_rel * iou_rel * max(unk_rel, 1e-6)) ** (1.0 / 4.0)
-                    conf = conf * (0.8 + 0.2 * center_rel)
                     pos_candidates.append((i, q, conf, e, k, u, us))
 
             pos_candidates = self._deduplicate_pos_candidates(pred_boxes[i], pos_candidates, self.uod_candidate_nms_iou)
@@ -1056,7 +1055,8 @@ class SetCriterion(nn.Module):
             for bt in bin_targets:
                 bt['labels'] = torch.zeros_like(bt['labels'])
             indices_enc = self.matcher(enc_outputs, bin_targets)
-            for loss in ['labels', 'boxes', 'cardinality']:
+            # for loss in ['labels', 'boxes', 'cardinality']:
+            for loss in ['labels', 'boxes']:
                 kwargs = {'log': False} if loss == 'labels' else {}
                 l_dict = self.get_loss(loss, enc_outputs, bin_targets, indices_enc, num_boxes, **kwargs)
                 l_dict = {k + f'_enc': v for k, v in l_dict.items()}
@@ -1104,44 +1104,6 @@ class PostProcess(nn.Module):
         self.invalid_cls_logits = invalid_cls_logits
         self.pred_per_im = pred_per_im
 
-    def _print_query_table_for_topk_one_image(
-        self,
-        name,
-        sort_score_2d,
-        obj_prob_2d,
-        knownness_prob_2d,
-        unknown_prob_2d,
-        max_known_cls_prob_2d,
-        class_prob_3d,
-        boxes_3d,
-        k=10,
-        image_index=0,
-    ):
-        b = image_index
-        Q = sort_score_2d.shape[1]
-        vals, idx = torch.topk(sort_score_2d[b], k=min(k, Q), dim=0)
-        vals = vals.detach().cpu()
-        idx = idx.detach().cpu()
-
-        print(f"\n[DEBUG][img={b}] {name} top-{len(idx)}")
-        print(" rank | query | sort_score | obj | known | unk | cls_max | cls_argmax | box[cx cy w h]")
-        print("-" * 110)
-
-        for rank, (q, sv) in enumerate(zip(idx.tolist(), vals.tolist()), start=1):
-            cls_argmax = int(torch.argmax(class_prob_3d[b, q]).detach().cpu().item())
-            box = boxes_3d[b, q].detach().cpu().tolist()
-            obj_v = float(obj_prob_2d[b, q].detach().cpu().item())
-            known_v = float(knownness_prob_2d[b, q].detach().cpu().item())
-            unk_v = float(unknown_prob_2d[b, q].detach().cpu().item())
-            clsmax_v = float(max_known_cls_prob_2d[b, q].detach().cpu().item())
-
-            print(
-                f"{rank:>5d} | {q:>5d} | {sv:>10.6f} | "
-                f"{obj_v:>6.4f} | {known_v:>6.4f} | {unk_v:>6.4f} | "
-                f"{clsmax_v:>7.4f} | {cls_argmax:>10d} | "
-                f"[{box[0]:.3f}, {box[1]:.3f}, {box[2]:.3f}, {box[3]:.3f}]"
-            )
-    
     @torch.no_grad()
     def forward(self, outputs, target_sizes):
         out_logits, pred_obj, out_bbox = outputs['pred_logits'], outputs['pred_obj'], outputs['pred_boxes']
@@ -1156,107 +1118,6 @@ class PostProcess(nn.Module):
             self.invalid_cls_logits,
             self.temperature,
         )
-        # normalized boxes before scaling
-        # if is_main_process():
-        #     debug_boxes = out_bbox
-
-        #     self._print_query_table_for_topk_one_image(
-        #         name="obj_prob",
-        #         sort_score_2d=fused["obj_prob"],
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=debug_boxes,
-        #         k=10,
-        #     )
-
-        #     self._print_query_table_for_topk_one_image(
-        #         name="knownness_prob",
-        #         sort_score_2d=fused["knownness_prob"],
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=debug_boxes,
-        #         k=10,
-        #     )
-
-        #     self._print_query_table_for_topk_one_image(
-        #         name="unknown_prob",
-        #         sort_score_2d=fused["unknown_prob"],
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=debug_boxes,
-        #         k=10,
-        #     )
-        
-        #     self._print_query_table_for_topk_one_image(
-        #         name="max_known_cls_prob",
-        #         sort_score_2d=fused["max_known_cls_prob"],
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=debug_boxes,
-        #         k=10,
-        #     )
-
-        #     self._print_query_table_for_topk_one_image(
-        #         name="unknown_score",
-        #         sort_score_2d=fused["unknown_score"],
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=debug_boxes,
-        #         k=10,
-        #     )
-        #     self._print_query_table_for_topk_one_image(
-        #         name="top_unknown_candidates",
-        #         sort_score_2d=fused["unknown_score"],
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=out_bbox,
-        #         k=10,
-        #     )
-        #     best_known_score = fused["known_scores"].max(dim=-1).values
-
-        #     self._print_query_table_for_topk_one_image(
-        #         name="top_known_candidates",
-        #         sort_score_2d=best_known_score,
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=out_bbox,
-        #         k=10,
-        #     )
-            
-        #     conflict_score = fused["obj_prob"] * fused["unknown_prob"]
-
-        #     self._print_query_table_for_topk_one_image(
-        #         name="high_obj_high_unknown",
-        #         sort_score_2d=conflict_score,
-        #         obj_prob_2d=fused["obj_prob"],
-        #         knownness_prob_2d=fused["knownness_prob"],
-        #         unknown_prob_2d=fused["unknown_prob"],
-        #         max_known_cls_prob_2d=fused["max_known_cls_prob"],
-        #         class_prob_3d=fused["class_prob"],
-        #         boxes_3d=out_bbox,
-        #         k=10,
-        #     )
         prob = fused['fused_prob']
 
         k = min(self.pred_per_im, prob.shape[1] * max(prob.shape[2], 1))
@@ -1267,96 +1128,6 @@ class PostProcess(nn.Module):
         labels = topk_indexes % prob.shape[2]
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
         boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
-        
-        #         # ---------------------------------------------------------
-        # # C: known / unknown 分开 top-k
-        # # D: 给 unknown 独立阈值
-        # # ---------------------------------------------------------
-        #         # ---------------------------------------------------------
-        # # C: known / unknown 分开 top-k
-        # # D: 给 unknown 独立阈值
-        # # ---------------------------------------------------------
-        # unk_label = out_logits.shape[2] - 1
-
-        # known_scores = fused['known_scores']
-        # if known_scores.shape[-1] > 1:
-        #     known_scores = known_scores[:, :, :-1]   # 去掉最后 unknown 槽位
-        # unknown_scores = fused['unknown_score']
-        # obj_prob = fused['obj_prob']
-
-        # # -----------------------------
-        # # Geometry filter for UNKNOWN only
-        # # -----------------------------
-        # boxes_cxcywh = out_bbox  # [B, Q, 4], normalized
-        # cx = boxes_cxcywh[..., 0]
-        # cy = boxes_cxcywh[..., 1]
-        # w  = boxes_cxcywh[..., 2]
-        # h  = boxes_cxcywh[..., 3]
-
-        # area = w * h
-        # min_side = torch.minimum(w, h)
-        # aspect = torch.maximum(
-        #     w / torch.clamp(h, min=1e-6),
-        #     h / torch.clamp(w, min=1e-6)
-        # )
-
-        # # 这组比你现在略收紧一点，更适合 unknown 输出
-        # min_area = 0.002
-        # max_area = 0.45
-        # min_side_thr = 0.05
-        # max_aspect = 5.0
-
-        # valid_geom = (
-        #     (area >= min_area) &
-        #     (area <= max_area) &
-        #     (min_side >= min_side_thr) &
-        #     (aspect <= max_aspect)
-        # )
-
-        # unknown_scores = torch.where(
-        #     valid_geom,
-        #     unknown_scores,
-        #     unknown_scores.new_full(unknown_scores.shape, -1e8)
-        # )
-
-        # # ---- D: unknown 独立阈值 ----
-        # unk_thresh = 0.20
-        # obj_thresh = 0.55
-        # unknown_scores = torch.where(
-        #     (unknown_scores > unk_thresh) & (obj_prob > obj_thresh),
-        #     unknown_scores,
-        #     unknown_scores.new_full(unknown_scores.shape, -1e8)
-        # )
-
-        # # ---- C: 分开预算 ----
-        # topk_known = 70
-        # topk_unknown = 30
-
-        # known_flat = known_scores.flatten(1)  # [B, Q * C_known]
-        # k_known = min(topk_known, known_flat.shape[1])
-        # k_unknown = min(topk_unknown, unknown_scores.shape[1])
-
-        # known_vals, known_idx = torch.topk(known_flat, k_known, dim=1)
-        # unk_vals, unk_idx = torch.topk(unknown_scores, k_unknown, dim=1)
-
-        # scores = torch.cat([known_vals, unk_vals], dim=1)
-        # labels = torch.cat([
-        #     known_idx % known_scores.shape[-1],
-        #     torch.full_like(unk_idx, unk_label)
-        # ], dim=1)
-        # topk_boxes = torch.cat([
-        #     known_idx // known_scores.shape[-1],
-        #     unk_idx
-        # ], dim=1)
-
-        # # 最终统一按分数再排一次
-        # scores, order = scores.sort(dim=1, descending=True)
-        # labels = labels.gather(1, order)
-        # topk_boxes = topk_boxes.gather(1, order)
-
-
-        # boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
-        # boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
 
         img_h, img_w = target_sizes.unbind(1)
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)

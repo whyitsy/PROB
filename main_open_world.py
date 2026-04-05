@@ -370,10 +370,13 @@ def main(args):
 
     model, criterion, postprocessors, exemplar_selection = build_model(args, mode=args.model_type)
     model.to(device)
-    # 打印指定模型指定行数的参数信息，方便调试
-    
+    # 打印指定模型指定行数的参数信息，方便调试    
     # for idx, (name, param) in enumerate(model.named_parameters()):
-    #     if 235 < idx <= 245:  # 只打印第236-255行的参数信息
+    #     if 303 < idx <= 307:  
+    #         logging.info(f"[{idx}]: {name}")
+
+    # for idx, (name, param) in enumerate(model.named_parameters()):
+    #     if 318 < idx <= 335:  
     #         logging.info(f"[{idx}]: {name}")
 
     model_without_ddp = model
