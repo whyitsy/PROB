@@ -69,11 +69,14 @@ def _unknown_logit_from_known_energy(known_energy, temperature):
     return torch.log(unk_prob / (1.0 - unk_prob))
 
 
-def _compute_uod_fused_probabilities(pred_logits, pred_obj, pred_known, invalid_cls_logits, temperature):
+def _compute_uod_fused_probabilities(pred_logits, pred_obj, pred_known, invalid_cls_logits,
+                                     obj_temperature, known_temperature=None, unknown_scale=15.0):
+    if known_temperature is None:
+        known_temperature = obj_temperature
     logits = pred_logits.clone()
     logits[:, :, invalid_cls_logits] = -10e10
 
-    obj_prob = _energy_to_prob(pred_obj, temperature)
+    obj_prob = _energy_to_prob(pred_obj, obj_temperature)
     class_prob = logits.sigmoid().clone()
     if len(invalid_cls_logits) > 0:
         class_prob[:, :, invalid_cls_logits] = 0.0
@@ -83,7 +86,7 @@ def _compute_uod_fused_probabilities(pred_logits, pred_obj, pred_known, invalid_
     if pred_known is None:
         knownness_prob = torch.ones_like(obj_prob)
     else:
-        knownness_prob = _energy_to_prob(pred_known, temperature)
+        knownness_prob = _energy_to_prob(pred_known, known_temperature)
 
     unknown_prob = (1.0 - knownness_prob).clamp(min=0.0, max=1.0)
     known_scores = obj_prob.unsqueeze(-1) * knownness_prob.unsqueeze(-1) * class_prob
@@ -93,7 +96,7 @@ def _compute_uod_fused_probabilities(pred_logits, pred_obj, pred_known, invalid_
         max_known_cls_prob = class_prob.squeeze(-1)
     else:
         max_known_cls_prob = torch.zeros_like(obj_prob)
-    unknown_score = obj_prob * unknown_prob * 15
+    unknown_score = obj_prob * unknown_prob * unknown_scale
 
     fused = known_scores.clone()
     if fused.shape[-1] > 0:
@@ -126,6 +129,7 @@ class DeformableDETRUOD(nn.Module):
         self.two_stage = two_stage
         self.enable_odqe = bool(getattr(args, 'uod_enable_odqe', False))
         self.energy_temperature = float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / float(hidden_dim)
+        self.postprocess_unknown_scale = float(getattr(args, 'uod_postprocess_unknown_scale', 15.0))
 
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
@@ -234,6 +238,9 @@ class DeformableDETRUOD(nn.Module):
             self.transformer.decoder.class_embed = self.class_embed
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
+            if not with_box_refine:
+                proposal_bbox_embed = nn.ModuleList([_ZeroBBoxDelta() for _ in range(num_total_pred - 1)] + [self.bbox_embed[-1]])
+                self.transformer.decoder.bbox_embed = proposal_bbox_embed
 
         # odqe decay should also be decoder-only
         if self.enable_odqe:
@@ -433,6 +440,8 @@ class SetCriterion(nn.Module):
             outputs.get('pred_known', None),
             self.invalid_cls_logits,
             self.obj_temperature,
+            self.known_temperature,
+            float(getattr(self.args, 'uod_postprocess_unknown_scale', 15.0)),
         )
 
     def _aux_stage(self, layer_idx):
@@ -619,6 +628,12 @@ class SetCriterion(nn.Module):
         return inter / area1[:, None]
 
     def _is_valid_geometry(self, box_cxcywh):
+        """
+        1. 面积不能太小
+        2. 最短边不能太短
+        3. 长宽比不能太极端
+        """
+        
         w = box_cxcywh[2].item()
         h = box_cxcywh[3].item()
         area = w * h
@@ -627,6 +642,9 @@ class SetCriterion(nn.Module):
         return area >= self.uod_min_area and side >= self.uod_min_side and ar <= self.uod_max_aspect_ratio
 
     def _deduplicate_pos_candidates(self, pred_boxes_img, candidates, iou_thr):
+        """
+        对伪正候选做 NMS 式去重, 只保留排序更靠前的那个
+        """
         if len(candidates) <= 1 or iou_thr is None or iou_thr <= 0:
             return candidates
         candidates = sorted(candidates, key=lambda x: (-x[2], x[3], x[4]))
@@ -661,6 +679,21 @@ class SetCriterion(nn.Module):
 
     @torch.no_grad()
     def _mine_uod_pseudo(self, outputs, targets, indices, epoch):
+        """
+        1. 从 未匹配到 GT 的 query 里，挖出一部分 伪正样本 dummy_pos_indices
+        2. 再从剩余 query 里挖出一部分 伪负样本 dummy_neg_indices
+        3. 再把一部分“不够确定、但又不能直接当负”的 query 标成 ignore ignore_query_indices
+        4. 同时返回一些统计量 stats
+        
+        return: dummy_pos_indices, dummy_neg_indices, dummy_pos_weights, dummy_pos_boxes, ignore_query_indices, stats
+         - dummy_pos_indices: list of list of int, 第 i 张图被选为伪正的 query 下标列表
+         - dummy_neg_indices: list of list of int, 第 i 张图被选为伪负的 query 下标列表
+         - dummy_pos_weights: list of list of float, 第 i 张图伪正 query 的软权重列表，权重范围 [0, 1]，权重越高表示越有可能是正样本
+         - dummy_pos_boxes: list of tensor, 第 i 张图伪正样本的预测框（cxcywh 格式），shape=[num_dummy_pos, 4]
+         - ignore_query_indices: list of list of int, 第 i 张图分类损失里要忽略的 query
+         - stats: dict, 包含一些统计量，例如挖出的伪正负样本数量、平均阈值等
+        """
+        
         batch_size = len(targets)
         dummy_pos_indices = [[] for _ in range(batch_size)]
         dummy_neg_indices = [[] for _ in range(batch_size)]
@@ -678,27 +711,31 @@ class SetCriterion(nn.Module):
             'pos_thresh_sum': 0.0,
             'num_thresh': 0.0,
         }
-
+        
+        # 启用伪标签功能且训练一定epoch后, 到模型已经学习到了已知类的稳定分布后再开始挖掘伪标签
         if (not self.enable_pseudo) or epoch < self.uod_start_epoch:
             return dummy_pos_indices, dummy_neg_indices, dummy_pos_weights, dummy_pos_boxes, ignore_query_indices, stats
 
-        energy = outputs['pred_obj'].detach() / float(self.hidden_dim)
+        energy = outputs['pred_obj'].detach() / float(self.hidden_dim) # 后面很多的打分基础. 
         pred_boxes = outputs['pred_boxes'].detach()
         fused = self._compute_fused_probabilities(outputs)
-        obj_prob = fused['obj_prob'].detach()
-        unknown_prob = fused['unknown_prob'].detach()
-        unknown_score = fused['unknown_score'].detach()
-        known_max = fused['max_known_cls_prob'].detach()
+        obj_prob = fused['obj_prob'].detach() # 由pred_obj（energy）转换来的概率，范围 [0, 1]
+        unknown_prob = fused['unknown_prob'].detach() # 反映这个 query 像不像 unknown, 由新分支pred_known准换的概率互补.
+        unknown_score = fused['unknown_score'].detach() # 由打分公式计算的一个综合分数, obj_prob*unk_prob*alpha.
+        known_max = fused['max_known_cls_prob'].detach() # 已知类里的最大类别置信度. 
         num_queries = energy.shape[1]
 
-        all_pos_candidates = []
-        per_img_pos_candidates = []
-        per_img_cache = []
+        # 中间缓存
+        all_pos_candidates = [] # batch中每张图片的伪正候选, 用于BDM时排序. 
+        per_img_pos_candidates = [] # 每张图各自的伪正候选
+        per_img_cache = [] # 缓存每张图的 valid query 和 pred_xyxy，后面给负样本和 ignore 用
 
+        # src_idx 时matcher给这一张图分配的GT的query下标
         for i, (src_idx, _) in enumerate(indices):
             matched = set(src_idx.tolist())
             unmatched = [q for q in range(num_queries) if q not in matched]
 
+            # 使用matched query的物体性能量计算伪正动态阈值.
             if len(src_idx) > 0:
                 matched_scores = energy[i, src_idx]
                 mu_obj = matched_scores.mean().item()
@@ -707,18 +744,20 @@ class SetCriterion(nn.Module):
             else:
                 pos_thresh = self.uod_min_pos_thresh
 
+            # 统计整个batch的pos_thresh, 用于后续计算平均阈值. TODO: 这里应该可以使用list保存每一个pos_thresh, 减少为一个统计量的同时, 能查看不同图片的pos_thresh的分布情况.
             stats['pos_thresh_sum'] += pos_thresh
             stats['num_thresh'] += 1.0
 
             pred_xyxy = box_ops.box_cxcywh_to_xyxy(pred_boxes[i])
             gt_xyxy = box_ops.box_cxcywh_to_xyxy(targets[i]['boxes'])
-            valid = unmatched
+            valid = unmatched # 先把所有 unmatched 都视为候选，再逐步过滤
             iou_map = {q: 0.0 for q in unmatched}
 
+            # 1. iou/iof过滤, 避免把“其实贴着已知 GT 的 query”误挖成 unknown, 这是根据query数量远大于gt数量的特性决定的.
             if gt_xyxy.numel() > 0 and len(unmatched) > 0:
                 cand_boxes = pred_xyxy[unmatched]
                 ious = box_ops.box_iou(cand_boxes, gt_xyxy)[0]
-                iofs = self._pairwise_iof(cand_boxes, gt_xyxy)
+                iofs = self._pairwise_iof(cand_boxes, gt_xyxy) # TODO: 这里的iof计算可以提取到box_ops里, 作为一个通用函数.
                 max_iou = ious.max(dim=1)[0]
                 max_iof = iofs.max(dim=1)[0]
                 valid = []
@@ -726,9 +765,10 @@ class SetCriterion(nn.Module):
                     iou_map[q] = max_iou[j].item()
                     if max_iou[j].item() < self.uod_max_iou and max_iof[j].item() < self.uod_max_iof:
                         valid.append(q)
-
+            # 2. 几何过滤
             valid = [q for q in valid if self._is_valid_geometry(pred_boxes[i, q])]
-            stats['num_valid_unmatched'] += float(len(valid))
+            # TODO: 目前属于第一阶段过滤, 这里可能需要对比过滤前后的效果和单独展示被过滤的query的分布情况. 
+            stats['num_valid_unmatched'] += float(len(valid)) # 只经过了两次过滤. 
 
             pos_candidates = []
             for q in valid:
@@ -736,15 +776,19 @@ class SetCriterion(nn.Module):
                 k = known_max[i, q].item()
                 u = unknown_prob[i, q].item()
                 us = unknown_score[i, q].item()
-                if u < self.uod_pos_unk_min:
+                # 3. unknown_prob过低的过滤
+                if u < self.uod_pos_unk_min: 
                     continue
+                # 4. 正阈值+非已知类过滤
                 if e < pos_thresh and k < self.uod_known_reject_thresh:
-                    energy_rel = max(0.0, min(1.0, (pos_thresh - e) / max(pos_thresh, 1e-6)))
-                    known_rel = max(0.0, min(1.0, (self.uod_known_reject_thresh - k) / max(self.uod_known_reject_thresh, 1e-6)))
-                    iou_rel = 1.0 - max(0.0, min(1.0, iou_map[q] / max(self.uod_max_iou, 1e-6)))
-                    unk_rel = max(0.0, min(1.0, u))
+                    # 计算每个query的综合置信度, 用于DBM时排序, 由一下四个方面综合得到. 
+                    energy_rel = max(0.0, min(1.0, (pos_thresh - e) / max(pos_thresh, 1e-6))) # energy 距离阈值越远且越低越好.
+                    known_rel = max(0.0, min(1.0, (self.uod_known_reject_thresh - k) / max(self.uod_known_reject_thresh, 1e-6))) # known 最大概率越低越好.
+                    iou_rel = 1.0 - max(0.0, min(1.0, iou_map[q] / max(self.uod_max_iou, 1e-6))) # 和 GT 重叠越小越好. 
+                    unk_rel = max(0.0, min(1.0, u)) # unknown 概率越高越好
                     conf = (energy_rel * known_rel * iou_rel * max(unk_rel, 1e-6)) ** (1.0 / 4.0)
                     pos_candidates.append((i, q, conf, e, k, u, us))
+                    # TODO: 这里获取到了阶段二的过滤结果, 可能需要对比过滤前后的效果.
 
             pos_candidates = self._deduplicate_pos_candidates(pred_boxes[i], pos_candidates, self.uod_candidate_nms_iou)
             all_pos_candidates.extend(pos_candidates)
@@ -753,8 +797,8 @@ class SetCriterion(nn.Module):
             per_img_cache.append({'valid': valid, 'pred_xyxy': pred_xyxy})
 
         if self.enable_batch_dynamic:
-            all_pos_candidates.sort(key=lambda x: (-x[2], -x[6], -x[5], x[3], x[4]))
-            topk = min(self.uod_batch_topk_max, max(1, int(math.ceil(self.uod_batch_topk_ratio * max(len(all_pos_candidates), 1)))))
+            all_pos_candidates.sort(key=lambda x: (-x[2], -x[6], -x[5], x[3], x[4])) # DBM排序
+            topk = min(self.uod_batch_topk_max, max(1, int(math.ceil(self.uod_batch_topk_ratio * max(len(all_pos_candidates), 1))))) # 先取uod_batch_topk_ratio比例的候选, 再限制在uod_batch_topk_max之内, 避免过多噪声.
             per_img_count = [0 for _ in range(batch_size)]
             selected = []
             for item in all_pos_candidates:
@@ -784,28 +828,37 @@ class SetCriterion(nn.Module):
 
         stats['num_dummy_pos'] = float(sum(len(v) for v in dummy_pos_indices))
 
+        # 构造伪负样本
         if epoch >= self.uod_start_epoch + self.uod_neg_warmup_epochs:
             for i in range(batch_size):
+                # 从 valid 里去掉已经被选成伪正的 query
                 valid = per_img_cache[i]['valid']
                 pred_xyxy = per_img_cache[i]['pred_xyxy']
                 pos_selected = dummy_pos_indices[i]
                 pos_selected_set = set(pos_selected)
                 remaining = [q for q in valid if q not in pos_selected_set]
+                # 去掉太靠近伪正的 query
                 remaining = self._filter_negatives_near_selected_pos(pred_xyxy, pos_selected, remaining)
 
                 neg_candidates = []
                 for q in remaining:
                     k = known_max[i, q].item()
                     obj = obj_prob[i, q].item()
+                    u = unknown_prob[i, q].item()
                     e = energy[i, q].item()
+                    # 1. 非已知类过滤
                     if k > self.uod_neg_known_max:
                         continue
-                    neg_candidates.append((q, obj, e, k))
+                    # 2. 非未知类过滤
+                    if u > self.uod_neg_unk_max:
+                        continue
+                    neg_candidates.append((q, obj, e, k, u))
 
                 stats['num_neg_candidates'] += float(len(neg_candidates))
-                neg_candidates.sort(key=lambda x: (-x[1], x[2], x[3]))
+                neg_candidates.sort(key=lambda x: (-x[1], x[2], x[3], x[4]))
+                # 3. 主要是取低obj_prob的query
                 neg_candidates = neg_candidates[:self.uod_neg_per_img]
-                dummy_neg_indices[i] = [q for q, _, _, _ in neg_candidates]
+                dummy_neg_indices[i] = [q for q, _, _, _, _ in neg_candidates]
                 stats['num_dummy_neg'] += float(len(dummy_neg_indices[i]))
 
         for i in range(batch_size):
@@ -1098,11 +1151,14 @@ class SetCriterion(nn.Module):
 
 
 class PostProcess(nn.Module):
-    def __init__(self, invalid_cls_logits, temperature=1, pred_per_im=100):
+    def __init__(self, invalid_cls_logits, obj_temperature=1, known_temperature=None,
+                 pred_per_im=100, unknown_scale=15.0):
         super().__init__()
-        self.temperature = temperature
+        self.obj_temperature = obj_temperature
+        self.known_temperature = obj_temperature if known_temperature is None else known_temperature
         self.invalid_cls_logits = invalid_cls_logits
         self.pred_per_im = pred_per_im
+        self.unknown_scale = float(unknown_scale)
 
     @torch.no_grad()
     def forward(self, outputs, target_sizes):
@@ -1116,7 +1172,9 @@ class PostProcess(nn.Module):
             pred_obj,
             pred_known,
             self.invalid_cls_logits,
-            self.temperature,
+            self.obj_temperature,
+            self.known_temperature,
+            self.unknown_scale,
         )
         prob = fused['fused_prob']
 
@@ -1152,6 +1210,8 @@ class ExemplarSelection(nn.Module):
             outputs.get('pred_known', None),
             self.invalid_cls_logits,
             self.temperature,
+            float(getattr(self.args, 'uod_known_temp', getattr(self.args, 'obj_temp', 1.0))) / float(getattr(self.args, 'hidden_dim', 256)),
+            float(getattr(self.args, 'uod_postprocess_unknown_scale', 15.0)),
         )
         image_sorted_scores = {}
         for i in range(len(targets)):
@@ -1257,8 +1317,10 @@ def build(args):
     criterion.to(device)
     postprocessors = {'bbox': PostProcess(
         invalid_cls_logits,
-        temperature=args.obj_temp / args.hidden_dim,
+        obj_temperature=args.obj_temp / args.hidden_dim,
+        known_temperature=float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / args.hidden_dim,
         pred_per_im=args.num_queries,
+        unknown_scale=float(getattr(args, 'uod_postprocess_unknown_scale', 15.0)),
     )}
     exemplar_selection = ExemplarSelection(args, num_classes, matcher, invalid_cls_logits,
                                            temperature=args.obj_temp / args.hidden_dim)

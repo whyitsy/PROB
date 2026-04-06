@@ -238,7 +238,7 @@ def get_args_parser():
     parser.add_argument('--uod_cls_soft_attn_min', default=0.1, type=float, help='minimum query weight under classification attenuation')
     parser.add_argument('--uod_pos_unk_min', default=0.05, type=float, help='minimum raw unknownness probability required for pseudo-positive candidates')
     parser.add_argument('--uod_postprocess_unknown_ratio', default=0.95, type=float, help='query-wise routing ratio for choosing unknown over best-known in postprocess')
-
+    parser.add_argument('--uod_postprocess_unknown_scale', default=15.0, type=float, help='multiplicative scale for final unknown score in postprocess and visualization')
     return parser
 
 
@@ -491,6 +491,15 @@ def main(args):
         else:
             if hasattr(model_without_ddp.prob_obj_head, 'freeze_prob_model'):
                 model_without_ddp.prob_obj_head.freeze_prob_model()
+                
+        if hasattr(model_without_ddp, 'known_energy_head'):
+            if isinstance(model_without_ddp.known_energy_head, torch.nn.ModuleList):
+                for known_head in model_without_ddp.known_energy_head:
+                    if hasattr(known_head, 'freeze_prob_model'):
+                        known_head.freeze_prob_model()
+            else:
+                if hasattr(model_without_ddp.known_energy_head, 'freeze_prob_model'):
+                    model_without_ddp.known_energy_head.freeze_prob_model()
 
     logging.info('Start training from epoch %s to %s', args.start_epoch, args.epochs)
     

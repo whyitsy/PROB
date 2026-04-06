@@ -477,6 +477,7 @@ def _compute_vis_fused(outputs, image_idx, args, invalid_cls_logits=None):
     hidden_dim = float(getattr(args, 'hidden_dim', 256))
     obj_temp = float(getattr(args, 'obj_temp', 1.0)) / hidden_dim
     known_temp = float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / hidden_dim
+    unknown_scale = float(getattr(args, 'uod_postprocess_unknown_scale', 15.0))
 
     logits = pred_logits[image_idx].detach().clone().cpu()
     if len(invalid_cls_logits) > 0:
@@ -491,20 +492,20 @@ def _compute_vis_fused(outputs, image_idx, args, invalid_cls_logits=None):
 
     pred_known = outputs.get('pred_known', None)
     if pred_known is not None:
-        known_prob = _energy_to_prob(pred_known[image_idx].detach().cpu(), known_temp)
+        knownness_prob = _energy_to_prob(pred_known[image_idx].detach().cpu(), known_temp)
     else:
         pred_unk = outputs.get('pred_unk', None)
         unk_prob_compat = torch.sigmoid(pred_unk[image_idx].detach().cpu()) if pred_unk is not None else torch.zeros_like(obj_prob)
-        known_prob = (1.0 - unk_prob_compat).clamp(min=1e-6, max=1.0)
+        knownness_prob = (1.0 - unk_prob_compat).clamp(min=1e-6, max=1.0)
 
-    unk_prob = (1.0 - known_prob).clamp(min=0.0, max=1.0)
-    known_scores = obj_prob.unsqueeze(-1) * known_prob.unsqueeze(-1) * class_prob
+    unk_prob = (1.0 - knownness_prob).clamp(min=0.0, max=1.0)
+    known_scores = obj_prob.unsqueeze(-1) * knownness_prob.unsqueeze(-1) * class_prob
     cls_max = class_prob.max(dim=-1).values if class_prob.shape[-1] > 0 else torch.zeros_like(obj_prob)
-    unknown_score = obj_prob * unk_prob
+    unknown_score = obj_prob * unk_prob * unknown_scale
     return {
         'obj_prob': obj_prob,
         'known_prob': class_prob,
-        'knownness_prob': known_prob,
+        'knownness_prob': knownness_prob,
         'cls_max': cls_max,
         'unk_prob': unk_prob,
         'unknown_score': unknown_score,
@@ -767,7 +768,7 @@ def save_eval_qualitative(vis_state, samples, targets, vis_results, outputs, cri
         
 
 def finalize_eval_visualizations(vis_state, output_dir, epoch, writer=None):
-    out_dir = os.path.join(output_dir, 'visualizations', f'epoch_{int(epoch):04d}')
+    out_dir = os.path.join(output_dir, 'eval', 'visualizations', f'epoch_{int(epoch):04d}')
     _ensure_dir(out_dir)
     _save_query_stats_csv(vis_state, out_dir)
     _save_feature_npz(vis_state, out_dir)
