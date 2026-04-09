@@ -57,20 +57,21 @@ run_stage() {
     "${PY_ARGS[@]}"
 }
 
-run_stage "${BASE_EXP_DIR}/t1" \
-  --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 20 \
-  --train_set owod_t1_train \
-  --epochs 41 \
-  --exemplar_replay_selection \
-  --exemplar_replay_max_length 850 \
-  --exemplar_replay_dir "${REPLAY_DIR}" \
-  --exemplar_replay_cur_file learned_owod_t1_ft.txt
+# run_stage "${BASE_EXP_DIR}/t1" \
+#   --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 20 \
+#   --train_set owod_t1_train \
+#   --epochs 41 \
+#   --exemplar_replay_selection \
+#   --exemplar_replay_max_length 850 \
+#   --exemplar_replay_dir "${REPLAY_DIR}" \
+#   --exemplar_replay_cur_file learned_owod_t1_ft.txt
 
 run_stage "${BASE_EXP_DIR}/t2" \
   --PREV_INTRODUCED_CLS 20 --CUR_INTRODUCED_CLS 20 \
   --train_set owod_t2_train \
   --epochs 51 \
   --freeze_prob_model \
+  --uod_start_epoch 46 \
   --exemplar_replay_selection \
   --exemplar_replay_max_length 1743 \
   --exemplar_replay_dir "${REPLAY_DIR}" \
@@ -90,6 +91,7 @@ run_stage "${BASE_EXP_DIR}/t3" \
   --PREV_INTRODUCED_CLS 40 --CUR_INTRODUCED_CLS 20 \
   --train_set owod_t3_train \
   --epochs 121 \
+  --uod_start_epoch 116 \
   --freeze_prob_model \
   --exemplar_replay_selection \
   --exemplar_replay_max_length 2361 \
@@ -110,6 +112,7 @@ run_stage "${BASE_EXP_DIR}/t4" \
   --PREV_INTRODUCED_CLS 60 --CUR_INTRODUCED_CLS 20 \
   --train_set owod_t4_train \
   --epochs 191 \
+  --uod_start_epoch 186 \
   --freeze_prob_model \
   --exemplar_replay_selection \
   --exemplar_replay_max_length 2749 \

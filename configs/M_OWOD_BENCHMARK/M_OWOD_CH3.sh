@@ -38,11 +38,10 @@ CH3_ARGS=(
   --unk_loss_coef 8e-4
   --uod_pseudo_obj_loss_coef 1.5
   --uod_pseudo_unk_loss_coef 0
-  --uod_pos_per_img_cap 2
+  --uod_pos_per_img_cap 0
   --uod_batch_topk_max 16
   --uod_cls_soft_attn_alpha 0.5
   --uod_cls_soft_attn_min 0.25
-  --uod_start_epoch 12
   --uod_haux_low_obj_coef 0
   --uod_haux_mid_unknown_coef 0
   --uod_haux_high_unknown_coef 0
@@ -67,6 +66,7 @@ run_stage "${BASE_EXP_DIR}/t1" \
   --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 20 \
   --train_set owod_t1_train \
   --epochs 41 \
+  --uod_start_epoch 12 \
   --exemplar_replay_selection \
   --exemplar_replay_max_length 850 \
   --exemplar_replay_dir "${REPLAY_DIR}" \
@@ -79,6 +79,7 @@ run_stage "${BASE_EXP_DIR}/t2" \
   --PREV_INTRODUCED_CLS 20 --CUR_INTRODUCED_CLS 20 \
   --train_set owod_t2_train \
   --epochs 51 \
+  --uod_start_epoch 46 \
   --freeze_prob_model \
   --exemplar_replay_selection \
   --exemplar_replay_max_length 1743 \
@@ -102,6 +103,7 @@ run_stage "${BASE_EXP_DIR}/t3" \
   --PREV_INTRODUCED_CLS 40 --CUR_INTRODUCED_CLS 20 \
   --train_set owod_t3_train \
   --epochs 121 \
+  --uod_start_epoch 116 \
   --freeze_prob_model \
   --exemplar_replay_selection \
   --exemplar_replay_max_length 2361 \
@@ -125,6 +127,7 @@ run_stage "${BASE_EXP_DIR}/t4" \
   --PREV_INTRODUCED_CLS 60 --CUR_INTRODUCED_CLS 20 \
   --train_set owod_t4_train \
   --epochs 191 \
+  --uod_start_epoch 186 \
   --freeze_prob_model \
   --exemplar_replay_selection \
   --exemplar_replay_max_length 2749 \

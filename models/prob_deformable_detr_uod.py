@@ -432,6 +432,7 @@ class SetCriterion(nn.Module):
         self.uod_cls_soft_attn_min = float(getattr(args, 'uod_cls_soft_attn_min', 0.25))
         self.uod_neg_max_pseudo_iou = float(getattr(args, 'uod_neg_max_pseudo_iou', 0.3))
         self.uod_neg_known_max = float(getattr(args, 'uod_neg_known_max', 0.7))
+        self.uod_neg_unk_max = float(getattr(args, 'uod_neg_unk_max', 0.1))
 
     def _compute_fused_probabilities(self, outputs):
         return _compute_uod_fused_probabilities(
@@ -763,7 +764,8 @@ class SetCriterion(nn.Module):
                 valid = []
                 for j, q in enumerate(unmatched):
                     iou_map[q] = max_iou[j].item()
-                    if max_iou[j].item() < self.uod_max_iou and max_iof[j].item() < self.uod_max_iof:
+                    # if max_iou[j].item() < self.uod_max_iou and max_iof[j].item() < self.uod_max_iof:
+                    if max_iou[j].item() < self.uod_max_iou:
                         valid.append(q)
             # 2. 几何过滤
             valid = [q for q in valid if self._is_valid_geometry(pred_boxes[i, q])]
@@ -805,7 +807,7 @@ class SetCriterion(nn.Module):
                 b_idx, q, conf, e, k, u, us = item
                 if len(selected) >= topk:
                     break
-                if per_img_count[b_idx] >= self.uod_pos_per_img_cap:
+                if self.uod_pos_per_img_cap > 0 and  per_img_count[b_idx] >= self.uod_pos_per_img_cap:
                     continue
                 selected.append(item)
                 per_img_count[b_idx] += 1
@@ -1201,6 +1203,7 @@ class ExemplarSelection(nn.Module):
         self.num_seen_classes = args.PREV_INTRODUCED_CLS + args.CUR_INTRODUCED_CLS
         self.invalid_cls_logits = invalid_cls_logits
         self.temperature = temperature
+        self.args = args
         print('running with exemplar_replay_selection')
 
     def calc_energy_per_image(self, outputs, targets, indices):

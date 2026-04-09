@@ -222,7 +222,7 @@ def get_args_parser():
     parser.add_argument('--uod_min_pos_thresh', default=0.08, type=float, help='minimum pseudo-positive energy threshold')
     parser.add_argument('--uod_known_reject_thresh', default=0.15, type=float, help='maximum known score for pseudo-unknown candidates')
     parser.add_argument('--uod_neg_margin', default=0.12, type=float, help='margin for reliable-background objectness negatives in normalized energy space')
-    parser.add_argument('--uod_pos_per_img_cap', default=1, type=int, help='max pseudo positives per image')
+    parser.add_argument('--uod_pos_per_img_cap', default=1, type=int, help='max pseudo positives per image, 小于等于0表示不限制')
     parser.add_argument('--uod_neg_per_img', default=2, type=int, help='max reliable-background negatives per image')
     parser.add_argument('--uod_neg_known_max', default=0.12, type=float, help='maximum max-known probability allowed for reliable-background negatives')
     parser.add_argument('--uod_neg_unk_max', default=0.10, type=float, help='maximum unknownness probability allowed for reliable-background negatives')
