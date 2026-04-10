@@ -56,6 +56,14 @@ torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
   ${PY_ARGS}
 
 
+torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
+  main_open_world.py \
+  --output_dir "${BASE_EXP_DIR}/C3_5_ClsSoftAttn" \
+  --uod_enable_unknown --uod_enable_pseudo --uod_enable_batch_dynamic --uod_enable_cls_soft_attn \
+  ${COMMON_ARGS} \
+  ${PY_ARGS}
+  
+
 # 最好的指标：59.54、21.41、7031.0、0.0657
 # torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
 #   main_open_world.py \
@@ -67,11 +75,3 @@ torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
 #   --uod_haux_low_obj_coef 0 --uod_haux_mid_unknown_coef 0 --uod_haux_high_unknown_coef 0 \
 #   ${COMMON_ARGS} \
 #   ${PY_ARGS}
-
-
-torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
-  main_open_world.py \
-  --output_dir "${BASE_EXP_DIR}/C3_5_ClsSoftAttn" \
-  --uod_enable_unknown --uod_enable_pseudo --uod_enable_batch_dynamic --uod_enable_cls_soft_attn \
-  ${COMMON_ARGS} \
-  ${PY_ARGS}

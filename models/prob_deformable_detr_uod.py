@@ -128,7 +128,9 @@ class DeformableDETRUOD(nn.Module):
         self.with_box_refine = with_box_refine
         self.two_stage = two_stage
         self.enable_odqe = bool(getattr(args, 'uod_enable_odqe', False))
+        self.obj_temperature = float(getattr(args, 'obj_temp', 1.0)) / float(hidden_dim)
         self.energy_temperature = float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / float(hidden_dim)
+        self.known_temperature = self.energy_temperature
 
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
@@ -260,7 +262,7 @@ class DeformableDETRUOD(nn.Module):
             return ref_sig[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[:, None]
         return ref_sig[:, :, None] * valid_ratios[:, None]
 
-    def forward(self, samples: NestedTensor):
+    def forward(self, samples: NestedTensor, return_vis_debug: bool = False):
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(samples)
@@ -358,6 +360,17 @@ class DeformableDETRUOD(nn.Module):
         if gate_mean_per_layer is not None:
             out['gate_mean_per_layer'] = gate_mean_per_layer
             out['gate_mean'] = gate_mean_per_layer.mean()
+        if return_vis_debug:
+            cls_prob_layers = outputs_class.detach().sigmoid()
+            if cls_prob_layers.shape[-1] > 0:
+                cls_prob_layers[..., -1] = 0.0
+            out['vis_debug'] = {
+                'layer_obj_prob': _energy_to_prob(outputs_objectness.detach(), self.obj_temperature),
+                'layer_knownness_prob': _energy_to_prob(outputs_known.detach(), self.known_temperature),
+                'layer_unknown_prob': (1.0 - _energy_to_prob(outputs_known.detach(), self.known_temperature)).clamp(min=0.0, max=1.0),
+                'layer_cls_max': cls_prob_layers[..., :-1].max(dim=-1).values if cls_prob_layers.shape[-1] > 1 else cls_prob_layers.squeeze(-1),
+                'gate_mean_per_layer': gate_mean_per_layer.detach() if gate_mean_per_layer is not None else None,
+            }
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(
                 outputs_class, outputs_coord, outputs_objectness, outputs_known,

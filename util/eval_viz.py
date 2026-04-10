@@ -69,9 +69,49 @@ def _hex_to_rgb(hex_color):
 def _label_color(label, unk_label):
     return _hex_to_rgb(PALETTE['box_unk'] if int(label) == int(unk_label) else PALETTE['box_known'])
 
+def _pred_text(label, score, unk_label):
+    if int(label) == int(unk_label):
+        return f'U {score:.2f}' if score is not None else 'U'
+    return f'K[{int(label)}] {score:.2f}' if score is not None else f'K[{int(label)}]'
+
+
+def _gt_text(label, unk_label):
+    if int(label) == int(unk_label):
+        return 'GT-U'
+    return f'GT-K[{int(label)}]'
+
+
+def _draw_legend(draw):
+    legend = [
+        ('Pred Known', _hex_to_rgb(PALETTE['box_known'])),
+        ('Pred Unknown', _hex_to_rgb(PALETTE['box_unk'])),
+        ('GT Known', _hex_to_rgb(PALETTE['gt_known'])),
+        ('GT Unknown', _hex_to_rgb(PALETTE['gt_unk'])),
+    ]
+    x0, y0 = 6, 22
+    for idx, (txt, color) in enumerate(legend):
+        y = y0 + idx * 14
+        draw.rectangle([x0, y, x0 + 10, y + 10], outline=color, width=2)
+        draw.text((x0 + 16, y - 1), txt, fill=(255, 255, 255))
+
+
+def _case_stem(image_id, epoch, num_pred, num_gt, num_unk_pred, num_unk_gt, num_u2k, num_k2u):
+    return (
+        f'{int(image_id):012d}'
+        f'__ep{int(epoch):04d}'
+        f'__pred{int(num_pred)}'
+        f'__gt{int(num_gt)}'
+        f'__unkpred{int(num_unk_pred)}'
+        f'__unkgt{int(num_unk_gt)}'
+        f'__u2k{int(num_u2k)}'
+        f'__k2u{int(num_k2u)}'
+    )
+
+
 
 def _draw_boxes(image_np, pred_boxes=None, pred_labels=None, pred_scores=None,
-                gt_boxes=None, gt_labels=None, unk_label=80, title=None):
+                gt_boxes=None, gt_labels=None, unk_label=80, title=None,
+                summary_text=None, show_legend=False):
     img = Image.fromarray(image_np)
     draw = ImageDraw.Draw(img)
     if gt_boxes is not None and len(gt_boxes) > 0:
@@ -80,7 +120,7 @@ def _draw_boxes(image_np, pred_boxes=None, pred_labels=None, pred_scores=None,
             label = int(gt_labels[i]) if gt_labels is not None else -1
             color = _hex_to_rgb(PALETTE['gt_unk'] if label == int(unk_label) else PALETTE['gt_known'])
             draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
-            draw.text((x1 + 2, max(0, y1 - 12)), f'GT:{label}', fill=color)
+            draw.text((x1 + 2, max(0, y1 - 12)), _gt_text(label, unk_label), fill=color)
     if pred_boxes is not None and len(pred_boxes) > 0:
         for i, box in enumerate(pred_boxes):
             x1, y1, x2, y2 = [float(v) for v in box]
@@ -88,10 +128,14 @@ def _draw_boxes(image_np, pred_boxes=None, pred_labels=None, pred_scores=None,
             score = float(pred_scores[i]) if pred_scores is not None else None
             color = _label_color(label, unk_label)
             draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-            text = f'P:{label}' if score is None else f'P:{label} {score:.2f}'
+            text = _pred_text(label, score, unk_label)
             draw.text((x1 + 2, y1 + 2), text, fill=color)
     if title:
         draw.text((5, 5), title, fill=(255, 255, 255))
+    if summary_text:
+        draw.text((5, 175), summary_text, fill=(255, 255, 255))
+    if show_legend:
+        _draw_legend(draw)
     return np.array(img)
 
 
@@ -321,6 +365,8 @@ def _save_error_case_csv(vis_state, out_dir):
 def init_eval_viz_state(args):
     return {
         'saved_images': [],
+        'saved_final_images': [],
+        'saved_debug_images': [],
         'num_saved': 0,
         'obj_prob': [],
         'unk_prob': [],
@@ -691,6 +737,10 @@ def save_eval_qualitative(vis_state, samples, targets, vis_results, outputs, cri
     max_samples = int(getattr(args, 'viz_num_samples', 12))
     tb_max = int(getattr(args, 'viz_tb_images', 4))
     unk_label = int(getattr(args, 'num_classes', 81) - 1)
+    final_dir = os.path.join(out_dir, 'final')
+    debug_dir = os.path.join(out_dir, 'debug')
+    _ensure_dir(final_dir)
+    _ensure_dir(debug_dir)
     for i in range(len(targets)):
         if vis_state['num_saved'] >= max_samples:
             break
@@ -706,12 +756,24 @@ def save_eval_qualitative(vis_state, samples, targets, vis_results, outputs, cri
         pred_scores = pred['scores'].detach().cpu().numpy()[keep]
         known_mask = pred_labels != unk_label if len(pred_labels) > 0 else np.array([], dtype=bool)
         unknown_mask = pred_labels == unk_label if len(pred_labels) > 0 else np.array([], dtype=bool)
+        num_unk_gt = int((gt_labels == unk_label).sum()) if len(gt_labels) > 0 else 0
+        num_unk_pred = int(unknown_mask.sum()) if len(pred_labels) > 0 else 0
 
-        pred_all = _draw_boxes(img_np, pred_boxes=pred_boxes, pred_labels=pred_labels, pred_scores=pred_scores, unk_label=unk_label, title='All Predictions')
-        pred_known = _draw_boxes(img_np, pred_boxes=pred_boxes[known_mask], pred_labels=pred_labels[known_mask], pred_scores=pred_scores[known_mask], unk_label=unk_label, title='Known Predictions')
-        pred_unknown = _draw_boxes(img_np, pred_boxes=pred_boxes[unknown_mask], pred_labels=pred_labels[unknown_mask], pred_scores=pred_scores[unknown_mask], unk_label=unk_label, title='Unknown Predictions')
-        gt_only = _draw_boxes(img_np, gt_boxes=gt_boxes, gt_labels=gt_labels, unk_label=unk_label, title='Ground Truth')
-        overlay = _draw_boxes(img_np, pred_boxes=pred_boxes, pred_labels=pred_labels, pred_scores=pred_scores, gt_boxes=gt_boxes, gt_labels=gt_labels, unk_label=unk_label, title='Pred + GT')
+        summary_text = (
+            f'ID={image_id} | ep={int(epoch):04d} | pred={len(pred_boxes)} gt={len(gt_boxes)} | '
+            f'unk_pred={num_unk_pred} unk_gt={num_unk_gt}'
+        )
+        pred_all = _draw_boxes(img_np, pred_boxes=pred_boxes, pred_labels=pred_labels, pred_scores=pred_scores,
+                            unk_label=unk_label, title='All Predictions', summary_text=summary_text, show_legend=True)
+        pred_known = _draw_boxes(img_np, pred_boxes=pred_boxes[known_mask], pred_labels=pred_labels[known_mask], pred_scores=pred_scores[known_mask],
+                                unk_label=unk_label, title='Known Predictions', summary_text=summary_text, show_legend=True)
+        pred_unknown = _draw_boxes(img_np, pred_boxes=pred_boxes[unknown_mask], pred_labels=pred_labels[unknown_mask], pred_scores=pred_scores[unknown_mask],
+                                unk_label=unk_label, title='Unknown Predictions', summary_text=summary_text, show_legend=True)
+        gt_only = _draw_boxes(img_np, gt_boxes=gt_boxes, gt_labels=gt_labels, unk_label=unk_label, title='Ground Truth',
+                            summary_text=summary_text, show_legend=True)
+        overlay = _draw_boxes(img_np, pred_boxes=pred_boxes, pred_labels=pred_labels, pred_scores=pred_scores,
+                            gt_boxes=gt_boxes, gt_labels=gt_labels, unk_label=unk_label, title='Pred + GT',
+                            summary_text=summary_text, show_legend=True)
 
         errors = _extract_error_cases(pred_boxes, pred_labels, pred_scores, gt_boxes, gt_labels, unk_label, iou_thr=float(getattr(args, 'viz_error_iou_thresh', 0.5)))
         u2k_pred_idx = np.array(sorted(set(errors['unknown_to_known_pred_idx'])), dtype=np.int64)
@@ -719,23 +781,45 @@ def save_eval_qualitative(vis_state, samples, targets, vis_results, outputs, cri
         k2u_pred_idx = np.array(sorted(set(errors['known_to_unknown_pred_idx'])), dtype=np.int64)
         k2u_gt_idx = np.array(sorted(set(errors['known_to_unknown_gt_idx'])), dtype=np.int64)
 
-        err_unknown_to_known = _draw_boxes(img_np, pred_boxes=pred_boxes[u2k_pred_idx] if len(u2k_pred_idx) > 0 else None, pred_labels=pred_labels[u2k_pred_idx] if len(u2k_pred_idx) > 0 else None, pred_scores=pred_scores[u2k_pred_idx] if len(u2k_pred_idx) > 0 else None, gt_boxes=gt_boxes[u2k_gt_idx] if len(u2k_gt_idx) > 0 else None, gt_labels=gt_labels[u2k_gt_idx] if len(u2k_gt_idx) > 0 else None, unk_label=unk_label, title='Error: Unknown -> Known')
-        err_known_to_unknown = _draw_boxes(img_np, pred_boxes=pred_boxes[k2u_pred_idx] if len(k2u_pred_idx) > 0 else None, pred_labels=pred_labels[k2u_pred_idx] if len(k2u_pred_idx) > 0 else None, pred_scores=pred_scores[k2u_pred_idx] if len(k2u_pred_idx) > 0 else None, gt_boxes=gt_boxes[k2u_gt_idx] if len(k2u_gt_idx) > 0 else None, gt_labels=gt_labels[k2u_gt_idx] if len(k2u_gt_idx) > 0 else None, unk_label=unk_label, title='Error: Known -> Unknown')
-
+        summary_with_errors = summary_text + f' | U2K={len(u2k_gt_idx)} K2U={len(k2u_gt_idx)}'
+        err_unknown_to_known = _draw_boxes(img_np, pred_boxes=pred_boxes[u2k_pred_idx] if len(u2k_pred_idx) > 0 else None, pred_labels=pred_labels[u2k_pred_idx] if len(u2k_pred_idx) > 0 else None, pred_scores=pred_scores[u2k_pred_idx] if len(u2k_pred_idx) > 0 else None, gt_boxes=gt_boxes[u2k_gt_idx] if len(u2k_gt_idx) > 0 else None, gt_labels=gt_labels[u2k_gt_idx] if len(u2k_gt_idx) > 0 else None, unk_label=unk_label, title='Error: Unknown -> Known', summary_text=summary_with_errors, show_legend=True)
+        err_known_to_unknown = _draw_boxes(img_np, pred_boxes=pred_boxes[k2u_pred_idx] if len(k2u_pred_idx) > 0 else None, pred_labels=pred_labels[k2u_pred_idx] if len(k2u_pred_idx) > 0 else None, pred_scores=pred_scores[k2u_pred_idx] if len(k2u_pred_idx) > 0 else None, gt_boxes=gt_boxes[k2u_gt_idx] if len(k2u_gt_idx) > 0 else None, gt_labels=gt_labels[k2u_gt_idx] if len(k2u_gt_idx) > 0 else None, unk_label=unk_label, title='Error: Known -> Unknown', summary_text=summary_with_errors, show_legend=True)
+        
         cand_boxes, cand_obj, cand_cls, cand_unk, cand_sel = _select_mining_aligned_candidates_from_criterion(outputs, targets, criterion, epoch, i, img_hw, args)
         cand_img = _draw_candidate_boxes(img_np, cand_boxes, cand_obj, cand_cls, cand_unk, title='Mining-aligned pseudo candidates')
 
-        stem = os.path.join(out_dir, f'{image_id:012d}')
-        _save_image(pred_all, stem + '_pred_all.png')
-        _save_image(pred_known, stem + '_pred_known.png')
-        _save_image(pred_unknown, stem + '_pred_unknown.png')
-        _save_image(gt_only, stem + '_gt.png')
-        _save_image(overlay, stem + '_overlay.png')
-        _save_image(err_unknown_to_known, stem + '_error_unknown_to_known.png')
-        _save_image(err_known_to_unknown, stem + '_error_known_to_unknown.png')
-        _save_image(cand_img, stem + '_candidate_mining_aligned.png')
+        final_unk_boxes, final_unk_scores, _ = _select_final_unknown_candidates(
+            pred, unk_label, topk=int(getattr(args, 'viz_candidate_topk', 10)),
+            nms_iou=float(getattr(args, 'viz_candidate_nms_iou', 0.6))
+        )
+        final_unk_img = _draw_boxes(
+            img_np,
+            pred_boxes=final_unk_boxes,
+            pred_labels=np.full((len(final_unk_boxes),), unk_label, dtype=np.int64) if len(final_unk_boxes) > 0 else None,
+            pred_scores=np.asarray(final_unk_scores, dtype=np.float32) if len(final_unk_scores) > 0 else None,
+            unk_label=unk_label,
+            title='Final Unknown Predictions (Top-K/NMS)',
+            summary_text=summary_with_errors,
+            show_legend=True,
+        )
+        
+        stem_name = _case_stem(
+            image_id, epoch, len(pred_boxes), len(gt_boxes), num_unk_pred, num_unk_gt,
+            len(u2k_gt_idx), len(k2u_gt_idx)
+        )
+        stem_final = os.path.join(final_dir, stem_name)
+        stem_debug = os.path.join(debug_dir, stem_name)
+        _save_image(pred_all, stem_final + '__pred_all.png')
+        _save_image(pred_known, stem_final + '__pred_known.png')
+        _save_image(pred_unknown, stem_final + '__pred_unknown.png')
+        _save_image(gt_only, stem_final + '__gt.png')
+        _save_image(overlay, stem_final + '__overlay.png')
+        _save_image(err_unknown_to_known, stem_final + '__error_unknown_to_known.png')
+        _save_image(err_known_to_unknown, stem_final + '__error_known_to_unknown.png')
+        _save_image(cand_img, stem_debug + '__candidate_mining_aligned.png')
+        _save_image(final_unk_img, stem_debug + '__final_unknown_candidates.png')
 
-        panel_path = stem + '_panel.png'
+        panel_path = stem_final + '__panel.png'
         _make_panel([
             (gt_only, 'Ground Truth'),
             (pred_all, 'All Predictions'),
@@ -743,15 +827,17 @@ def save_eval_qualitative(vis_state, samples, targets, vis_results, outputs, cri
             (pred_unknown, 'Unknown Predictions')
         ], panel_path, tile_hw=(420, 280), cols=2)
 
-        error_panel_path = stem + '_panel_errors.png'
+        error_panel_path = stem_final + '__panel_errors.png'
         _make_panel([
             (overlay, 'Pred + GT'),
             (err_unknown_to_known, 'Error: Unknown -> Known'),
             (err_known_to_unknown, 'Error: Known -> Unknown'),
-            (cand_img, 'Mining-aligned Pseudo Candidates')
+            (final_unk_img, 'Final Unknown Predictions')
         ], error_panel_path, tile_hw=(420, 280), cols=2)
 
         vis_state['saved_images'].append(error_panel_path)
+        vis_state['saved_final_images'].append(panel_path)
+        vis_state['saved_debug_images'].append(stem_debug + '__candidate_mining_aligned.png')
         vis_state['saved_panels'].append(panel_path)
         vis_state['error_rows'].append({
             'image_id': image_id,
@@ -760,6 +846,7 @@ def save_eval_qualitative(vis_state, samples, targets, vis_results, outputs, cri
             'num_unknown_to_known': int(len(u2k_gt_idx)),
             'num_known_to_unknown': int(len(k2u_gt_idx)),
             'num_candidates': int(len(cand_boxes)),
+            'num_final_unknown_candidates': int(len(final_unk_boxes)),
         })
         if writer is not None and vis_state['num_saved'] < tb_max:
             writer.add_image(f'eval_qualitative/{image_id:012d}_panel', np.array(Image.open(panel_path)), global_step=step, dataformats='HWC')
@@ -770,12 +857,19 @@ def save_eval_qualitative(vis_state, samples, targets, vis_results, outputs, cri
 def finalize_eval_visualizations(vis_state, output_dir, epoch, writer=None):
     out_dir = os.path.join(output_dir, 'eval', 'visualizations', f'epoch_{int(epoch):04d}')
     _ensure_dir(out_dir)
-    _save_query_stats_csv(vis_state, out_dir)
-    _save_feature_npz(vis_state, out_dir)
-    _save_error_case_csv(vis_state, out_dir)
-    _plot_histograms(vis_state, out_dir, writer, epoch)
-    _plot_scatter(vis_state, out_dir, writer, epoch)
-    _plot_heatmap(vis_state, out_dir, writer, epoch)
-    _plot_feature_embeddings(vis_state, out_dir, writer, epoch)
-    _save_contact_sheet(vis_state.get('saved_panels', []), os.path.join(out_dir, 'qualitative_panels_contact_sheet.png'))
-    _save_contact_sheet(vis_state.get('saved_images', []), os.path.join(out_dir, 'qualitative_error_panels_contact_sheet.png'))
+    stats_dir = os.path.join(out_dir, 'stats')
+    final_dir = os.path.join(out_dir, 'final')
+    debug_dir = os.path.join(out_dir, 'debug')
+    _ensure_dir(stats_dir)
+    _ensure_dir(final_dir)
+    _ensure_dir(debug_dir)
+    _save_query_stats_csv(vis_state, stats_dir)
+    _save_feature_npz(vis_state, stats_dir)
+    _save_error_case_csv(vis_state, stats_dir)
+    _plot_histograms(vis_state, stats_dir, writer, epoch)
+    _plot_scatter(vis_state, stats_dir, writer, epoch)
+    _plot_heatmap(vis_state, stats_dir, writer, epoch)
+    _plot_feature_embeddings(vis_state, stats_dir, writer, epoch)
+    _save_contact_sheet(vis_state.get('saved_final_images', vis_state.get('saved_panels', [])), os.path.join(final_dir, 'qualitative_panels_contact_sheet.png'))
+    _save_contact_sheet(vis_state.get('saved_images', []), os.path.join(final_dir, 'qualitative_error_panels_contact_sheet.png'))
+    _save_contact_sheet(vis_state.get('saved_debug_images', []), os.path.join(debug_dir, 'debug_contact_sheet.png'))

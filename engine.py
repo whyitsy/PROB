@@ -181,7 +181,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     vis_state = init_eval_viz_state(args) if (getattr(args, 'viz', False) and utils.is_main_process()) else None
     vis_dir = None
     if vis_state is not None:
-        vis_dir = os.path.join(output_dir, 'eval', 'visualizations', f'epoch_{int(epoch):04d}', 'qualitative')
+        vis_dir = os.path.join(output_dir, 'eval', 'visualizations', f'epoch_{int(epoch):04d}')
         _ensure_dir(vis_dir)
 
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
@@ -213,7 +213,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
         if vis_state is not None:
             collect_eval_stats(vis_state, outputs, targets, criterion, args)
-            vis_dir = os.path.join(output_dir, 'eval', 'visualizations', f'epoch_{int(epoch):04d}', 'qualitative')
+            vis_dir = os.path.join(output_dir, 'eval', 'visualizations', f'epoch_{int(epoch):04d}')
             save_eval_qualitative(
                 vis_state,
                 samples,

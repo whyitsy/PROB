@@ -16,7 +16,6 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-import datasets
 import datasets.samplers as samplers
 import util.misc as utils
 from datasets.coco import make_coco_transforms
@@ -27,8 +26,9 @@ from util.plot_metrics import append_json_record, refresh_metric_plots
 from models import build_model
 
 
-METRICS_JSONL = 'metrics_log.jsonl'
-STEP_METRICS_JSONL = 'metrics_step.jsonl'
+TRAIN_EPOCH_JSONL = 'train/metrics_epoch.jsonl'
+TRAIN_STEP_JSONL = 'train/metrics_step.jsonl'
+EVAL_EPOCH_JSONL = 'eval/metrics_epoch.jsonl'
 
 
 def _sanitize_for_checkpoint(obj):
@@ -153,7 +153,7 @@ def get_args_parser():
     parser.add_argument('--viz_candidate_nms_iou', default=0.6, type=float, help='IoU threshold for deduplicating visualization candidates')
     parser.add_argument('--viz_max_query_points', default=2500, type=int, help='maximum query samples cached for visualization plots')
     parser.add_argument('--viz_max_feature_points', default=2500, type=int, help='maximum feature samples cached for PCA/t-SNE visualizations')
-    parser.add_argument('--step_metrics_jsonl', default='metrics_step.jsonl', type=str)
+    parser.add_argument('--step_metrics_jsonl', default='train/metrics_step.jsonl', type=str)
     parser.add_argument('--step_histogram_every', default=100, type=int)
     parser.add_argument('--eval_every', default=5, type=int)
     parser.add_argument('--num_workers', default=3, type=int)
@@ -344,6 +344,9 @@ def main(args):
     output_dir = Path(args.output_dir)
     if args.output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / 'train').mkdir(parents=True, exist_ok=True)
+        (output_dir / 'eval').mkdir(parents=True, exist_ok=True)
+        (output_dir / 'infer').mkdir(parents=True, exist_ok=True)
     setup_logging(output=args.output_dir, distributed_rank=utils.get_rank(), abbrev_name='PROB')
     logging.info('Arguments:\n%s', args)
 
@@ -538,7 +541,7 @@ def main(args):
         if args.output_dir and utils.is_main_process():
             metric_dict = test_stats.get('metrics', {}) if isinstance(test_stats, dict) else {}
 
-            record = {
+            train_record = {
                 'epoch': epoch,
                 'n_parameters': n_parameters,
 
@@ -607,15 +610,25 @@ def main(args):
                     train_stats.get('stat_num_pos_candidates')
                 ) if isinstance(train_stats, dict) else None,
 
-                # ---------- eval metrics ----------
-                'test_metrics': metric_dict,
             }
 
-            append_json_record(output_dir / METRICS_JSONL, record)
+            eval_record = {
+                'epoch': epoch,
+                'n_parameters': n_parameters,
+                'test_metrics': metric_dict,
+            }
+            append_json_record(output_dir / TRAIN_EPOCH_JSONL, train_record)
+            if metric_dict:
+                append_json_record(output_dir / EVAL_EPOCH_JSONL, eval_record)
 
             if args.viz:
                 try:
-                    refresh_metric_plots(output_dir, metrics_filename=METRICS_JSONL, step_metrics_filename=args.step_metrics_jsonl)
+                    refresh_metric_plots(
+                        output_dir,
+                        train_metrics_filename=TRAIN_EPOCH_JSONL,
+                        eval_metrics_filename=EVAL_EPOCH_JSONL,
+                        step_metrics_filename=args.step_metrics_jsonl,
+                    )
                 except Exception as e:
                     logging.error('Failed to refresh metric plots: %s', e)
                     

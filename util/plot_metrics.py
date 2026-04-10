@@ -69,14 +69,27 @@ def _ema(values, alpha=0.15):
 
 
 class MetricPlotter:
-    def __init__(self, output_dir: Path, metrics_filename='metrics_log.jsonl', step_metrics_filename='metrics_step.jsonl'):
+    def __init__(self, output_dir: Path,
+                 train_metrics_filename='train/metrics_epoch.jsonl',
+                 eval_metrics_filename='eval/metrics_epoch.jsonl',
+                 step_metrics_filename='train/metrics_step.jsonl'):
         self.output_dir = Path(output_dir)
-        self.metrics_path = self.output_dir / metrics_filename
+        self.train_metrics_path = self.output_dir / train_metrics_filename
+        self.eval_metrics_path = self.output_dir / eval_metrics_filename
         self.step_metrics_path = self.output_dir / step_metrics_filename
-        self.plots_dir = self.output_dir / 'plots'
-        self.plots_dir.mkdir(parents=True, exist_ok=True)
-        self.epoch_rows = _SeriesReader(self.metrics_path).rows()
+        self.train_plots_dir = self.output_dir / 'train' / 'plots'
+        self.eval_plots_dir = self.output_dir / 'eval' / 'plots'
+        self.train_plots_dir.mkdir(parents=True, exist_ok=True)
+        self.eval_plots_dir.mkdir(parents=True, exist_ok=True)
+        self.train_epoch_rows = _SeriesReader(self.train_metrics_path).rows()
+        self.eval_epoch_rows = _SeriesReader(self.eval_metrics_path).rows()
         self.step_rows = _SeriesReader(self.step_metrics_path).rows()
+        if not self.train_epoch_rows:
+            legacy_rows = _SeriesReader(self.output_dir / 'metrics_log.jsonl').rows()
+            self.train_epoch_rows = legacy_rows
+        if not self.eval_epoch_rows:
+            legacy_rows = _SeriesReader(self.output_dir / 'metrics_log.jsonl').rows()
+            self.eval_epoch_rows = [r for r in legacy_rows if (r.get('test_metrics') or {})]
 
     def refresh_all(self):
         self.plot_epoch_metrics()
@@ -87,15 +100,16 @@ class MetricPlotter:
         self.plot_step_stats()
         self.plot_step_aux_losses()
 
-    def _save(self, fig, name):
-        fig.savefig(self.plots_dir / name, dpi=220, bbox_inches='tight')
+    def _save(self, fig, name, kind='train'):
+        out_dir = self.train_plots_dir if kind == 'train' else self.eval_plots_dir
+        fig.savefig(out_dir / name, dpi=220, bbox_inches='tight')
         plt.close(fig)
 
     def plot_epoch_metrics(self):
-        if not self.epoch_rows:
+        if not self.eval_epoch_rows:
             return
         history = []
-        for row in self.epoch_rows:
+        for row in self.eval_epoch_rows:
             metrics = row.get('test_metrics') or {}
             epoch = row.get('epoch')
             if epoch is None:
@@ -125,7 +139,7 @@ class MetricPlotter:
         ax.set_title('Open-World Percentage Metrics')
         ax.grid(True, alpha=0.25)
         ax.legend(frameon=False)
-        self._save(fig, 'open_world_metric_trends_percent.png')
+        self._save(fig, 'open_world_metric_trends_percent.png', kind='eval')
 
         fig, ax1 = plt.subplots(figsize=(10, 6))
         lines, labels = [], []
@@ -149,15 +163,15 @@ class MetricPlotter:
         if lines:
             ax1.legend(lines, labels, frameon=False, loc='best')
         ax1.set_title('Open-World Error Metrics')
-        self._save(fig, 'open_world_metric_trends_openworld.png')
-
+        self._save(fig, 'open_world_metric_trends_openworld.png', kind='eval')
+        
     def plot_epoch_losses(self):
-        if not self.epoch_rows:
+        if not self.train_epoch_rows:
             return
-        epochs = [int(r['epoch']) for r in self.epoch_rows if r.get('epoch') is not None]
+        epochs = [int(r['epoch']) for r in self.train_epoch_rows if r.get('epoch') is not None]
         if not epochs:
             return
-        total_loss = [_safe_float(r.get('train_loss')) for r in self.epoch_rows if r.get('epoch') is not None]
+        total_loss = [_safe_float(r.get('train_loss')) for r in self.train_epoch_rows if r.get('epoch') is not None]
         fig, ax = plt.subplots(figsize=(10, 6))
         ax.plot(epochs, total_loss, marker='o', linewidth=2.2, color=PALETTE['blue'], label='total_loss')
         ax.set_xlabel('Epoch')
@@ -165,8 +179,8 @@ class MetricPlotter:
         ax.set_title('Training Total Loss Trend')
         ax.grid(True, alpha=0.25)
         ax.legend(frameon=False)
-        self._save(fig, 'training_loss_total_trend.png')
-
+        self._save(fig, 'training_loss_total_trend.png', kind='train')
+        
         basic_series = [
             ('loss_ce', 'train_loss_ce_unscaled', PALETTE['blue']),
             ('loss_bbox', 'train_loss_bbox_unscaled', PALETTE['orange']),
@@ -175,7 +189,7 @@ class MetricPlotter:
         ]
         fig, ax = plt.subplots(figsize=(11, 6))
         for label, key, color in basic_series:
-            ys = [_safe_float(r.get(key)) for r in self.epoch_rows if r.get('epoch') is not None]
+            ys = [_safe_float(r.get(key)) for r in self.train_epoch_rows if r.get('epoch') is not None]
             xs = [e for e, y in zip(epochs, ys) if y is not None]
             ys = [y for y in ys if y is not None]
             if xs:
@@ -185,7 +199,7 @@ class MetricPlotter:
         ax.set_title('Base Detection Loss Components')
         ax.grid(True, alpha=0.25)
         ax.legend(frameon=False, ncol=2)
-        self._save(fig, 'training_loss_base_components.png')
+        self._save(fig, 'training_loss_base_components.png', kind='train')
 
         ow_series = [
             ('unk_known', 'train_loss_unk_known_unscaled', PALETTE['orange']),
@@ -195,7 +209,7 @@ class MetricPlotter:
         ]
         fig, ax = plt.subplots(figsize=(11, 6))
         for label, key, color in ow_series:
-            ys = [_safe_float(r.get(key)) for r in self.epoch_rows if r.get('epoch') is not None]
+            ys = [_safe_float(r.get(key)) for r in self.train_epoch_rows if r.get('epoch') is not None]
             xs = [e for e, y in zip(epochs, ys) if y is not None]
             ys = [y for y in ys if y is not None]
             if xs:
@@ -205,12 +219,12 @@ class MetricPlotter:
         ax.set_title('Open-World Core Loss Components')
         ax.grid(True, alpha=0.25)
         ax.legend(frameon=False)
-        self._save(fig, 'training_loss_openworld_components.png')
+        self._save(fig, 'training_loss_openworld_components.png', kind='train')
 
     def plot_epoch_pseudo_stats(self):
-        if not self.epoch_rows:
+        if not self.eval_epoch_rows:
             return
-        epochs = [int(r['epoch']) for r in self.epoch_rows if r.get('epoch') is not None]
+        epochs = [int(r['epoch']) for r in self.train_epoch_rows if r.get('epoch') is not None]
         count_keys = [
             ('dummy_pos', 'train_stat_num_dummy_pos', PALETTE['blue']),
             ('valid_unmatched', 'train_stat_num_valid_unmatched', PALETTE['orange']),
@@ -220,7 +234,7 @@ class MetricPlotter:
         fig, ax = plt.subplots(figsize=(11, 6))
         plotted = False
         for label, key, color in count_keys:
-            ys = [_safe_float(r.get(key)) for r in self.epoch_rows if r.get('epoch') is not None]
+            ys = [_safe_float(r.get(key)) for r in self.train_epoch_rows if r.get('epoch') is not None]
             xs = [e for e, y in zip(epochs, ys) if y is not None]
             ys = [y for y in ys if y is not None]
             if xs:
@@ -232,7 +246,7 @@ class MetricPlotter:
             ax.set_title('Pseudo-Supervision Count Statistics')
             ax.grid(True, alpha=0.25)
             ax.legend(frameon=False)
-            self._save(fig, 'pseudo_stat_counts.png')
+            self._save(fig, 'pseudo_stat_counts.png', kind='train')
         else:
             plt.close(fig)
 
@@ -241,7 +255,7 @@ class MetricPlotter:
             ('selection_ratio', 'train_pseudo_selection_ratio', PALETTE['cyan']),
             ('accept_ratio', 'train_pseudo_accept_ratio', PALETTE['red']),
         ]:
-            ys = [_safe_float(r.get(key)) for r in self.epoch_rows if r.get('epoch') is not None]
+            ys = [_safe_float(r.get(key)) for r in self.train_epoch_rows if r.get('epoch') is not None]
             xs = [e for e, y in zip(epochs, ys) if y is not None]
             ys = [y for y in ys if y is not None]
             if xs:
@@ -251,10 +265,10 @@ class MetricPlotter:
         ax.set_title('Pseudo-Supervision Efficiency Trends')
         ax.grid(True, alpha=0.25)
         ax.legend(frameon=False)
-        self._save(fig, 'pseudo_efficiency_trends.png')
+        self._save(fig, 'pseudo_efficiency_trends.png', kind='train')
 
     def plot_epoch_decoupling(self):
-        if not self.epoch_rows:
+        if not self.train_epoch_rows:
             return
         keys = [
             ('corr_fg_obj_unk', PALETTE['blue']),
@@ -268,7 +282,7 @@ class MetricPlotter:
         plotted = False
         for key, color in keys:
             xs, ys = [], []
-            for row in self.epoch_rows:
+            for row in self.eval_epoch_rows:
                 epoch = row.get('epoch')
                 metrics = row.get('test_metrics') or {}
                 val = _safe_float(metrics.get(key))
@@ -285,7 +299,7 @@ class MetricPlotter:
             ax.set_title('Decoupling Correlation Trends')
             ax.grid(True, alpha=0.25)
             ax.legend(frameon=False, fontsize=9, ncol=2)
-            self._save(fig, 'decoupling_correlation_trends.png')
+            self._save(fig, 'decoupling_correlation_trends.png', kind='eval')
         else:
             plt.close(fig)
 
@@ -473,5 +487,13 @@ class MetricPlotter:
             plt.close(fig)
 
 
-def refresh_metric_plots(output_dir: Path, metrics_filename='metrics_log.jsonl', step_metrics_filename='metrics_step.jsonl'):
-    MetricPlotter(Path(output_dir), metrics_filename=metrics_filename, step_metrics_filename=step_metrics_filename).refresh_all()
+def refresh_metric_plots(output_dir: Path,
+                         train_metrics_filename='train/metrics_epoch.jsonl',
+                         eval_metrics_filename='eval/metrics_epoch.jsonl',
+                         step_metrics_filename='train/metrics_step.jsonl'):
+    MetricPlotter(
+        Path(output_dir),
+        train_metrics_filename=train_metrics_filename,
+        eval_metrics_filename=eval_metrics_filename,
+        step_metrics_filename=step_metrics_filename,
+    ).refresh_all()
