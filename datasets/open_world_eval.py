@@ -181,7 +181,7 @@ class OWEvaluator:
         logger.info(f"mAP: {fmt.format(mAP)}")
         logger.info(f"Total unknown objects: {total_num_unk}")
         for iou, ose in total_ose.items():
-            logger.info(f"Absolute OSE (IoU={iou}): {ose}")
+            logger.info(f"Absolute OSE (IoU={iou}): {int(ose)}")
             
         # WI 表格
         recalls = sorted(wi.keys())

@@ -1,10 +1,4 @@
-#!/usr/bin/env bash
-set -euo pipefail
-set -x
-
-
-
-BASE_EXP_DIR="${1:-/mnt/data/kky/output/PROB/exps/MOWODB/UOD_CH3_FULL}"
+BASE_EXP_DIR="${1:-/mnt/data/kky/output/PROB/exps/SOWODB/UOD_CH3_FULL}"
 shift $(( $# > 0 ? 1 : 0 )) || true
 PY_ARGS=("$@")
 
@@ -12,13 +6,14 @@ REPLAY_DIR="${REPLAY_DIR:-UOD_CH3}"
 GPUS="${GPUS:-gpu}"
 
 COMMON_ARGS=(
-  --dataset TOWOD
-  --test_set owod_all_task_test
+  --dataset OWDETR
+  --test_set owdetr_test
   --num_workers 8
   --model_type uod
   --with_box_refine
   --obj_loss_coef 8e-4
   --obj_temp 1.3
+  --exemplar_replay_selection
 )
 
 CH3_ARGS=(
@@ -29,7 +24,7 @@ CH3_ARGS=(
   --unk_loss_coef 8e-4
   --uod_pseudo_obj_loss_coef 1.5
   --uod_pseudo_unk_loss_coef 0
-  --uod_pos_per_img_cap 2
+  --uod_pos_per_img_cap 0
   --uod_batch_topk_max 16
   --uod_cls_soft_attn_alpha 0.5
   --uod_cls_soft_attn_min 0.25
@@ -54,84 +49,81 @@ run_stage() {
 # Task 1
 # ----------------
 run_stage "${BASE_EXP_DIR}/t1" \
-  --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 20 \
-  --train_set owod_t1_train \
+  --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
+  --train_set owdetr_t1_train \
   --epochs 41 \
   --uod_start_epoch 12 \
-  --exemplar_replay_selection \
+  --lr_drop 31 \
   --exemplar_replay_max_length 850 \
   --exemplar_replay_dir "${REPLAY_DIR}" \
-  --exemplar_replay_cur_file learned_owod_t1_ft.txt
+  --exemplar_replay_cur_file learned_owdetr_t1_ft.txt
 
 # ----------------
 # Task 2
 # ----------------
 run_stage "${BASE_EXP_DIR}/t2" \
-  --PREV_INTRODUCED_CLS 20 --CUR_INTRODUCED_CLS 20 \
-  --train_set owod_t2_train \
+  --PREV_INTRODUCED_CLS 19 --CUR_INTRODUCED_CLS 21 \
+  --train_set owdetr_t2_train \
   --epochs 51 \
   --uod_start_epoch 46 \
   --freeze_prob_model \
-  --exemplar_replay_selection \
-  --exemplar_replay_max_length 1743 \
+  --exemplar_replay_max_length 1679 \
   --exemplar_replay_dir "${REPLAY_DIR}" \
-  --exemplar_replay_prev_file learned_owod_t1_ft.txt \
-  --exemplar_replay_cur_file learned_owod_t2_ft.txt \
-  --pretrain "${BASE_EXP_DIR}/t1/checkpoint0040.pth" \
+  --exemplar_replay_prev_file learned_owdetr_t1_ft.txt \
+  --exemplar_replay_cur_file learned_owdetr_t2_ft.txt \
+  --pretrain "${BASE_EXP_DIR}/t1/checkpoint.pth" \
   --lr 2e-5
 
 run_stage "${BASE_EXP_DIR}/t2_ft" \
-  --PREV_INTRODUCED_CLS 20 --CUR_INTRODUCED_CLS 20 \
-  --train_set "${REPLAY_DIR}/learned_owod_t2_ft" \
-  --epochs 111 \
-  --lr_drop 40 \
-  --pretrain "${BASE_EXP_DIR}/t2/checkpoint0050.pth"
+  --PREV_INTRODUCED_CLS 19 --CUR_INTRODUCED_CLS 21 \
+  --train_set "${REPLAY_DIR}/learned_owdetr_t2_ft" \
+  --epochs 121 \
+  --lr_drop 50 \
+  --pretrain "${BASE_EXP_DIR}/t2/checkpoint.pth"
 
 # ----------------
 # Task 3
 # ----------------
 run_stage "${BASE_EXP_DIR}/t3" \
   --PREV_INTRODUCED_CLS 40 --CUR_INTRODUCED_CLS 20 \
-  --train_set owod_t3_train \
-  --epochs 121 \
-  --uod_start_epoch 116 \
+  --train_set owdetr_t3_train \
+  --epochs 131 \
+  --uod_start_epoch 126 \
   --freeze_prob_model \
-  --exemplar_replay_selection \
-  --exemplar_replay_max_length 2361 \
+  --exemplar_replay_max_length 2345 \
   --exemplar_replay_dir "${REPLAY_DIR}" \
-  --exemplar_replay_prev_file learned_owod_t2_ft.txt \
-  --exemplar_replay_cur_file learned_owod_t3_ft.txt \
-  --pretrain "${BASE_EXP_DIR}/t2_ft/checkpoint0110.pth" \
+  --exemplar_replay_prev_file learned_owdetr_t2_ft.txt \
+  --exemplar_replay_cur_file learned_owdetr_t3_ft.txt \
+  --pretrain "${BASE_EXP_DIR}/t2_ft/checkpoint.pth" \
   --lr 2e-5
 
 run_stage "${BASE_EXP_DIR}/t3_ft" \
   --PREV_INTRODUCED_CLS 40 --CUR_INTRODUCED_CLS 20 \
-  --train_set "${REPLAY_DIR}/learned_owod_t3_ft" \
-  --epochs 181 \
-  --lr_drop 35 \
-  --pretrain "${BASE_EXP_DIR}/t3/checkpoint0120.pth"
+  --train_set "${REPLAY_DIR}/learned_owdetr_t3_ft" \
+  --epochs 201 \
+  --lr_drop 50 \
+  --pretrain "${BASE_EXP_DIR}/t3/checkpoint.pth"
 
 # ----------------
 # Task 4
 # ----------------
 run_stage "${BASE_EXP_DIR}/t4" \
   --PREV_INTRODUCED_CLS 60 --CUR_INTRODUCED_CLS 20 \
-  --train_set owod_t4_train \
-  --epochs 191 \
-  --uod_start_epoch 186 \
+  --train_set owdetr_t4_train \
+  --epochs 211 \
+  --uod_start_epoch 206 \
   --freeze_prob_model \
-  --exemplar_replay_selection \
-  --exemplar_replay_max_length 2749 \
+  --exemplar_replay_max_length 2664 \
   --exemplar_replay_dir "${REPLAY_DIR}" \
-  --exemplar_replay_prev_file learned_owod_t3_ft.txt \
-  --exemplar_replay_cur_file learned_owod_t4_ft.txt \
+  --exemplar_replay_prev_file learned_owdetr_t3_ft.txt \
+  --exemplar_replay_cur_file learned_owdetr_t4_ft.txt \
   --num_inst_per_class 40 \
-  --pretrain "${BASE_EXP_DIR}/t3_ft/checkpoint0180.pth" \
+  --pretrain "${BASE_EXP_DIR}/t3_ft/checkpoint.pth" \
   --lr 2e-5
 
 run_stage "${BASE_EXP_DIR}/t4_ft" \
   --PREV_INTRODUCED_CLS 60 --CUR_INTRODUCED_CLS 20 \
-  --train_set "${REPLAY_DIR}/learned_owod_t4_ft" \
-  --epochs 261 \
+  --train_set "${REPLAY_DIR}/learned_owdetr_t4_ft" \
+  --epochs 301 \
   --lr_drop 50 \
-  --pretrain "${BASE_EXP_DIR}/t4/checkpoint0190.pth"
+  --pretrain "${BASE_EXP_DIR}/t4/checkpoint.pth"

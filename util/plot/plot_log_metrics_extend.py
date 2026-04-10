@@ -83,7 +83,7 @@ def parse_absolute_ose(log_path):
         content = f.read()
     pattern = r'Absolute OSE \(IoU=50\): (\d+\.?\d*)'
     matches = re.findall(pattern, content)
-    return [float(m) for m in matches]
+    return [int(m) for m in matches]
 
 
 def parse_wi_tables(log_path):

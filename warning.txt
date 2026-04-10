@@ -15,3 +15,6 @@ eval完输出指标之后：
   c /= stddev[:, None]
 /home/kky/miniconda3/envs/prob/lib/python3.10/site-packages/numpy/lib/_function_base_impl.py:3046: RuntimeWarning: invalid value encountered in divide
   c /= stddev[None, :]
+
+/home/kky/PROB/util/misc.py:140: UserWarning: TypedStorage is deprecated. It will be removed in the future and UntypedStorage will be the only storage class. This should only matter to you if you are using storages directly.  To access UntypedStorage directly, use tensor.untyped_storage() instead of tensor.storage()
+  storage = torch.ByteStorage.from_buffer(buffer)

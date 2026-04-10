@@ -129,7 +129,6 @@ class DeformableDETRUOD(nn.Module):
         self.two_stage = two_stage
         self.enable_odqe = bool(getattr(args, 'uod_enable_odqe', False))
         self.energy_temperature = float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / float(hidden_dim)
-        self.postprocess_unknown_scale = float(getattr(args, 'uod_postprocess_unknown_scale', 15.0))
 
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)

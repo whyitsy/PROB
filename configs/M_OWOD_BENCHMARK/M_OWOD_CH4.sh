@@ -66,62 +66,59 @@ run_stage() {
 #   --exemplar_replay_dir "${REPLAY_DIR}" \
 #   --exemplar_replay_cur_file learned_owod_t1_ft.txt
 
-run_stage "${BASE_EXP_DIR}/t2" \
-  --PREV_INTRODUCED_CLS 20 --CUR_INTRODUCED_CLS 20 \
-  --train_set owod_t2_train \
-  --epochs 51 \
-  --freeze_prob_model \
-  --uod_start_epoch 46 \
-  --exemplar_replay_selection \
-  --exemplar_replay_max_length 1743 \
-  --exemplar_replay_dir "${REPLAY_DIR}" \
-  --exemplar_replay_prev_file learned_owod_t1_ft.txt \
-  --exemplar_replay_cur_file learned_owod_t2_ft.txt \
-  --pretrain "${BASE_EXP_DIR}/t1/checkpoint0040.pth" \
-  --lr 2e-5
+# run_stage "${BASE_EXP_DIR}/t2" \
+#   --PREV_INTRODUCED_CLS 20 --CUR_INTRODUCED_CLS 20 \
+#   --train_set owod_t2_train \
+#   --epochs 51 \
+#   --freeze_prob_model \
+#   --exemplar_replay_selection \
+#   --exemplar_replay_max_length 1743 \
+#   --exemplar_replay_dir "${REPLAY_DIR}" \
+#   --exemplar_replay_prev_file learned_owod_t1_ft.txt \
+#   --exemplar_replay_cur_file learned_owod_t2_ft.txt \
+#   --pretrain "${BASE_EXP_DIR}/t1/checkpoint0040.pth" \
+#   --lr 2e-5
 
-run_stage "${BASE_EXP_DIR}/t2_ft" \
-  --PREV_INTRODUCED_CLS 20 --CUR_INTRODUCED_CLS 20 \
-  --train_set "${REPLAY_DIR}/learned_owod_t2_ft" \
-  --epochs 111 \
-  --lr_drop 40 \
-  --pretrain "${BASE_EXP_DIR}/t2/checkpoint0050.pth"
+# run_stage "${BASE_EXP_DIR}/t2_ft" \
+#   --PREV_INTRODUCED_CLS 20 --CUR_INTRODUCED_CLS 20 \
+#   --train_set "${REPLAY_DIR}/learned_owod_t2_ft" \
+#   --epochs 111 \
+#   --lr_drop 40 \
+#   --pretrain "${BASE_EXP_DIR}/t2/checkpoint0050.pth"
 
-run_stage "${BASE_EXP_DIR}/t3" \
-  --PREV_INTRODUCED_CLS 40 --CUR_INTRODUCED_CLS 20 \
-  --train_set owod_t3_train \
-  --epochs 121 \
-  --uod_start_epoch 116 \
-  --freeze_prob_model \
-  --exemplar_replay_selection \
-  --exemplar_replay_max_length 2361 \
-  --exemplar_replay_dir "${REPLAY_DIR}" \
-  --exemplar_replay_prev_file learned_owod_t2_ft.txt \
-  --exemplar_replay_cur_file learned_owod_t3_ft.txt \
-  --pretrain "${BASE_EXP_DIR}/t2_ft/checkpoint0110.pth" \
-  --lr 2e-5
+# run_stage "${BASE_EXP_DIR}/t3" \
+#   --PREV_INTRODUCED_CLS 40 --CUR_INTRODUCED_CLS 20 \
+#   --train_set owod_t3_train \
+#   --epochs 121 \
+#   --freeze_prob_model \
+#   --exemplar_replay_selection \
+#   --exemplar_replay_max_length 2361 \
+#   --exemplar_replay_dir "${REPLAY_DIR}" \
+#   --exemplar_replay_prev_file learned_owod_t2_ft.txt \
+#   --exemplar_replay_cur_file learned_owod_t3_ft.txt \
+#   --lr 2e-5 \
+#   --pretrain "${BASE_EXP_DIR}/t2_ft/checkpoint0110.pth" \
 
-run_stage "${BASE_EXP_DIR}/t3_ft" \
-  --PREV_INTRODUCED_CLS 40 --CUR_INTRODUCED_CLS 20 \
-  --train_set "${REPLAY_DIR}/learned_owod_t3_ft" \
-  --epochs 181 \
-  --lr_drop 35 \
-  --pretrain "${BASE_EXP_DIR}/t3/checkpoint0120.pth"
+# run_stage "${BASE_EXP_DIR}/t3_ft" \
+#   --PREV_INTRODUCED_CLS 40 --CUR_INTRODUCED_CLS 20 \
+#   --train_set "${REPLAY_DIR}/learned_owod_t3_ft" \
+#   --epochs 181 \
+#   --lr_drop 35 \
+#   --pretrain "${BASE_EXP_DIR}/t3/checkpoint0120.pth"
 
-run_stage "${BASE_EXP_DIR}/t4" \
-  --PREV_INTRODUCED_CLS 60 --CUR_INTRODUCED_CLS 20 \
-  --train_set owod_t4_train \
-  --epochs 191 \
-  --uod_start_epoch 186 \
-  --freeze_prob_model \
-  --exemplar_replay_selection \
-  --exemplar_replay_max_length 2749 \
-  --exemplar_replay_dir "${REPLAY_DIR}" \
-  --exemplar_replay_prev_file learned_owod_t3_ft.txt \
-  --exemplar_replay_cur_file learned_owod_t4_ft.txt \
-  --num_inst_per_class 40 \
-  --pretrain "${BASE_EXP_DIR}/t3_ft/checkpoint0180.pth" \
-  --lr 2e-5
+# run_stage "${BASE_EXP_DIR}/t4" \
+#   --PREV_INTRODUCED_CLS 60 --CUR_INTRODUCED_CLS 20 \
+#   --train_set owod_t4_train \
+#   --epochs 191 \
+#   --freeze_prob_model \
+#   --exemplar_replay_selection \
+#   --exemplar_replay_max_length 2749 \
+#   --exemplar_replay_dir "${REPLAY_DIR}" \
+#   --exemplar_replay_prev_file learned_owod_t3_ft.txt \
+#   --exemplar_replay_cur_file learned_owod_t4_ft.txt \
+#   --num_inst_per_class 40 \
+#   --pretrain "${BASE_EXP_DIR}/t3_ft/checkpoint0180.pth" \
+#   --lr 2e-5
 
 run_stage "${BASE_EXP_DIR}/t4_ft" \
   --PREV_INTRODUCED_CLS 60 --CUR_INTRODUCED_CLS 20 \

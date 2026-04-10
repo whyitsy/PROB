@@ -478,8 +478,8 @@ def main(args):
         if args.eval:
             test_stats, coco_evaluator = evaluate(model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args, epoch=args.start_epoch-1)
             _log_test_stats_to_tb(writer, test_stats, args.start_epoch)
-            if args.output_dir and coco_evaluator is not None:
-                utils.save_on_master(coco_evaluator.coco_eval['bbox'].eval, output_dir / 'eval.pth')
+            # if args.output_dir and coco_evaluator is not None:
+            #     utils.save_on_master(coco_evaluator.coco_eval['bbox'].eval, output_dir / 'eval.pth')
             return
 
     

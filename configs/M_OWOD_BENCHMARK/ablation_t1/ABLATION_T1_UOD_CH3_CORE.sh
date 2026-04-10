@@ -56,8 +56,6 @@ torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
   ${PY_ARGS}
 
 
-
-
 # 最好的指标：59.54、21.41、7031.0、0.0657
 # torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
 #   main_open_world.py \
