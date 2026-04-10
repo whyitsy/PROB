@@ -384,8 +384,7 @@ class SetCriterion(nn.Module):
         self.uod_batch_topk_ratio = float(getattr(args, 'uod_batch_topk_ratio', 0.25))
         self.uod_max_iou = float(getattr(args, 'uod_max_iou', 0.2))
         self.uod_max_iof = float(getattr(args, 'uod_max_iof', 0.4))
-        self.uod_min_area = float(getattr(args, 'uod_min_area', 0.002))
-        self.uod_min_side = float(getattr(args, 'uod_min_side', 0.05))
+        self.uod_min_area = float(getattr(args, 'uod_min_area', 0.02))
         self.uod_max_aspect_ratio = float(getattr(args, 'uod_max_aspect_ratio', 4.0))
         self.uod_candidate_nms_iou = float(getattr(args, 'uod_candidate_nms_iou', 0.6))
         self.uod_pos_unk_min = float(getattr(args, 'uod_pos_unk_min', 0.05))
@@ -591,9 +590,8 @@ class SetCriterion(nn.Module):
         w = box_cxcywh[2].item()
         h = box_cxcywh[3].item()
         area = w * h
-        side = min(w, h)
         ar = max(w / max(h, 1e-6), h / max(w, 1e-6))
-        return area >= self.uod_min_area and side >= self.uod_min_side and ar <= self.uod_max_aspect_ratio
+        return area >= self.uod_min_area and ar <= self.uod_max_aspect_ratio
 
     def _center_prior(self, box_cxcywh):
         """

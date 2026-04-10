@@ -15,10 +15,9 @@ COMMON_ARGS="\
   --with_box_refine \
   --unk_loss_coef 4e-4 \
   --uod_pseudo_obj_loss_coef 1 \
-  --uod_pos_per_img_cap 1 --uod_batch_topk_max 12 \
   --uod_cls_soft_attn_alpha 0.5 --uod_cls_soft_attn_min 0.25 \
   --uod_haux_low_obj_coef 0 --uod_haux_mid_unknown_coef 0 --uod_haux_high_unknown_coef 0 \
-  --uod_pos_unk_min 0.08 --uod_known_reject_thresh 0.10 \
+  --uod_pos_unk_min 0.08\
   "
 
 # torchrun --standalone --nnodes=1 --nproc-per-node=gpu \

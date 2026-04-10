@@ -17,5 +17,4 @@ python infer.py \
     --input photos \
     --mode_type uod \
     --output_dir ./infer_output \
-    --score_thresh 0.05 \
     --save_layer_debug

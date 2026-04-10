@@ -33,7 +33,7 @@ run_stage() {
 }
 
 
-# run_stage "${BASE_EXP_DIR}/t1" 
+run_stage "${BASE_EXP_DIR}/t1" 
 
 run_stage "${BASE_EXP_DIR}/t2" 
 

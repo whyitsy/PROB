@@ -18,11 +18,9 @@ GPUS="${GPUS:-gpu}"
 COMMON_ARGS=(
   --dataset TOWOD
   --test_set owod_all_task_test
-  --num_workers 8
   --model_type uod
   --with_box_refine
-  --obj_loss_coef 8e-4
-  --obj_temp 1.3
+  --viz
 )
 
 CH4_ARGS=(
@@ -35,8 +33,6 @@ CH4_ARGS=(
   --unk_loss_coef 8e-4
   --uod_pseudo_obj_loss_coef 1.5
   --uod_pseudo_unk_loss_coef 0
-  --uod_pos_per_img_cap 2
-  --uod_batch_topk_max 16
   --uod_cls_soft_attn_alpha 0.5
   --uod_cls_soft_attn_min 0.25
   --uod_start_epoch 12

@@ -1,3 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 BASE_EXP_DIR="${1:-/mnt/data/kky/output/PROB/exps/SOWODB/UOD_CH3_FULL}"
 shift $(( $# > 0 ? 1 : 0 )) || true
 PY_ARGS=("$@")
@@ -8,12 +11,9 @@ GPUS="${GPUS:-gpu}"
 COMMON_ARGS=(
   --dataset OWDETR
   --test_set owdetr_test
-  --num_workers 8
   --model_type uod
   --with_box_refine
-  --obj_loss_coef 8e-4
-  --obj_temp 1.3
-  --exemplar_replay_selection
+  --viz
 )
 
 CH3_ARGS=(
@@ -21,13 +21,10 @@ CH3_ARGS=(
   --uod_enable_pseudo
   --uod_enable_batch_dynamic
   --uod_enable_cls_soft_attn
-  --unk_loss_coef 8e-4
+  --uod_pseudo_bbox_loss_coef 3
+  --uod_pseudo_giou_loss_coef 1
   --uod_pseudo_obj_loss_coef 1.5
   --uod_pseudo_unk_loss_coef 0
-  --uod_pos_per_img_cap 0
-  --uod_batch_topk_max 16
-  --uod_cls_soft_attn_alpha 0.5
-  --uod_cls_soft_attn_min 0.25
   --uod_haux_low_obj_coef 0
   --uod_haux_mid_unknown_coef 0
   --uod_haux_high_unknown_coef 0
@@ -54,6 +51,7 @@ run_stage "${BASE_EXP_DIR}/t1" \
   --epochs 41 \
   --uod_start_epoch 12 \
   --lr_drop 31 \
+  --exemplar_replay_selection \
   --exemplar_replay_max_length 850 \
   --exemplar_replay_dir "${REPLAY_DIR}" \
   --exemplar_replay_cur_file learned_owdetr_t1_ft.txt
@@ -67,6 +65,7 @@ run_stage "${BASE_EXP_DIR}/t2" \
   --epochs 51 \
   --uod_start_epoch 46 \
   --freeze_prob_model \
+  --exemplar_replay_selection \
   --exemplar_replay_max_length 1679 \
   --exemplar_replay_dir "${REPLAY_DIR}" \
   --exemplar_replay_prev_file learned_owdetr_t1_ft.txt \
@@ -90,6 +89,7 @@ run_stage "${BASE_EXP_DIR}/t3" \
   --epochs 131 \
   --uod_start_epoch 126 \
   --freeze_prob_model \
+  --exemplar_replay_selection \
   --exemplar_replay_max_length 2345 \
   --exemplar_replay_dir "${REPLAY_DIR}" \
   --exemplar_replay_prev_file learned_owdetr_t2_ft.txt \
@@ -113,6 +113,7 @@ run_stage "${BASE_EXP_DIR}/t4" \
   --epochs 211 \
   --uod_start_epoch 206 \
   --freeze_prob_model \
+  --exemplar_replay_selection \
   --exemplar_replay_max_length 2664 \
   --exemplar_replay_dir "${REPLAY_DIR}" \
   --exemplar_replay_prev_file learned_owdetr_t3_ft.txt \
