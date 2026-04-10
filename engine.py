@@ -1,30 +1,36 @@
 # ------------------------------------------------------------------------
-# Training and evaluation loop for official PROB / UOD experiments.
-# Refactored to keep step logging and evaluation visualization modular.
+# Training and evaluation loops for official PROB / UOD experiments.
+# This refactor keeps the execution order linear while moving visualization
+# and TensorBoard writing into dedicated visual/* helpers.
 # ------------------------------------------------------------------------
 import logging
 import math
-import os
 import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Iterable
+import os
 
 import torch
 
 import util.misc as utils
 from datasets.data_prefetcher import data_prefetcher
 from datasets.open_world_eval import OWEvaluator
-from datasets.panoptic_eval import PanopticEvaluator
-from util.eval_viz import (
-    _ensure_dir,
-    collect_eval_stats,
-    compute_decoupling_corr_metrics,
+from visual.eval_visualizer import (
+    collect_eval_visual_stats,
+    compute_branch_correlation_metrics,
     finalize_eval_visualizations,
-    init_eval_viz_state,
-    save_eval_qualitative,
+    init_eval_visual_state,
+    save_eval_qualitative_cases,
 )
-from util.step_logger import log_train_step
+from visual.train_writer import write_train_step_artifacts
+
+
+def _get_output(outputs, *keys):
+    for key in keys:
+        if key in outputs and outputs[key] is not None:
+            return outputs[key]
+    return None
 
 
 def _call_criterion(criterion, outputs, targets, epoch):
@@ -34,36 +40,48 @@ def _call_criterion(criterion, outputs, targets, epoch):
         return criterion(outputs, targets)
 
 
-def _safe_float(v):
-    if torch.is_tensor(v):
-        return float(v.detach().cpu().item())
-    return float(v)
+def _forward_model_for_evaluation(model, samples, enable_visual_debug):
+    if not enable_visual_debug:
+        return model(samples)
+    try:
+        return model(samples, return_vis_debug=True)
+    except TypeError:
+        return model(samples)
 
 
 def get_exemplar_replay(model, exemplar_selection, device, data_loader):
     metric_logger = utils.MetricLogger(delimiter='  ')
-    header = '[ExempReplay]'
-    print_freq = 10
+    header = '[ExemplarReplay]'
+    print_frequency = 10
     prefetcher = data_prefetcher(data_loader, device, prefetch=True)
 
     samples, targets = prefetcher.next()
-
-    image_sorted_scores_reduced = {}
-    for _ in metric_logger.log_every(range(len(data_loader)), print_freq, header):
+    image_sorted_scores = {}
+    for _ in metric_logger.log_every(range(len(data_loader)), print_frequency, header):
         outputs = model(samples)
-        image_sorted_scores = exemplar_selection(samples, outputs, targets)
-        for i in utils.combine_dict(image_sorted_scores):
-            image_sorted_scores_reduced.update(i[0])
-        metric_logger.update(loss=len(image_sorted_scores_reduced.keys()))
+        per_batch_scores = exemplar_selection(samples, outputs, targets)
+        for item in utils.combine_dict(per_batch_scores):
+            image_sorted_scores.update(item[0])
+        metric_logger.update(processed_images=len(image_sorted_scores.keys()))
         samples, targets = prefetcher.next()
-    logging.info('found a total of %s images', len(image_sorted_scores_reduced.keys()))
-    return image_sorted_scores_reduced
+    logging.info('Collected exemplar scores for %s images', len(image_sorted_scores.keys()))
+    return image_sorted_scores
 
 
-def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, nc_epoch: int,
-                    max_norm: float = 0, writer=None, args=None):
+def train_one_epoch(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    data_loader: Iterable,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    max_norm: float = 0.0,
+    tb_writer=None,
+    output_dir='',
+    step_metrics_file='train/metrics_step.jsonl',
+    viz_cfg=None,
+    args=None,
+):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter='  ')
@@ -71,86 +89,73 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     metric_logger.add_meter('grad_norm', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     header = f'Epoch: [{epoch}]'
-    print_freq = 10
+    print_frequency = 10
 
     prefetcher = data_prefetcher(data_loader, device, prefetch=True)
     samples, targets = prefetcher.next()
-    pseudo_start = int(getattr(args, 'uod_start_epoch', 8))
-    neg_warmup = int(getattr(args, 'uod_neg_warmup_epochs', 0))
 
-    for step in metric_logger.log_every(range(len(data_loader)), print_freq, header):
+    pseudo_start_epoch = int(getattr(args, 'uod_start_epoch', 8))
+    reliable_background_warmup = int(getattr(args, 'uod_neg_warmup_epochs', 0))
+
+    for local_step in metric_logger.log_every(range(len(data_loader)), print_frequency, header):
         outputs = model(samples)
         loss_dict = _call_criterion(criterion, outputs, targets, epoch)
         weight_dict = deepcopy(criterion.weight_dict)
 
-        if epoch < nc_epoch:
-            for k in list(weight_dict.keys()):
-                if 'NC' in k:
-                    weight_dict[k] = 0
-
-        if epoch < pseudo_start:
-            for k in ('loss_obj_pseudo', 'loss_unk_pseudo', 'loss_obj_neg'):
-                if k in weight_dict:
-                    weight_dict[k] = 0.0
-        elif epoch < pseudo_start + neg_warmup:
+        if epoch < pseudo_start_epoch:
+            for key in ('loss_obj_pseudo', 'loss_unk_pseudo', 'loss_obj_neg', 'loss_bbox_pseudo_cons', 'loss_giou_pseudo_cons'):
+                if key in weight_dict:
+                    weight_dict[key] = 0.0
+        elif epoch < pseudo_start_epoch + reliable_background_warmup:
             if 'loss_obj_neg' in weight_dict:
                 weight_dict['loss_obj_neg'] = 0.0
 
-        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+        total_loss = sum(loss_dict[key] * weight_dict[key] for key in loss_dict.keys() if key in weight_dict)
+        reduced_loss_dict = utils.reduce_dict(loss_dict)
+        reduced_raw_loss_dict = {key: value for key, value in reduced_loss_dict.items() if key in weight_dict or key.startswith('stat_') or key.startswith('num_')}
+        reduced_weighted_loss_dict = {key: value * weight_dict[key] for key, value in reduced_loss_dict.items() if key in weight_dict}
+        reduced_total_loss = sum(reduced_weighted_loss_dict.values())
+        total_loss_value = reduced_total_loss.item()
 
-        loss_dict_reduced = utils.reduce_dict(loss_dict)
-        loss_dict_reduced_unscaled = {f'{k}_unscaled': v for k, v in loss_dict_reduced.items() if k in weight_dict}
-        loss_dict_reduced_scaled = {k: v * weight_dict[k]
-                                    for k, v in loss_dict_reduced.items() if k in weight_dict}
-        losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
-        loss_value = losses_reduced_scaled.item()
-
-        if not math.isfinite(loss_value):
-            logging.error('Loss is %s, stopping training', loss_value)
-            logging.error('Reduced loss dict: %s', loss_dict_reduced)
+        if not math.isfinite(total_loss_value):
+            logging.error('Loss is %s, stopping training', total_loss_value)
+            logging.error('Reduced loss dict: %s', reduced_loss_dict)
             sys.exit(1)
 
         optimizer.zero_grad()
-        losses.backward()
+        total_loss.backward()
         if max_norm > 0:
             grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         else:
             grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
         optimizer.step()
 
-        if writer is not None or getattr(args, 'output_dir', ''):
-            global_step = epoch * len(data_loader) + step
-            step_jsonl_path = Path(getattr(args, 'output_dir', '')) / getattr(args, 'step_metrics_jsonl', 'metrics_step.jsonl') if getattr(args, 'output_dir', '') else Path('metrics_step.jsonl')
-            log_train_step(
-                writer=writer,
+        if tb_writer is not None or output_dir:
+            global_step = epoch * len(data_loader) + local_step
+            step_jsonl_path = Path(output_dir) / step_metrics_file if output_dir else Path(step_metrics_file)
+            write_train_step_artifacts(
+                tb_writer=tb_writer,
                 step_jsonl_path=step_jsonl_path,
                 global_step=global_step,
                 epoch=epoch,
-                local_step=step,
+                local_step=local_step,
                 optimizer=optimizer,
                 grad_total_norm=grad_total_norm,
                 outputs=outputs,
                 targets=targets,
                 criterion=criterion,
-                loss_value=loss_value,
-                loss_dict_reduced=loss_dict_reduced,
-                loss_dict_reduced_scaled=loss_dict_reduced_scaled,
-                hist_every=int(getattr(args, 'step_histogram_every', 100)),
+                total_loss=total_loss_value,
+                reduced_loss_dict=reduced_raw_loss_dict,
+                reduced_weighted_loss_dict=reduced_weighted_loss_dict,
+                viz_cfg=viz_cfg,
                 args=args,
             )
-        
-        metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
-        extra_meter_keys = [
-            'known_unk_suppress_coeff', 'unknown_known_suppress_coeff', 'gate_mean',
-            'stat_num_dummy_pos', 'stat_num_dummy_neg', 'stat_num_valid_unmatched',
-            'stat_num_pos_candidates', 'stat_num_neg_candidates',
-            'stat_num_batch_selected_pos', 'stat_pos_thresh_mean', 'stat_cls_attn_mean', 'stat_num_cls_soft'
-        ]
-        for key in extra_meter_keys:
-            if key in loss_dict_reduced:
-                metric_logger.update(**{key: loss_dict_reduced[key]})
-        if 'class_error' in loss_dict_reduced:
-            metric_logger.update(class_error=loss_dict_reduced['class_error'])
+
+        metric_logger.update(loss=total_loss_value, **reduced_weighted_loss_dict)
+        for key, value in reduced_raw_loss_dict.items():
+            metric_logger.update(**{key: value})
+        if 'class_error' in reduced_loss_dict:
+            metric_logger.update(class_error=reduced_loss_dict['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]['lr'])
         metric_logger.update(grad_norm=grad_total_norm)
 
@@ -158,111 +163,78 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
     metric_logger.synchronize_between_processes()
     logging.info('Averaged stats: %s', metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return {key: meter.global_avg for key, meter in metric_logger.meters.items()}
 
 
 @torch.no_grad()
-def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir, args, writer=None, epoch=0):
+def evaluate(
+    model,
+    criterion,
+    postprocessors,
+    data_loader,
+    base_dataset,
+    device,
+    output_dir,
+    args,
+    viz_cfg=None,
+    tb_writer=None,
+    epoch=0,
+):
+    epoch = max(int(epoch), 0)
     model.eval()
     criterion.eval()
     metric_logger = utils.MetricLogger(delimiter='  ')
     header = 'Test:'
-    iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
-    coco_evaluator = OWEvaluator(base_ds, iou_types, args=args)
+    iou_types = ('bbox',)
+    evaluator = OWEvaluator(base_dataset, iou_types, args=args)
 
-    panoptic_evaluator = None
-    if 'panoptic' in postprocessors.keys():
-        panoptic_evaluator = PanopticEvaluator(
-            data_loader.dataset.ann_file,
-            data_loader.dataset.ann_folder,
-            output_dir=os.path.join(output_dir, 'panoptic_eval'),
-        )
-
-    vis_state = init_eval_viz_state(args) if (getattr(args, 'viz', False) and utils.is_main_process()) else None
-    vis_dir = None
-    if vis_state is not None:
-        vis_dir = os.path.join(output_dir, 'eval', 'visualizations', f'epoch_{int(epoch):04d}')
-        _ensure_dir(vis_dir)
+    visual_state = init_eval_visual_state(viz_cfg) if (viz_cfg is not None and utils.is_main_process()) else None
 
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-        outputs = model(samples)
+        targets = [{key: value.to(device) for key, value in target.items()} for target in targets]
+        outputs = _forward_model_for_evaluation(model, samples, enable_visual_debug=(visual_state is not None))
 
-        orig_target_sizes = torch.stack([t['orig_size'] for t in targets], dim=0)
-        vis_target_sizes = torch.stack([t['size'] for t in targets], dim=0)
-        results = postprocessors['bbox'](outputs, orig_target_sizes)
-        vis_results = postprocessors['bbox'](outputs, vis_target_sizes) if vis_state is not None else None
+        original_sizes = torch.stack([target['orig_size'] for target in targets], dim=0)
+        visual_sizes = torch.stack([target['size'] for target in targets], dim=0)
+        results = postprocessors['bbox'](outputs, original_sizes)
+        visual_results = postprocessors['bbox'](outputs, visual_sizes) if visual_state is not None else None
 
-        if 'segm' in postprocessors.keys():
-            target_sizes = torch.stack([t['size'] for t in targets], dim=0)
-            results = postprocessors['segm'](results, outputs, orig_target_sizes, target_sizes)
+        result_by_image_id = {target['image_id'].item(): output for target, output in zip(targets, results)}
+        evaluator.update(result_by_image_id)
 
-        res = {target['image_id'].item(): output for target, output in zip(targets, results)}
-        if coco_evaluator is not None:
-            coco_evaluator.update(res)
-
-        if panoptic_evaluator is not None:
-            res_pano = postprocessors['panoptic'](outputs, target_sizes, orig_target_sizes)
-            for i, target in enumerate(targets):
-                image_id = target['image_id'].item()
-                file_name = f'{image_id:012d}.png'
-                res_pano[i]['image_id'] = image_id
-                res_pano[i]['file_name'] = file_name
-            panoptic_evaluator.update(res_pano)
-
-        if vis_state is not None:
-            collect_eval_stats(vis_state, outputs, targets, criterion, args)
-            vis_dir = os.path.join(output_dir, 'eval', 'visualizations', f'epoch_{int(epoch):04d}')
-            save_eval_qualitative(
-                vis_state,
+        if visual_state is not None:
+            collect_eval_visual_stats(visual_state, outputs, targets, criterion, args)
+            visual_output_dir = os.path.join(output_dir, 'eval', 'visualizations', f'epoch_{int(epoch):04d}')
+            save_eval_qualitative_cases(
+                visual_state,
                 samples,
                 targets,
-                vis_results,
+                visual_results,
                 outputs,
-                criterion=criterion,
-                args=args,
-                out_dir=vis_dir,
-                writer=writer,
-                step=epoch,
+                criterion,
+                args,
+                visual_output_dir,
+                viz_cfg,
+                tb_writer=tb_writer,
+                global_step=epoch,
                 epoch=epoch,
             )
 
     metric_logger.synchronize_between_processes()
-    if coco_evaluator is not None:
-        coco_evaluator.synchronize_between_processes()
-    if panoptic_evaluator is not None:
-        panoptic_evaluator.synchronize_between_processes()
+    evaluator.synchronize_between_processes()
+    evaluator.accumulate()
+    open_world_metrics = evaluator.summarize()
 
-    if coco_evaluator is not None:
-        coco_evaluator.accumulate()
-        res = coco_evaluator.summarize()
-    else:
-        res = {}
+    stats = {key: meter.global_avg for key, meter in metric_logger.meters.items()}
+    stats['open_world_metrics'] = dict(open_world_metrics) if isinstance(open_world_metrics, dict) else {}
+    if visual_state is not None:
+        for key, value in compute_branch_correlation_metrics(visual_state).items():
+            if value is not None:
+                stats['open_world_metrics'][key] = value
+        finalize_eval_visualizations(visual_state, output_dir, epoch, viz_cfg, tb_writer=tb_writer)
 
-    panoptic_res = None
-    if panoptic_evaluator is not None:
-        panoptic_res = panoptic_evaluator.summarize()
+    if 'bbox' in postprocessors:
+        stats['coco_eval_bbox'] = evaluator.coco_eval['bbox'].stats.tolist()
 
-    stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-    stats['metrics'] = dict(res) if isinstance(res, dict) else {}
-    if vis_state is not None:
-        corr_metrics = compute_decoupling_corr_metrics(vis_state)
-        for k, v in corr_metrics.items():
-            if v is not None:
-                stats['metrics'][k] = v
-
-    if coco_evaluator is not None:
-        if 'bbox' in postprocessors.keys():
-            stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
-        if 'segm' in postprocessors.keys():
-            stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
-    if panoptic_res is not None:
-        stats['PQ_all'] = panoptic_res['All']
-        stats['PQ_th'] = panoptic_res['Things']
-        stats['PQ_st'] = panoptic_res['Stuff']
-
-    if vis_state is not None:
-        finalize_eval_visualizations(vis_state, output_dir, epoch, writer=writer)
-
-    return stats, coco_evaluator
+    return stats, evaluator

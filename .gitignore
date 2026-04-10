@@ -131,3 +131,5 @@ dmypy.json
 clip_text_feature/
 
 photos
+
+infer_output

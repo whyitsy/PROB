@@ -1415,8 +1415,7 @@ def build(args):
         two_stage=args.two_stage,
         args=args,
     )
-    if args.masks:
-        model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
+
 
     matcher = build_matcher(args)
     weight_dict = {
@@ -1444,10 +1443,6 @@ def build(args):
         weight_dict['loss_decorr'] = getattr(args, 'uod_decorr_loss_coef', 0.05)
         losses.append('decorr')
 
-    if args.masks:
-        weight_dict['loss_mask'] = args.mask_loss_coef
-        weight_dict['loss_dice'] = args.dice_loss_coef
-        losses += ['masks']
 
     if args.aux_loss:
         aux_weight_dict = {}
@@ -1491,9 +1486,5 @@ def build(args):
     )}
     exemplar_selection = ExemplarSelection(args, num_classes, matcher, invalid_cls_logits,
                                            temperature=args.obj_temp / args.hidden_dim)
-    if args.masks:
-        postprocessors['segm'] = PostProcessSegm()
-        if args.dataset_file == 'coco_panoptic':
-            is_thing_map = {i: i <= 90 for i in range(201)}
-            postprocessors['panoptic'] = PostProcessPanoptic(is_thing_map, threshold=0.85)
+
     return model, criterion, postprocessors, exemplar_selection

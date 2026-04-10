@@ -3,7 +3,7 @@ import logging
 
 
 def build_model(args, mode='owdetr'):
-    logging.info(f'Building model with mode: {mode}')
+    logging.info('Building model with mode: %s', mode)
     if mode == 'prob':
         from .prob_deformable_detr import build
     elif mode == 'uod':

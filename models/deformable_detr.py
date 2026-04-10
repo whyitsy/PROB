@@ -693,8 +693,7 @@ def build(args):
         novelty_cls=args.NC_branch,
         featdim=args.featdim,
     )
-    if args.masks:
-        model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
+
     matcher = build_matcher(args)
 
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
@@ -702,9 +701,7 @@ def build(args):
         weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_NC': args.nc_loss_coef, 'loss_bbox': args.bbox_loss_coef}
 
     weight_dict['loss_giou'] = args.giou_loss_coef
-    if args.masks:
-        weight_dict["loss_mask"] = args.mask_loss_coef
-        weight_dict["loss_dice"] = args.dice_loss_coef
+
     # TODO this is a hack
     if args.aux_loss:
         aux_weight_dict = {}
@@ -716,15 +713,9 @@ def build(args):
     losses = ['labels', 'boxes', 'cardinality']
     if args.NC_branch:
         losses = ['labels', 'NC_labels', 'boxes', 'cardinality']
-    if args.masks:
-        losses += ["masks"]
+
     criterion = SetCriterion(args, num_classes, matcher, weight_dict, losses, invalid_cls_logits, focal_alpha=args.focal_alpha)
     criterion.to(device)
     postprocessors = {'bbox': PostProcess(invalid_cls_logits, args.unk_conf_w)}
-    if args.masks:
-        postprocessors['segm'] = PostProcessSegm()
-        if args.dataset == "coco_panoptic":
-            is_thing_map = {i: i <= 90 for i in range(201)}
-            postprocessors["panoptic"] = PostProcessPanoptic(is_thing_map, threshold=0.85)
-
+    
     return model, criterion, postprocessors, None
