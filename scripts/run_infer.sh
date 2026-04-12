@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-
 # 单张图
 # python infer.py \
 #     --checkpoint /mnt/data/kky/output/PROB/exps/MOWODB/UOD_CH3_FULL/t1/checkpoint.pth \
