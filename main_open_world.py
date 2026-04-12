@@ -210,8 +210,8 @@ def get_args_parser():
     parser.add_argument('--uod_pseudo_obj_loss_coef', default=1.0, type=float)
     parser.add_argument('--uod_obj_neg_loss_coef', default=1.0, type=float)
     parser.add_argument('--uod_decorr_loss_coef', default=2.0, type=float)
-    parser.add_argument('--uod_pseudo_bbox_loss_coef', default=None, type=float)
-    parser.add_argument('--uod_pseudo_giou_loss_coef', default=None, type=float)
+    parser.add_argument('--uod_pseudo_bbox_loss_coef', default=3, type=float)
+    parser.add_argument('--uod_pseudo_giou_loss_coef', default=1, type=float)
 
     parser.add_argument('--uod_start_epoch', default=3, type=int)
     parser.add_argument('--uod_neg_warmup_epochs', default=2, type=int)
@@ -394,6 +394,7 @@ def main(args):
         model_without_ddp = model.module
 
     if args.resume:
+        logging.info('Resuming from checkpoint: %s', args.resume)
         checkpoint = torch.hub.load_state_dict_from_url(args.resume, map_location='cpu', check_hash=True) if args.resume.startswith('https') else torch.load(args.resume, map_location='cpu')
         missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         unexpected_keys = [key for key in unexpected_keys if not (key.endswith('total_params') or key.endswith('total_ops'))]
@@ -401,6 +402,9 @@ def main(args):
             logging.info('Missing keys while resuming: %s', missing_keys)
         if unexpected_keys:
             logging.info('Unexpected keys while resuming: %s', unexpected_keys)
+            
+        logging.info('epoch resumed from %d', checkpoint['epoch'])
+        args.start_epoch = checkpoint['epoch'] + 1
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             import copy
             optimizer_param_groups = copy.deepcopy(optimizer.param_groups)
@@ -412,7 +416,7 @@ def main(args):
             lr_scheduler.step_size = args.lr_drop
             lr_scheduler.base_lrs = [group['initial_lr'] for group in optimizer.param_groups]
             lr_scheduler.step(lr_scheduler.last_epoch)
-            args.start_epoch = checkpoint['epoch'] + 1
+
     elif args.pretrain:
         logging.info('Initializing from pretrain checkpoint: %s', args.pretrain)
         checkpoint = torch.load(args.pretrain, map_location='cpu')

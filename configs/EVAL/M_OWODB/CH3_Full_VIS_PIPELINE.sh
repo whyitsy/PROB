@@ -12,17 +12,17 @@ set -euo pipefail
 # ============================================================
 
 BASE_EXP_DIR="${BASE_EXP_DIR:-/mnt/data/kky/output/PROB/exps/MOWODB/UOD_CH3_FULL}"
-MANUAL_VIS_DIR="${MANUAL_VIS_DIR:-/mnt/data/kky/output/PROB/exps/MOWODB/UOD_CH3_FULL_MANUAL_VIS}"
+OUTPUTS_VIS_DIR="${OUTPUTS_VIS_DIR:-/mnt/data/kky/output/PROB/exps/OUTPUTS/MOWODB/UOD_CH3_FULL_VIS}"
 
 # Default stage list. You can override by passing stage names to the runner.
 DEFAULT_STAGES=(
   t1
-  t2
-  t2_ft
-  t3
-  t3_ft
-  t4
-  t4_ft
+  # t2
+  # t2_ft
+  # t3
+  # t3_ft
+  # t4
+  # t4_ft
 )
 
 # ------------------------------------------------------------
@@ -88,7 +88,7 @@ latest_eval_epoch_dir() {
 run_stage_eval() {
   local stage_name="$1"
   local stage_src_dir="${BASE_EXP_DIR}/${stage_name}"
-  local stage_out_dir="${MANUAL_VIS_DIR}/${stage_name}"
+  local stage_out_dir="${OUTPUTS_VIS_DIR}/${stage_name}"
   local checkpoint_path
 
   checkpoint_path="$(resolve_checkpoint "${stage_src_dir}")"
@@ -106,7 +106,7 @@ run_stage_eval() {
 run_stage_offline_visualization() {
   local stage_name="$1"
   local stage_src_dir="${BASE_EXP_DIR}/${stage_name}"
-  local stage_out_dir="${MANUAL_VIS_DIR}/${stage_name}"
+  local stage_out_dir="${OUTPUTS_VIS_DIR}/${stage_name}"
   local checkpoint_path
   local latest_eval_dir
   local stats_dir

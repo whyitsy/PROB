@@ -45,34 +45,34 @@ run_stage() {
 # ----------------
 # Task 1
 # ----------------
-run_stage "${BASE_EXP_DIR}/t1" \
-  --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
-  --train_set owdetr_t1_train \
-  --epochs 41 \
-  --uod_start_epoch 12 \
-  --lr_drop 31 \
-  --exemplar_replay_selection \
-  --exemplar_replay_max_length 850 \
-  --exemplar_replay_dir "${REPLAY_DIR}" \
-  --resume '/mnt/data/kky/output/PROB/exps/SOWODB/UOD_CH3_FULL/t1/train/checkpoints/checkpoint_latest.pth' \
-  --exemplar_replay_cur_file learned_owdetr_t1_ft.txt
+# run_stage "${BASE_EXP_DIR}/t1" \
+#   --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
+#   --train_set owdetr_t1_train \
+#   --epochs 41 \
+#   --uod_start_epoch 12 \
+#   --lr_drop 31 \
+#   --exemplar_replay_selection \
+#   --exemplar_replay_max_length 850 \
+#   --exemplar_replay_dir "${REPLAY_DIR}" \
+#   --resume '/mnt/data/kky/output/PROB/exps/SOWODB/UOD_CH3_FULL/t1/train/checkpoints/checkpoint_latest.pth' \
+#   --exemplar_replay_cur_file learned_owdetr_t1_ft.txt
 
 # ----------------
 # Task 2
 # ----------------
-run_stage "${BASE_EXP_DIR}/t2" \
-  --PREV_INTRODUCED_CLS 19 --CUR_INTRODUCED_CLS 21 \
-  --train_set owdetr_t2_train \
-  --epochs 51 \
-  --uod_start_epoch 46 \
-  --freeze_prob_model \
-  --exemplar_replay_selection \
-  --exemplar_replay_max_length 1679 \
-  --exemplar_replay_dir "${REPLAY_DIR}" \
-  --exemplar_replay_prev_file learned_owdetr_t1_ft.txt \
-  --exemplar_replay_cur_file learned_owdetr_t2_ft.txt \
-  --pretrain "${BASE_EXP_DIR}/t1/train/checkpoints/checkpoint_latest.pth" \
-  --lr 2e-5
+# run_stage "${BASE_EXP_DIR}/t2" \
+#   --PREV_INTRODUCED_CLS 19 --CUR_INTRODUCED_CLS 21 \
+#   --train_set owdetr_t2_train \
+#   --epochs 51 \
+#   --uod_start_epoch 46 \
+#   --freeze_prob_model \
+#   --exemplar_replay_selection \
+#   --exemplar_replay_max_length 1679 \
+#   --exemplar_replay_dir "${REPLAY_DIR}" \
+#   --exemplar_replay_prev_file learned_owdetr_t1_ft.txt \
+#   --exemplar_replay_cur_file learned_owdetr_t2_ft.txt \
+#   --pretrain "${BASE_EXP_DIR}/t1/train/checkpoints/checkpoint_latest.pth" \
+#   --lr 2e-5
 
 run_stage "${BASE_EXP_DIR}/t2_ft" \
   --PREV_INTRODUCED_CLS 19 --CUR_INTRODUCED_CLS 21 \

@@ -13,4 +13,4 @@ fi
 # shellcheck disable=SC1090
 source "${CONFIG_PATH}"
 
-run_visual_pipeline "$@"
+RERUN_EVAL=1 run_visual_pipeline "$@"
