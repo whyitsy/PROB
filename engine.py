@@ -48,24 +48,40 @@ def _forward_model_for_evaluation(model, samples, enable_visual_debug):
     except TypeError:
         return model(samples)
 
-
+@torch.no_grad()
 def get_exemplar_replay(model, exemplar_selection, device, data_loader):
-    metric_logger = utils.MetricLogger(delimiter='  ')
-    header = '[ExemplarReplay]'
-    print_frequency = 10
-    prefetcher = data_prefetcher(data_loader, device, prefetch=True)
+    # replay 阶段只是打分和选样本，不参与训练
+    model.eval()
+    exemplar_selection.eval()
 
+    metric_logger = utils.MetricLogger(delimiter='  ')
+    header = '[ExempReplay]'
+    print_freq = 10
+
+    # replay 阶段关闭预取，减少下一批数据常驻 GPU 的显存开销
+    prefetcher = data_prefetcher(data_loader, device, prefetch=False)
     samples, targets = prefetcher.next()
-    image_sorted_scores = {}
-    for _ in metric_logger.log_every(range(len(data_loader)), print_frequency, header):
+
+    image_sorted_scores_reduced = {}
+
+    for _ in metric_logger.log_every(range(len(data_loader)), print_freq, header):
+        if samples is None:
+            break
+
         outputs = model(samples)
-        per_batch_scores = exemplar_selection(samples, outputs, targets)
-        for item in utils.combine_dict(per_batch_scores):
-            image_sorted_scores.update(item[0])
-        metric_logger.update(processed_images=len(image_sorted_scores.keys()))
+        image_sorted_scores = exemplar_selection(samples, outputs, targets)
+
+        for i in utils.combine_dict(image_sorted_scores):
+            image_sorted_scores_reduced.update(i[0])
+
+        metric_logger.update(processed_images=len(image_sorted_scores_reduced.keys()))
+
+        # 显式释放中间变量，降低长循环中的碎片累积
+        del outputs, image_sorted_scores
         samples, targets = prefetcher.next()
-    logging.info('Collected exemplar scores for %s images', len(image_sorted_scores.keys()))
-    return image_sorted_scores
+
+    logging.info('found a total of %s images', len(image_sorted_scores_reduced.keys()))
+    return image_sorted_scores_reduced
 
 
 def train_one_epoch(

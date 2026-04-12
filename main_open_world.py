@@ -485,7 +485,7 @@ def main(args):
         checkpoint_paths = []
         if args.output_dir:
             checkpoint_paths.append(output_dir / CHECKPOINT_DIR / 'checkpoint_latest.pth')
-            should_run_evaluation = ((epoch + 1) % args.lr_drop == 0) or (epoch == 0) or (epoch == 1) or ((epoch + 1) % args.eval_every == 0)
+            should_run_evaluation = ((epoch + 1) % args.lr_drop == 0) or (epoch == 0) or (epoch == 1) or ((epoch + 1) % args.eval_every == 0 or (epoch == args.epochs - 1))
             if should_run_evaluation:
                 eval_stats, eval_evaluator = evaluate(
                     model,
