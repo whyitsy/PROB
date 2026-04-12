@@ -6,8 +6,8 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-BASE_EXP_DIR="${BASE_EXP_DIR:-/mnt/data/kky/output/PROB/exps/MOWODB/UOD_CH3_FULL}"
-OUTPUTS_VIS_DIR="${OUTPUTS_VIS_DIR:-/mnt/data/kky/output/PROB/exps/OUTPUTS/MOWODB/UOD_CH3_FULL_VIS}"
+BASE_EXP_DIR="${BASE_EXP_DIR:-/mnt/data/kky/output/PROB/exps/SOWODB/UOD_CH3_FULL}"
+OUTPUTS_VIS_DIR="${OUTPUTS_VIS_DIR:-/mnt/data/kky/output/PROB/exps/OUTPUTS/SOWODB/UOD_CH3_FULL_VIS}"
 
 DEFAULT_STAGES=(
   t1,
@@ -18,6 +18,9 @@ COMMON_EVAL_ARGS=(
   --with_box_refine
   --viz
   --eval
+  --dataset OWDETR
+  --train_set owdetr_t1_train
+  --test_set owdetr_test
 )
 
 CH3_ARGS=(
