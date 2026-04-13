@@ -45,7 +45,10 @@ def load_selected_entries(manifest_path, categories, per_category_limit):
     category_map = manifest.get('categories', {})
     for category in categories:
         entries = category_map.get(category, [])
-        selected.extend(entries[:per_category_limit])
+        if per_category_limit > 0:
+            selected.extend(entries[:per_category_limit])
+        else:
+            selected.extend(entries)
     return manifest, selected
 
 
@@ -105,11 +108,11 @@ def render_case(entry, case_dir, base_image, scores, attn_records, gate_records,
 
 def build_parser():
     parser = argparse.ArgumentParser('SVG batch renderer for mined representative cases', parents=[get_args_parser()])
-    parser.add_argument('--checkpoint', required=True, type=str, help='checkpoint path to load')
-    parser.add_argument('--manifest', required=True, type=str, help='path to representative_case_manifest.json')
-    parser.add_argument('--split', default=None, choices=['train', 'eval', None], help='override split in manifest')
+    parser.add_argument('--checkpoint', required=True, type=str)
+    parser.add_argument('--manifest', required=True, type=str)
+    parser.add_argument('--split', default=None, choices=['train', 'eval', None])
     parser.add_argument('--categories', default='known,unknown,odqe_salient', type=str)
-    parser.add_argument('--per_category_limit', default=3, type=int)
+    parser.add_argument('--per_category_limit', default=9, type=int, help='set <=0 to render all cases from each category')
     parser.add_argument('--render_modes', default='sampling,gate,joint,trajectory', type=str)
     parser.add_argument('--output_subdir', default='infer/rendered_cases', type=str)
     return parser
@@ -133,7 +136,6 @@ def main(parsed_args):
 
     train_dataset, eval_dataset = build_datasets(parsed_args)
     dataset = eval_dataset if split == 'eval' else train_dataset
-
     grouped_entries = group_entries_by_sample(entries)
     invalid_cls_logits = list(range(parsed_args.PREV_INTRODUCED_CLS + parsed_args.CUR_INTRODUCED_CLS, parsed_args.num_classes - 1))
 
@@ -166,7 +168,6 @@ def main(parsed_args):
 
         scores = compute_query_scores(outputs, parsed_args, invalid_cls_logits)
         layer_scores = compute_per_layer_scores(outputs, parsed_args, invalid_cls_logits)
-
         image_hw = target['size'].tolist() if 'size' in target else image.shape[-2:]
         image_np = to_numpy_image(image, image_hw)
         unknown_label = int(parsed_args.num_classes - 1)
@@ -191,5 +192,4 @@ def main(parsed_args):
 
 
 if __name__ == '__main__':
-    args = build_parser().parse_args()
-    main(args)
+    main(build_parser().parse_args())
