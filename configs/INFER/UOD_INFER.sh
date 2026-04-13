@@ -7,7 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 
 CHECKPOINT="${CHECKPOINT:-/mnt/data/kky/output/PROB/exps/MOWODB/UOD_CH3_FULL/t1/train/checkpoints/checkpoint_latest.pth}"
 INPUT_PATH="${INPUT_PATH:-photos}"
-OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/infer_output_v2}"
+OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/infer_output}"
 DEVICE="${DEVICE:-cuda}"
 
 KNOWN_SCORE_THRESH="${KNOWN_SCORE_THRESH:-0.35}"
@@ -18,14 +18,14 @@ MIN_SIDE_RATIO="${MIN_SIDE_RATIO:-0.03}"
 MAX_ASPECT_RATIO="${MAX_ASPECT_RATIO:-5.0}"
 SAVE_LAYER_DEBUG="${SAVE_LAYER_DEBUG:-1}"
 
-run_infer_v2() {
+run_infer() {
   local extra_args=()
   if [[ "${SAVE_LAYER_DEBUG}" == "1" ]]; then
     extra_args+=(--save_layer_debug)
   fi
 
   PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}" \
-    "${PYTHON_BIN}" "${ROOT_DIR}/infer_uod_v2.py" \
+    "${PYTHON_BIN}" "${ROOT_DIR}/infer.py" \
     --checkpoint "${CHECKPOINT}" \
     --input "${INPUT_PATH}" \
     --output_dir "${OUTPUT_DIR}" \
