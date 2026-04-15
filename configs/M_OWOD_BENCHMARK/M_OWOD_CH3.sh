@@ -3,7 +3,6 @@ set -euo pipefail
 set -x
 
 
-
 BASE_EXP_DIR="${1:-/mnt/data/kky/output/PROB/exps/MOWODB/UOD_CH3_FULL}"
 shift $(( $# > 0 ? 1 : 0 )) || true
 PY_ARGS=("$@")
@@ -56,6 +55,8 @@ run_stage "${BASE_EXP_DIR}/t1" \
   --exemplar_replay_dir "${REPLAY_DIR}" \
   --exemplar_replay_cur_file learned_owod_t1_ft.txt
 
+sleep 5
+
 # ----------------
 # Task 2
 # ----------------
@@ -73,12 +74,16 @@ run_stage "${BASE_EXP_DIR}/t2" \
   --pretrain "${BASE_EXP_DIR}/t1/checkpoint0040.pth" \
   --lr 2e-5
 
+sleep 5
+
 run_stage "${BASE_EXP_DIR}/t2_ft" \
   --PREV_INTRODUCED_CLS 20 --CUR_INTRODUCED_CLS 20 \
   --train_set "${REPLAY_DIR}/learned_owod_t2_ft" \
   --epochs 111 \
   --lr_drop 40 \
   --pretrain "${BASE_EXP_DIR}/t2/checkpoint0050.pth"
+
+sleep 5
 
 # ----------------
 # Task 3
@@ -97,12 +102,16 @@ run_stage "${BASE_EXP_DIR}/t3" \
   --pretrain "${BASE_EXP_DIR}/t2_ft/checkpoint0110.pth" \
   --lr 2e-5
 
+sleep 5
+
 run_stage "${BASE_EXP_DIR}/t3_ft" \
   --PREV_INTRODUCED_CLS 40 --CUR_INTRODUCED_CLS 20 \
   --train_set "${REPLAY_DIR}/learned_owod_t3_ft" \
   --epochs 181 \
   --lr_drop 35 \
   --pretrain "${BASE_EXP_DIR}/t3/checkpoint0120.pth"
+
+sleep 5
 
 # ----------------
 # Task 4
@@ -121,6 +130,8 @@ run_stage "${BASE_EXP_DIR}/t4" \
   --num_inst_per_class 40 \
   --pretrain "${BASE_EXP_DIR}/t3_ft/checkpoint0180.pth" \
   --lr 2e-5
+
+sleep 5
 
 run_stage "${BASE_EXP_DIR}/t4_ft" \
   --PREV_INTRODUCED_CLS 60 --CUR_INTRODUCED_CLS 20 \

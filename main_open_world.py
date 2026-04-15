@@ -213,7 +213,7 @@ def get_args_parser():
     parser.add_argument('--uod_pseudo_bbox_loss_coef', default=3, type=float)
     parser.add_argument('--uod_pseudo_giou_loss_coef', default=1, type=float)
 
-    parser.add_argument('--uod_start_epoch', default=3, type=int)
+    parser.add_argument('--uod_start_epoch', default=12, type=int)
     parser.add_argument('--uod_neg_warmup_epochs', default=2, type=int)
     parser.add_argument('--uod_min_pos_thresh', default=0.08, type=float)
     parser.add_argument('--uod_known_reject_thresh', default=0.25, type=float)
@@ -584,6 +584,29 @@ def main(args):
                     if epoch % 50 == 0:
                         torch.save(eval_evaluator.coco_eval['bbox'].eval, bbox_eval_dir / f'epoch_{epoch:04d}.pth')
 
+    # =========== [及时释放显存] ===========
+    logging.info("Training finished. Releasing training resources to free VRAM...")
+    
+    # 1. 删除优化器和学习率调度器
+    if 'optimizer' in locals():
+        del optimizer
+    if 'lr_scheduler' in locals():
+        del lr_scheduler
+        
+    # 2. loss_dict 或 outputs 等大型 Tensor
+    if 'outputs' in locals():
+        del outputs
+    if 'loss_dict' in locals():
+        del loss_dict
+
+    # 3. 最关键的一步：让 PyTorch 把闲置的显存真正还给 GPU
+    torch.cuda.empty_cache()
+    
+    import gc
+    gc.collect() # 强制 Python 进行一次垃圾回收
+    logging.info("Resources released. Proceeding to exemplar replay/evaluation.")
+    
+    
     if args.exemplar_replay_selection:
         exemplar_scores = get_exemplar_replay(model, exemplar_selection, device, train_loader)
         create_ft_dataset(args, exemplar_scores)
@@ -606,6 +629,10 @@ if __name__ == '__main__':
         raise
     finally:
         import torch.distributed as dist
-        if dist.is_initialized():
-            dist.destroy_process_group()
-            logging.info('Distributed process group destroyed successfully.')
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+                logging.info('Distributed process group destroyed successfully.')
+        except Exception as cleanup_error:
+            logging.error('Failed to destroy process group cleanly: %s', cleanup_error, exc_info=True)
+

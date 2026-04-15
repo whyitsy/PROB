@@ -48,7 +48,7 @@ def _forward_model_for_evaluation(model, samples, enable_visual_debug):
     except TypeError:
         return model(samples)
 
-@torch.no_grad()
+@torch.inference_mode()
 def get_exemplar_replay(model, exemplar_selection, device, data_loader):
     # replay 阶段只是打分和选样本，不参与训练
     model.eval()
