@@ -71,7 +71,7 @@ def get_args_parser():
     parser.add_argument('--num_feature_levels', default=4, type=int)
     parser.add_argument('--enc_layers', default=6, type=int)
     parser.add_argument('--dec_layers', default=6, type=int)
-    parser.add_argument('--dim_feedforward', default=1024, type=float)
+    parser.add_argument('--dim_feedforward', default=1024, type=int)
     parser.add_argument('--hidden_dim', default=256, type=int)
     parser.add_argument('--dropout', default=0.1, type=float)
     parser.add_argument('--nheads', default=8, type=int)
