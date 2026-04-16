@@ -79,7 +79,6 @@ def _sum_optional_floats(*values):
 def _build_output_structure(output_dir: Path):
     (output_dir / 'train').mkdir(parents=True, exist_ok=True)
     (output_dir / 'eval').mkdir(parents=True, exist_ok=True)
-    (output_dir / 'infer').mkdir(parents=True, exist_ok=True)
     (output_dir / CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
     (output_dir / TENSORBOARD_DIR).mkdir(parents=True, exist_ok=True)
 
