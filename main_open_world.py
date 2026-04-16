@@ -118,6 +118,7 @@ def get_args_parser():
     parser.add_argument('--lr_linear_proj_names', default=['reference_points', 'sampling_offsets'], type=str, nargs='+')
     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
     parser.add_argument('--batch_size', default=5, type=int)
+    parser.add_argument('--eval_batch_size', default=5, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=41, type=int)
     parser.add_argument('--lr_drop', default=35, type=int)
@@ -363,7 +364,7 @@ def main(args):
 
     train_batch_sampler = torch.utils.data.BatchSampler(train_sampler, args.batch_size, drop_last=True)
     train_loader = DataLoader(train_dataset, batch_sampler=train_batch_sampler, collate_fn=utils.collate_fn, num_workers=args.num_workers, pin_memory=True)
-    eval_loader = DataLoader(eval_dataset, args.batch_size, sampler=eval_sampler, drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers, pin_memory=True)
+    eval_loader = DataLoader(eval_dataset, args.eval_batch_size, sampler=eval_sampler, drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers, pin_memory=True)
 
     def match_name_keywords(parameter_name, keyword_list):
         return any(keyword in parameter_name for keyword in keyword_list)

@@ -4,7 +4,7 @@ set -euo pipefail
 
 BASE_EXP_DIR="${1:-/mnt/data/kky/output/PROB/exps/SOWODB/UOD_ABL_T1_CH3}"
 shift $(( $# > 0 ? 1 : 0 )) || true
-PY_ARGS="${@:1}"
+PY_ARGS=("$@")
 
 GPUS="${GPUS:-gpu}"
 

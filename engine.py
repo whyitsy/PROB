@@ -182,7 +182,7 @@ def train_one_epoch(
     return {key: meter.global_avg for key, meter in metric_logger.meters.items()}
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate(
     model,
     criterion,

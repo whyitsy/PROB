@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+
+export CUDA_VISIBLE_DEVICES=2,3
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_PATH="${ROOT_DIR}/configs/EVAL/M_OWODB/CH3_Full_VIS_PIPELINE_SVG.sh"
 
@@ -13,4 +16,4 @@ fi
 # shellcheck disable=SC1090
 source "${CONFIG_PATH}"
 
-run_visual_pipeline "$@"
+RERUN_EVAL=1 run_visual_pipeline "$@"

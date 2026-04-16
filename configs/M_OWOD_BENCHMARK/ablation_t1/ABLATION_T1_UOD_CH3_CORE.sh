@@ -4,7 +4,7 @@ set -euo pipefail
 
 BASE_EXP_DIR="${1:-/mnt/data/kky/output/PROB/exps/MOWODB/UOD_ABL_T1_CH3_CORE_O4_03}"
 shift $(( $# > 0 ? 1 : 0 )) || true
-PY_ARGS="${@:1}"
+PY_ARGS=("$@")
 
 COMMON_ARGS="\
   --dataset TOWOD \

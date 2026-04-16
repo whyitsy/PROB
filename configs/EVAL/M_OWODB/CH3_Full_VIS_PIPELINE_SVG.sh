@@ -16,6 +16,7 @@ COMMON_EVAL_ARGS=(
   --with_box_refine
   --viz
   --eval
+  --eval_batch_size 15
 )
 
 CH3_ARGS=(

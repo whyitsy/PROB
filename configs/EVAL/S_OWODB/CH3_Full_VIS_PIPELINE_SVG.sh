@@ -10,7 +10,7 @@ BASE_EXP_DIR="${BASE_EXP_DIR:-/mnt/data/kky/output/PROB/exps/SOWODB/UOD_CH3_FULL
 OUTPUTS_VIS_DIR="${OUTPUTS_VIS_DIR:-/mnt/data/kky/output/PROB/exps/OUTPUTS/SOWODB/UOD_CH3_FULL_VIS}"
 
 DEFAULT_STAGES=(
-  t1,
+  t1
 )
 
 COMMON_EVAL_ARGS=(
@@ -21,6 +21,7 @@ COMMON_EVAL_ARGS=(
   --dataset OWDETR
   --train_set owdetr_t1_train
   --test_set owdetr_test
+  --eval_batch_size 15
 )
 
 CH3_ARGS=(
@@ -52,7 +53,7 @@ resolve_checkpoint() {
     return 0
   fi
 
-  latest_epoch_ckpt="$(find "${stage_src_dir}/train/checkpoints" -maxdepth 1 -type f -name 'checkpoint_epoch_*.pth' 2>/dev/null | sort | tail -n 1 || true)"
+  latest_epoch_ckpt="${stage_src_dir}/train/checkpoints/checkpoint_latest.pth"
   if [[ -n "${latest_epoch_ckpt}" ]]; then
     printf '%s\n' "${latest_epoch_ckpt}"
     return 0
@@ -90,7 +91,7 @@ run_stage_eval() {
   torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
     "${ROOT_DIR}/main_open_world.py" \
     --output_dir "${stage_out_dir}" \
-    --resume "${checkpoint_path}" \
+    --pretrain "${checkpoint_path}" \
     "${COMMON_EVAL_ARGS[@]}" \
     "${CH3_ARGS[@]}"
 }

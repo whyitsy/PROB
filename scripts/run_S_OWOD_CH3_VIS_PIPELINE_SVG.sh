@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+export CUDA_VISIBLE_DEVICES=2,3
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_PATH="${ROOT_DIR}/configs/EVAL/S_OWODB/CH3_Full_VIS_PIPELINE_SVG.sh"
 
