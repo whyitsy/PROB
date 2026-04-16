@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-set -x
+
 set -euo pipefail
+set -x
 
 
 BASE_EXP_DIR="/mnt/data/kky/output/PROB/exps/MOWODB/UOD_ABL_T1_CH3_CORE_O4_03"

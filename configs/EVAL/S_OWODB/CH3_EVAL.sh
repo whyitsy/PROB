@@ -1,38 +1,28 @@
 #!/usr/bin/env bash
 
-set -x
+
 set -euo pipefail
+set -x
 
-# ============================================================
-# Manual visualization pipeline config for M_OWODB / CH3 runs.
-# This file follows the same split-pattern as the existing eval
-# launcher config: paths and stage logic live here, while the
-# runnable entrypoint only sources this file and calls the main
-# function.
-# ============================================================
+ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
-BASE_EXP_DIR="${BASE_EXP_DIR:-/mnt/data/kky/output/PROB/exps/MOWODB/UOD_CH3_FULL}"
-OUTPUTS_VIS_DIR="${OUTPUTS_VIS_DIR:-/mnt/data/kky/output/PROB/exps/OUTPUTS/MOWODB/UOD_CH3_FULL_VIS}"
+BASE_EXP_DIR="${BASE_EXP_DIR:-/mnt/data/kky/output/PROB/exps/SOWODB/UOD_CH3_FULL}"
+OUTPUTS_VIS_DIR="${OUTPUTS_VIS_DIR:-/mnt/data/kky/output/PROB/exps/OUTPUTS/SOWODB/UOD_CH3_FULL_VIS}"
 
-# Default stage list. You can override by passing stage names to the runner.
 DEFAULT_STAGES=(
   t1
-  # t2
-  # t2_ft
-  # t3
-  # t3_ft
-  # t4
-  # t4_ft
 )
 
-# ------------------------------------------------------------
-# Native eval entry arguments
-# ------------------------------------------------------------
 COMMON_EVAL_ARGS=(
   --model_type uod
   --with_box_refine
   --viz
   --eval
+  --dataset OWDETR
+  --train_set owdetr_t1_train
+  --test_set owdetr_test
+  --eval_batch_size 15
 )
 
 CH3_ARGS=(
@@ -42,27 +32,31 @@ CH3_ARGS=(
   --uod_enable_cls_soft_attn
 )
 
-# ------------------------------------------------------------
-# Offline visualization pipeline knobs
-# ------------------------------------------------------------
 MINE_MAX_SAMPLES="${MINE_MAX_SAMPLES:-300}"
 MINE_TOP_K="${MINE_TOP_K:-9}"
 RENDER_PER_CATEGORY_LIMIT="${RENDER_PER_CATEGORY_LIMIT:-3}"
 RENDER_CATEGORIES="${RENDER_CATEGORIES:-known,unknown,odqe_salient}"
 RENDER_MODES="${RENDER_MODES:-sampling,gate,joint,trajectory}"
-ATLAS_TILE_SIZE="${ATLAS_TILE_SIZE:-340}"
-ATLAS_COLS="${ATLAS_COLS:-3}"
 ATLAS_PER_GROUP_LIMIT="${ATLAS_PER_GROUP_LIMIT:-3}"
+RERUN_EVAL="${RERUN_EVAL:-0}"
 
-# Set to 0 if official eval outputs already exist and you only want to rerun
-# the downstream offline scripts.
-RERUN_EVAL="${RERUN_EVAL:-1}"
+run_python_module() {
+  PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}" \
+    "${PYTHON_BIN}" -m "$@"
+}
 
 resolve_checkpoint() {
   local stage_src_dir="$1"
+  local latest_epoch_ckpt
 
   if [[ -f "${stage_src_dir}/train/checkpoints/checkpoint_latest.pth" ]]; then
     printf '%s\n' "${stage_src_dir}/train/checkpoints/checkpoint_latest.pth"
+    return 0
+  fi
+
+  latest_epoch_ckpt="${stage_src_dir}/train/checkpoints/checkpoint_latest.pth"
+  if [[ -n "${latest_epoch_ckpt}" ]]; then
+    printf '%s\n' "${latest_epoch_ckpt}"
     return 0
   fi
 
@@ -71,6 +65,7 @@ resolve_checkpoint() {
     return 0
   fi
 
+  echo "Failed to resolve checkpoint under ${stage_src_dir}" >&2
   return 1
 }
 
@@ -92,13 +87,12 @@ run_stage_eval() {
   local checkpoint_path
 
   checkpoint_path="$(resolve_checkpoint "${stage_src_dir}")"
-
   mkdir -p "${stage_out_dir}"
 
   torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
-    main_open_world.py \
+    "${ROOT_DIR}/main_open_world.py" \
     --output_dir "${stage_out_dir}" \
-    --resume "${checkpoint_path}" \
+    --pretrain "${checkpoint_path}" \
     "${COMMON_EVAL_ARGS[@]}" \
     "${CH3_ARGS[@]}"
 }
@@ -117,10 +111,10 @@ run_stage_offline_visualization() {
   latest_eval_dir="$(latest_eval_epoch_dir "${stage_out_dir}")"
   stats_dir="${latest_eval_dir}/stats"
 
-  python tools/plot_uod_manifold_3d.py \
+  run_python_module tools.plot_uod_manifold_3d_svg \
     --stats_dir "${stats_dir}"
 
-  python tools/mine_representative_cases.py \
+  run_python_module tools.mine_representative_cases_svg \
     --checkpoint "${checkpoint_path}" \
     --split eval \
     --start_index 0 \
@@ -133,7 +127,7 @@ run_stage_offline_visualization() {
 
   representative_manifest="${stage_out_dir}/infer/representative_cases/representative_case_manifest.json"
 
-  python tools/render_mined_cases.py \
+  run_python_module tools.render_mined_cases_svg \
     --checkpoint "${checkpoint_path}" \
     --manifest "${representative_manifest}" \
     --categories "${RENDER_CATEGORIES}" \
@@ -146,12 +140,10 @@ run_stage_offline_visualization() {
 
   render_manifest="${stage_out_dir}/infer/rendered_cases/render_manifest.json"
 
-  python tools/organize_rendered_cases.py \
+  run_python_module tools.organize_rendered_cases_svg \
     --render_manifest "${render_manifest}" \
     --representative_manifest "${representative_manifest}" \
     --output_dir "${stage_out_dir}/infer/figure_atlas" \
-    --tile_size "${ATLAS_TILE_SIZE}" \
-    --cols "${ATLAS_COLS}" \
     --per_group_limit "${ATLAS_PER_GROUP_LIMIT}"
 }
 

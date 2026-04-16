@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-set -x
+
 set -euo pipefail
+set -x
 
-BASE_EXP_DIR="${1:-/mnt/data/kky/output/PROB/exps/SOWODB/UOD_ABL_T1_CH3}"
-shift $(( $# > 0 ? 1 : 0 )) || true
-PY_ARGS=("$@")
-
-GPUS="${GPUS:-gpu}"
+BASE_EXP_DIR="/mnt/data/kky/output/PROB/exps/SOWODB/UOD_ABL_T1_CH4"
 
 COMMON_ARGS=(
   --dataset OWDETR
@@ -16,7 +13,8 @@ COMMON_ARGS=(
   --viz
 )
 
-CH3_ARGS=(
+CH4_ARGS=(
+  --uod_enable_unknown
   --uod_enable_pseudo
   --uod_enable_batch_dynamic
   --uod_enable_cls_soft_attn
@@ -32,49 +30,36 @@ CH3_ARGS=(
 run_stage() {
   local out_dir="$1"
   shift
-  torchrun --standalone --nnodes=1 --nproc-per-node="${GPUS}" \
+  torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
     main_open_world.py \
     --output_dir "${out_dir}" \
-    "$@" \
     "${COMMON_ARGS[@]}" \
-    "${CH3_ARGS[@]}" \
-    "${PY_ARGS[@]}"
+    "${CH4_ARGS[@]}" \
+    "$@"
 }
 
-run_stage "${BASE_EXP_DIR}/C3_1_UnknownOnly" \
+
+run_stage "${BASE_EXP_DIR}/C4_1_ODQE" \
   --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
   --train_set owdetr_t1_train \
   --lr_drop 31 \
-  --uod_enable_unknown
+  --uod_enable_odqe 
 
 sleep 5
 
-run_stage "${BASE_EXP_DIR}/C3_2_Unknown_StaticPseudo" \
+run_stage "${BASE_EXP_DIR}/C4_2_Decorr" \
   --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
   --train_set owdetr_t1_train \
   --lr_drop 31 \
-  --uod_enable_unknown \
-  --uod_enable_pseudo 
+  --uod_enable_decorr
 
 sleep 5
 
-run_stage "${BASE_EXP_DIR}/C3_3_BatchDynamic" \
+run_stage "${BASE_EXP_DIR}/C4_3_ODQE_Decorr" \
   --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
   --train_set owdetr_t1_train \
   --lr_drop 31 \
-  --uod_enable_unknown \
-  --uod_enable_pseudo \
-  --uod_enable_batch_dynamic 
-
-sleep 5
-
-run_stage "${BASE_EXP_DIR}/C3_4_ClsSoftAttn" \
-  --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
-  --train_set owdetr_t1_train \
-  --lr_drop 31 \
-  --uod_enable_unknown \
-  --uod_enable_pseudo \
-  --uod_enable_batch_dynamic \
-  --uod_enable_cls_soft_attn
+  --uod_enable_odqe \
+  --uod_enable_decorr 
 
 sleep 5

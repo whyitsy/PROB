@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set -x
 
 BASE_EXP_DIR="${1:-/mnt/data/kky/output/PROB/exps/SOWODB/UOD_CH4_FULL}"
-shift $(( $# > 0 ? 1 : 0 )) || true
-PY_ARGS=("$@")
 
-REPLAY_DIR="${REPLAY_DIR:-UOD_CH4}"
-GPUS="${GPUS:-gpu}"
+REPLAY_DIR="UOD_CH4"
 
 COMMON_ARGS=(
   --dataset OWDETR
   --test_set owdetr_test
   --model_type uod
   --with_box_refine
+  --exemplar_replay_dir ${REPLAY_DIR}
   --viz
 )
 
@@ -35,7 +34,7 @@ CH4_ARGS=(
 run_stage() {
   local out_dir="$1"
   shift
-  torchrun --standalone --nnodes=1 --nproc-per-node="${GPUS}" \
+  torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
     main_open_world.py \
     --output_dir "${out_dir}" \
     "$@" \
@@ -55,7 +54,6 @@ run_stage "${BASE_EXP_DIR}/t1" \
   --lr_drop 31 \
   --exemplar_replay_selection \
   --exemplar_replay_max_length 850 \
-  --exemplar_replay_dir "${REPLAY_DIR}" \
   --exemplar_replay_cur_file learned_owdetr_t1_ft.txt
 
 sleep 5
@@ -71,7 +69,6 @@ run_stage "${BASE_EXP_DIR}/t2" \
   --freeze_prob_model \
   --exemplar_replay_selection \
   --exemplar_replay_max_length 1679 \
-  --exemplar_replay_dir "${REPLAY_DIR}" \
   --exemplar_replay_prev_file learned_owdetr_t1_ft.txt \
   --exemplar_replay_cur_file learned_owdetr_t2_ft.txt \
   --pretrain "${BASE_EXP_DIR}/t1/train/checkpoints/checkpoint_latest.pth" \
@@ -99,7 +96,6 @@ run_stage "${BASE_EXP_DIR}/t3" \
   --freeze_prob_model \
   --exemplar_replay_selection \
   --exemplar_replay_max_length 2345 \
-  --exemplar_replay_dir "${REPLAY_DIR}" \
   --exemplar_replay_prev_file learned_owdetr_t2_ft.txt \
   --exemplar_replay_cur_file learned_owdetr_t3_ft.txt \
   --pretrain "${BASE_EXP_DIR}/t2_ft/train/checkpoints/checkpoint_latest.pth" \
@@ -127,7 +123,6 @@ run_stage "${BASE_EXP_DIR}/t4" \
   --freeze_prob_model \
   --exemplar_replay_selection \
   --exemplar_replay_max_length 2664 \
-  --exemplar_replay_dir "${REPLAY_DIR}" \
   --exemplar_replay_prev_file learned_owdetr_t3_ft.txt \
   --exemplar_replay_cur_file learned_owdetr_t4_ft.txt \
   --num_inst_per_class 40 \

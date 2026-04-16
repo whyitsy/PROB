@@ -2,7 +2,7 @@
 
 echo running training of prob-detr with random exemplar selection, M-OWODB dataset
 
-set -x
+
 
 EXP_DIR=exps/MOWODB/PROB_RIL
 PY_ARGS=${@:1}
