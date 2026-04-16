@@ -7,23 +7,19 @@ import logging
 import math
 import sys
 from copy import deepcopy
-from pathlib import Path
 from typing import Iterable
-import os
 
 import torch
 
 import util.misc as utils
 from datasets.data_prefetcher import data_prefetcher
 from datasets.open_world_eval import OWEvaluator
-from visual.eval_visualizer import (
-    collect_eval_visual_stats,
-    compute_branch_correlation_metrics,
-    finalize_eval_visualizations,
+from visual.engine_hooks import (
+    collect_eval_visuals,
+    finalize_eval_visuals,
     init_eval_visual_state,
-    save_eval_qualitative_cases,
+    log_train_step_artifacts,
 )
-from visual.train_writer import write_train_step_artifacts
 
 
 def _get_output(outputs, *keys):
@@ -47,6 +43,7 @@ def _forward_model_for_evaluation(model, samples, enable_visual_debug):
         return model(samples, return_vis_debug=True)
     except TypeError:
         return model(samples)
+
 
 @torch.inference_mode()
 def get_exemplar_replay(model, exemplar_selection, device, data_loader):
@@ -92,10 +89,7 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     max_norm: float = 0.0,
-    tb_writer=None,
-    output_dir='',
-    step_metrics_file='train/metrics_step.jsonl',
-    viz_cfg=None,
+    viz_ctx=None,
     args=None,
 ):
     model.train()
@@ -128,8 +122,16 @@ def train_one_epoch(
 
         total_loss = sum(loss_dict[key] * weight_dict[key] for key in loss_dict.keys() if key in weight_dict)
         reduced_loss_dict = utils.reduce_dict(loss_dict)
-        reduced_raw_loss_dict = {key: value for key, value in reduced_loss_dict.items() if key in weight_dict or key.startswith('stat_') or key.startswith('num_')}
-        reduced_weighted_loss_dict = {key: value * weight_dict[key] for key, value in reduced_loss_dict.items() if key in weight_dict}
+        reduced_raw_loss_dict = {
+            key: value
+            for key, value in reduced_loss_dict.items()
+            if key in weight_dict or key.startswith('stat_') or key.startswith('num_')
+        }
+        reduced_weighted_loss_dict = {
+            key: value * weight_dict[key]
+            for key, value in reduced_loss_dict.items()
+            if key in weight_dict
+        }
         reduced_total_loss = sum(reduced_weighted_loss_dict.values())
         total_loss_value = reduced_total_loss.item()
 
@@ -146,26 +148,22 @@ def train_one_epoch(
             grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
         optimizer.step()
 
-        if tb_writer is not None or output_dir:
-            global_step = epoch * len(data_loader) + local_step
-            step_jsonl_path = Path(output_dir) / step_metrics_file if output_dir else Path(step_metrics_file)
-            write_train_step_artifacts(
-                tb_writer=tb_writer,
-                step_jsonl_path=step_jsonl_path,
-                global_step=global_step,
-                epoch=epoch,
-                local_step=local_step,
-                optimizer=optimizer,
-                grad_total_norm=grad_total_norm,
-                outputs=outputs,
-                targets=targets,
-                criterion=criterion,
-                total_loss=total_loss_value,
-                reduced_loss_dict=reduced_raw_loss_dict,
-                reduced_weighted_loss_dict=reduced_weighted_loss_dict,
-                viz_cfg=viz_cfg,
-                args=args,
-            )
+        global_step = epoch * len(data_loader) + local_step
+        log_train_step_artifacts(
+            viz_ctx=viz_ctx,
+            global_step=global_step,
+            epoch=epoch,
+            local_step=local_step,
+            optimizer=optimizer,
+            grad_total_norm=grad_total_norm,
+            outputs=outputs,
+            targets=targets,
+            criterion=criterion,
+            total_loss=total_loss_value,
+            reduced_loss_dict=reduced_raw_loss_dict,
+            reduced_weighted_loss_dict=reduced_weighted_loss_dict,
+            args=args,
+        )
 
         metric_logger.update(loss=total_loss_value, **reduced_weighted_loss_dict)
         for key, value in reduced_raw_loss_dict.items():
@@ -192,8 +190,7 @@ def evaluate(
     device,
     output_dir,
     args,
-    viz_cfg=None,
-    tb_writer=None,
+    viz_ctx=None,
     epoch=0,
 ):
     epoch = max(int(epoch), 0)
@@ -204,7 +201,7 @@ def evaluate(
     iou_types = ('bbox',)
     evaluator = OWEvaluator(base_dataset, iou_types, args=args)
 
-    visual_state = init_eval_visual_state(viz_cfg) if (viz_cfg is not None and utils.is_main_process()) else None
+    visual_state = init_eval_visual_state(viz_ctx)
 
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
@@ -219,23 +216,17 @@ def evaluate(
         result_by_image_id = {target['image_id'].item(): output for target, output in zip(targets, results)}
         evaluator.update(result_by_image_id)
 
-        if visual_state is not None:
-            collect_eval_visual_stats(visual_state, outputs, targets, criterion, args)
-            visual_output_dir = os.path.join(output_dir, 'eval', 'visualizations', f'epoch_{int(epoch):04d}')
-            save_eval_qualitative_cases(
-                visual_state,
-                samples,
-                targets,
-                visual_results,
-                outputs,
-                criterion,
-                args,
-                visual_output_dir,
-                viz_cfg,
-                tb_writer=tb_writer,
-                global_step=epoch,
-                epoch=epoch,
-            )
+        collect_eval_visuals(
+            viz_ctx=viz_ctx,
+            visual_state=visual_state,
+            samples=samples,
+            targets=targets,
+            visual_results=visual_results,
+            outputs=outputs,
+            criterion=criterion,
+            args=args,
+            epoch=epoch,
+        )
 
     metric_logger.synchronize_between_processes()
     evaluator.synchronize_between_processes()
@@ -244,11 +235,9 @@ def evaluate(
 
     stats = {key: meter.global_avg for key, meter in metric_logger.meters.items()}
     stats['open_world_metrics'] = dict(open_world_metrics) if isinstance(open_world_metrics, dict) else {}
-    if visual_state is not None:
-        for key, value in compute_branch_correlation_metrics(visual_state).items():
-            if value is not None:
-                stats['open_world_metrics'][key] = value
-        finalize_eval_visualizations(visual_state, output_dir, epoch, viz_cfg, tb_writer=tb_writer)
+
+    for key, value in finalize_eval_visuals(viz_ctx=viz_ctx, visual_state=visual_state, epoch=epoch).items():
+        stats['open_world_metrics'][key] = value
 
     if 'bbox' in postprocessors:
         stats['coco_eval_bbox'] = evaluator.coco_eval['bbox'].stats.tolist()

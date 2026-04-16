@@ -7,7 +7,6 @@
 import argparse
 import datetime
 import logging
-import os
 import random
 import time
 from pathlib import Path
@@ -15,7 +14,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 
 import datasets.samplers as samplers
 import util.misc as utils
@@ -24,14 +22,8 @@ from datasets.torchvision_datasets.open_world import OWDetection
 from engine import evaluate, get_exemplar_replay, train_one_epoch
 from models import build_model
 from util.log import setup_logging
-from visual.metrics_plotter import append_json_record, refresh_metric_plots
-from visual.viz_config import build_viz_cfg
-
-TRAIN_EPOCH_METRICS_FILE = 'train/metrics_epoch.jsonl'
-TRAIN_STEP_METRICS_FILE = 'train/metrics_step.jsonl'
-EVAL_EPOCH_METRICS_FILE = 'eval/metrics_epoch.jsonl'
-CHECKPOINT_DIR = 'train/checkpoints'
-TENSORBOARD_DIR = 'train/tensorboard'
+from visual.epoch_reporter import write_epoch_reports, write_eval_scalars_to_tensorboard
+from visual.viz_context import VizContext
 
 
 def _sanitize_for_checkpoint(obj):
@@ -50,61 +42,6 @@ def _sanitize_for_checkpoint(obj):
     if torch.is_tensor(obj):
         return obj.detach().cpu().tolist()
     return repr(obj)
-
-
-def _safe_float(value):
-    try:
-        return float(value)
-    except Exception:
-        return None
-
-
-def _safe_div(numerator, denominator):
-    numerator = _safe_float(numerator)
-    denominator = _safe_float(denominator)
-    if numerator is None or denominator is None or abs(denominator) < 1e-12:
-        return None
-    return float(numerator / denominator)
-
-
-def _sum_optional_floats(*values):
-    valid_values = []
-    for value in values:
-        value = _safe_float(value)
-        if value is not None:
-            valid_values.append(value)
-    return None if not valid_values else float(sum(valid_values))
-
-
-def _build_output_structure(output_dir: Path):
-    (output_dir / 'train').mkdir(parents=True, exist_ok=True)
-    (output_dir / 'eval').mkdir(parents=True, exist_ok=True)
-    (output_dir / CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
-    (output_dir / TENSORBOARD_DIR).mkdir(parents=True, exist_ok=True)
-
-
-def _create_tensorboard_writer(output_dir: Path, enable_visualization: bool):
-    if not enable_visualization or not utils.is_main_process():
-        return None
-    run_name = datetime.datetime.now().strftime('run_%Y%m%d_%H%M%S')
-    log_dir = output_dir / TENSORBOARD_DIR / run_name
-    log_dir.mkdir(parents=True, exist_ok=True)
-    tb_writer = SummaryWriter(log_dir=str(log_dir))
-    logging.info('TensorBoard log dir: %s', log_dir)
-    return tb_writer
-
-
-def _write_eval_scalars_to_tensorboard(tb_writer, eval_stats, epoch):
-    if tb_writer is None:
-        return
-    for key, value in eval_stats.items():
-        if key == 'open_world_metrics' and isinstance(value, dict):
-            for metric_name, metric_value in value.items():
-                if isinstance(metric_value, (int, float)):
-                    tag = 'A-OSE' if metric_name == 'AOSA' else metric_name
-                    tb_writer.add_scalar(f'eval/metrics/{tag}', metric_value, epoch)
-        elif isinstance(value, (int, float)):
-            tb_writer.add_scalar(f'eval/{key}', value, epoch)
 
 
 def get_args_parser():
@@ -320,9 +257,8 @@ def create_ft_dataset(args, image_sorted_scores):
 
 def main(args):
     utils.init_distributed_mode(args)
-    output_dir = Path(args.output_dir)
-    if args.output_dir:
-        _build_output_structure(output_dir)
+    viz_ctx = VizContext.from_args(args)
+    output_dir = viz_ctx.output_dir
     setup_logging(output=args.output_dir, distributed_rank=utils.get_rank(), abbrev_name='PROB')
     logging.info('Arguments:\n%s', args)
     logging.info('git:\n  %s\n', utils.get_sha())
@@ -330,291 +266,226 @@ def main(args):
     if args.resume and args.pretrain:
         logging.warning('Both --resume and --pretrain are provided. The script will use --resume and ignore --pretrain.')
 
-    viz_cfg = build_viz_cfg(args.viz)
-    tb_writer = _create_tensorboard_writer(output_dir, enable_visualization=(viz_cfg is not None and args.output_dir)) if args.output_dir else None
-    if tb_writer is not None:
-        tb_writer.add_text('args', str(args), 0)
+    viz_ctx.add_args_text(args)
 
-    device = torch.device(args.device)
-    seed = args.seed + utils.get_rank()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
+    try:
+        device = torch.device(args.device)
+        seed = args.seed + utils.get_rank()
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
 
-    model, criterion, postprocessors, exemplar_selection = build_model(args, mode=args.model_type)
-    model.to(device)
-    model_without_ddp = model
-    logging.info('%s', model_without_ddp)
-    num_trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-    logging.info('Number of trainable parameters: %s', num_trainable_parameters)
+        model, criterion, postprocessors, exemplar_selection = build_model(args, mode=args.model_type)
+        model.to(device)
+        model_without_ddp = model
+        logging.info('%s', model_without_ddp)
+        num_trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+        logging.info('Number of trainable parameters: %s', num_trainable_parameters)
 
-    train_dataset, eval_dataset = build_datasets(args)
+        train_dataset, eval_dataset = build_datasets(args)
 
-    if args.distributed:
-        if args.cache_mode:
-            train_sampler = samplers.NodeDistributedSampler(train_dataset)
-            eval_sampler = samplers.NodeDistributedSampler(eval_dataset, shuffle=False)
+        if args.distributed:
+            if args.cache_mode:
+                train_sampler = samplers.NodeDistributedSampler(train_dataset)
+                eval_sampler = samplers.NodeDistributedSampler(eval_dataset, shuffle=False)
+            else:
+                train_sampler = samplers.DistributedSampler(train_dataset)
+                eval_sampler = samplers.DistributedSampler(eval_dataset, shuffle=False)
         else:
-            train_sampler = samplers.DistributedSampler(train_dataset)
-            eval_sampler = samplers.DistributedSampler(eval_dataset, shuffle=False)
-    else:
-        train_sampler = torch.utils.data.RandomSampler(train_dataset)
-        eval_sampler = torch.utils.data.SequentialSampler(eval_dataset)
+            train_sampler = torch.utils.data.RandomSampler(train_dataset)
+            eval_sampler = torch.utils.data.SequentialSampler(eval_dataset)
 
-    train_batch_sampler = torch.utils.data.BatchSampler(train_sampler, args.batch_size, drop_last=True)
-    train_loader = DataLoader(train_dataset, batch_sampler=train_batch_sampler, collate_fn=utils.collate_fn, num_workers=args.num_workers, pin_memory=True)
-    eval_loader = DataLoader(eval_dataset, args.eval_batch_size, sampler=eval_sampler, drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers, pin_memory=True)
+        train_batch_sampler = torch.utils.data.BatchSampler(train_sampler, args.batch_size, drop_last=True)
+        train_loader = DataLoader(train_dataset, batch_sampler=train_batch_sampler, collate_fn=utils.collate_fn, num_workers=args.num_workers, pin_memory=True)
+        eval_loader = DataLoader(eval_dataset, args.eval_batch_size, sampler=eval_sampler, drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers, pin_memory=True)
 
-    def match_name_keywords(parameter_name, keyword_list):
-        return any(keyword in parameter_name for keyword in keyword_list)
+        def match_name_keywords(parameter_name, keyword_list):
+            return any(keyword in parameter_name for keyword in keyword_list)
 
-    parameter_groups = [
-        {
-            'params': [parameter for name, parameter in model_without_ddp.named_parameters() if not match_name_keywords(name, args.lr_backbone_names) and not match_name_keywords(name, args.lr_linear_proj_names) and parameter.requires_grad],
-            'lr': args.lr,
-        },
-        {
-            'params': [parameter for name, parameter in model_without_ddp.named_parameters() if match_name_keywords(name, args.lr_backbone_names) and parameter.requires_grad],
-            'lr': args.lr_backbone,
-        },
-        {
-            'params': [parameter for name, parameter in model_without_ddp.named_parameters() if match_name_keywords(name, args.lr_linear_proj_names) and parameter.requires_grad],
-            'lr': args.lr * args.lr_linear_proj_mult,
-        },
-    ]
+        parameter_groups = [
+            {
+                'params': [parameter for name, parameter in model_without_ddp.named_parameters() if not match_name_keywords(name, args.lr_backbone_names) and not match_name_keywords(name, args.lr_linear_proj_names) and parameter.requires_grad],
+                'lr': args.lr,
+            },
+            {
+                'params': [parameter for name, parameter in model_without_ddp.named_parameters() if match_name_keywords(name, args.lr_backbone_names) and parameter.requires_grad],
+                'lr': args.lr_backbone,
+            },
+            {
+                'params': [parameter for name, parameter in model_without_ddp.named_parameters() if match_name_keywords(name, args.lr_linear_proj_names) and parameter.requires_grad],
+                'lr': args.lr * args.lr_linear_proj_mult,
+            },
+        ]
 
-    if args.sgd:
-        optimizer = torch.optim.SGD(parameter_groups, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
-    else:
-        optimizer = torch.optim.AdamW(parameter_groups, lr=args.lr, weight_decay=args.weight_decay)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+        if args.sgd:
+            optimizer = torch.optim.SGD(parameter_groups, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
+        else:
+            optimizer = torch.optim.AdamW(parameter_groups, lr=args.lr, weight_decay=args.weight_decay)
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
 
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        model_without_ddp = model.module
+        if args.distributed:
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+            model_without_ddp = model.module
 
-    if args.resume:
-        logging.info('Resuming from checkpoint: %s', args.resume)
-        checkpoint = torch.hub.load_state_dict_from_url(args.resume, map_location='cpu', check_hash=True) if args.resume.startswith('https') else torch.load(args.resume, map_location='cpu')
-        missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
-        unexpected_keys = [key for key in unexpected_keys if not (key.endswith('total_params') or key.endswith('total_ops'))]
-        if missing_keys:
-            logging.info('Missing keys while resuming: %s', missing_keys)
-        if unexpected_keys:
-            logging.info('Unexpected keys while resuming: %s', unexpected_keys)
-            
-        logging.info('epoch resumed from %d', checkpoint['epoch'])
-        args.start_epoch = checkpoint['epoch'] + 1
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            import copy
-            optimizer_param_groups = copy.deepcopy(optimizer.param_groups)
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            for current_group, original_group in zip(optimizer.param_groups, optimizer_param_groups):
-                current_group['lr'] = original_group['lr']
-                current_group['initial_lr'] = original_group['initial_lr']
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            lr_scheduler.step_size = args.lr_drop
-            lr_scheduler.base_lrs = [group['initial_lr'] for group in optimizer.param_groups]
-            lr_scheduler.step(lr_scheduler.last_epoch)
+        if args.resume:
+            logging.info('Resuming from checkpoint: %s', args.resume)
+            checkpoint = torch.hub.load_state_dict_from_url(args.resume, map_location='cpu', check_hash=True) if args.resume.startswith('https') else torch.load(args.resume, map_location='cpu')
+            missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+            unexpected_keys = [key for key in unexpected_keys if not (key.endswith('total_params') or key.endswith('total_ops'))]
+            if missing_keys:
+                logging.info('Missing keys while resuming: %s', missing_keys)
+            if unexpected_keys:
+                logging.info('Unexpected keys while resuming: %s', unexpected_keys)
 
-    elif args.pretrain:
-        logging.info('Initializing from pretrain checkpoint: %s', args.pretrain)
-        checkpoint = torch.load(args.pretrain, map_location='cpu')
-        load_message = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
-        logging.info('%s', load_message)
-        args.start_epoch = checkpoint.get('epoch', -1) + 1
+            logging.info('epoch resumed from %d', checkpoint['epoch'])
+            args.start_epoch = checkpoint['epoch'] + 1
+            if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+                import copy
+                optimizer_param_groups = copy.deepcopy(optimizer.param_groups)
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                for current_group, original_group in zip(optimizer.param_groups, optimizer_param_groups):
+                    current_group['lr'] = original_group['lr']
+                    current_group['initial_lr'] = original_group['initial_lr']
+                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+                lr_scheduler.step_size = args.lr_drop
+                lr_scheduler.base_lrs = [group['initial_lr'] for group in optimizer.param_groups]
+                lr_scheduler.step(lr_scheduler.last_epoch)
 
-    if args.freeze_prob_model and hasattr(model_without_ddp, 'prob_obj_head'):
-        probability_head = model_without_ddp.prob_obj_head
-        if isinstance(probability_head, torch.nn.ModuleList):
-            for module in probability_head:
-                if hasattr(module, 'freeze_prob_model'):
-                    module.freeze_prob_model()
-        elif hasattr(probability_head, 'freeze_prob_model'):
-            probability_head.freeze_prob_model()
+        elif args.pretrain:
+            logging.info('Initializing from pretrain checkpoint: %s', args.pretrain)
+            checkpoint = torch.load(args.pretrain, map_location='cpu')
+            load_message = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+            logging.info('%s', load_message)
+            args.start_epoch = checkpoint.get('epoch', -1) + 1
 
-        if hasattr(model_without_ddp, 'known_energy_head'):
-            knownness_head = model_without_ddp.known_energy_head
-            if isinstance(knownness_head, torch.nn.ModuleList):
-                for module in knownness_head:
+        if args.freeze_prob_model and hasattr(model_without_ddp, 'prob_obj_head'):
+            probability_head = model_without_ddp.prob_obj_head
+            if isinstance(probability_head, torch.nn.ModuleList):
+                for module in probability_head:
                     if hasattr(module, 'freeze_prob_model'):
                         module.freeze_prob_model()
-            elif hasattr(knownness_head, 'freeze_prob_model'):
-                knownness_head.freeze_prob_model()
+            elif hasattr(probability_head, 'freeze_prob_model'):
+                probability_head.freeze_prob_model()
 
-    if args.eval:
-        eval_stats, eval_evaluator = evaluate(
-            model,
-            criterion,
-            postprocessors,
-            eval_loader,
-            eval_dataset,
-            device,
-            args.output_dir,
-            args,
-            viz_cfg=viz_cfg,
-            tb_writer=tb_writer,
-            epoch=max(int(args.start_epoch) - 1, 0),
-        )
-        _write_eval_scalars_to_tensorboard(tb_writer, eval_stats, args.start_epoch)
-        if tb_writer is not None:
-            tb_writer.close()
-        return
+            if hasattr(model_without_ddp, 'known_energy_head'):
+                knownness_head = model_without_ddp.known_energy_head
+                if isinstance(knownness_head, torch.nn.ModuleList):
+                    for module in knownness_head:
+                        if hasattr(module, 'freeze_prob_model'):
+                            module.freeze_prob_model()
+                elif hasattr(knownness_head, 'freeze_prob_model'):
+                    knownness_head.freeze_prob_model()
 
-    logging.info('Start training from epoch %s to %s', args.start_epoch, args.epochs)
-    training_start_time = time.time()
+        if args.eval:
+            eval_stats, _ = evaluate(
+                model,
+                criterion,
+                postprocessors,
+                eval_loader,
+                eval_dataset,
+                device,
+                args.output_dir,
+                args,
+                viz_ctx=viz_ctx,
+                epoch=max(int(args.start_epoch) - 1, 0),
+            )
+            write_eval_scalars_to_tensorboard(viz_ctx, eval_stats, args.start_epoch)
+            return
 
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
+        logging.info('Start training from epoch %s to %s', args.start_epoch, args.epochs)
+        training_start_time = time.time()
 
-        train_stats = train_one_epoch(
-            model,
-            criterion,
-            train_loader,
-            optimizer,
-            device,
-            epoch,
-            max_norm=args.clip_max_norm,
-            tb_writer=tb_writer,
-            output_dir=args.output_dir,
-            step_metrics_file=TRAIN_STEP_METRICS_FILE,
-            viz_cfg=viz_cfg,
-            args=args,
-        )
-        lr_scheduler.step()
+        for epoch in range(args.start_epoch, args.epochs):
+            if args.distributed:
+                train_sampler.set_epoch(epoch)
 
-        eval_stats = {}
-        eval_evaluator = None
-        checkpoint_paths = []
-        if args.output_dir:
-            checkpoint_paths.append(output_dir / CHECKPOINT_DIR / 'checkpoint_latest.pth')
-            should_run_evaluation = ((epoch + 1) % args.lr_drop == 0) or (epoch == 0) or (epoch == 1) or ((epoch + 1) % args.eval_every == 0 or (epoch == args.epochs - 1))
-            if should_run_evaluation:
-                eval_stats, eval_evaluator = evaluate(
-                    model,
-                    criterion,
-                    postprocessors,
-                    eval_loader,
-                    eval_dataset,
-                    device,
-                    args.output_dir,
-                    args,
-                    viz_cfg=viz_cfg,
-                    tb_writer=tb_writer,
-                    epoch=epoch,
-                )
-                _write_eval_scalars_to_tensorboard(tb_writer, eval_stats, epoch)
-                checkpoint_paths.append(output_dir / CHECKPOINT_DIR / f'checkpoint_epoch_{epoch:04d}.pth')
-            elif epoch > args.epochs - 6:
-                checkpoint_paths.append(output_dir / CHECKPOINT_DIR / f'checkpoint_epoch_{epoch:04d}.pth')
+            train_stats = train_one_epoch(
+                model,
+                criterion,
+                train_loader,
+                optimizer,
+                device,
+                epoch,
+                max_norm=args.clip_max_norm,
+                viz_ctx=viz_ctx,
+                args=args,
+            )
+            lr_scheduler.step()
 
-            checkpoint_args = _sanitize_for_checkpoint(args)
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': checkpoint_args,
-                }, checkpoint_path)
-
-        if args.output_dir and utils.is_main_process():
-            open_world_metrics = eval_stats.get('open_world_metrics', {}) if isinstance(eval_stats, dict) else {}
-            epoch_train_record = {
-                'epoch': epoch,
-                'num_trainable_parameters': num_trainable_parameters,
-                'train_total_loss': _safe_float(train_stats.get('loss')),
-                'train_lr': _safe_float(train_stats.get('lr')),
-                'train_grad_norm': _safe_float(train_stats.get('grad_norm')),
-                'train_class_error': _safe_float(train_stats.get('class_error')),
-                'train_weighted_loss_ce': _safe_float(train_stats.get('loss_ce')),
-                'train_raw_loss_ce': _safe_float(train_stats.get('loss_ce')),
-                'train_weighted_loss_bbox': _safe_float(train_stats.get('loss_bbox')),
-                'train_raw_loss_bbox': _safe_float(train_stats.get('loss_bbox')),
-                'train_weighted_loss_giou': _safe_float(train_stats.get('loss_giou')),
-                'train_raw_loss_giou': _safe_float(train_stats.get('loss_giou')),
-                'train_weighted_loss_obj_ll': _safe_float(train_stats.get('loss_obj_ll')),
-                'train_raw_loss_obj_ll': _safe_float(train_stats.get('loss_obj_ll')),
-                'train_weighted_loss_unk_known': _safe_float(train_stats.get('loss_unk_known')),
-                'train_raw_loss_unk_known': _safe_float(train_stats.get('loss_unk_known')),
-                'train_weighted_loss_obj_pseudo': _safe_float(train_stats.get('loss_obj_pseudo')),
-                'train_raw_loss_obj_pseudo': _safe_float(train_stats.get('loss_obj_pseudo')),
-                'train_weighted_loss_obj_neg': _safe_float(train_stats.get('loss_obj_neg')),
-                'train_raw_loss_obj_neg': _safe_float(train_stats.get('loss_obj_neg')),
-                'train_weighted_loss_unk_pseudo': _safe_float(train_stats.get('loss_unk_pseudo')),
-                'train_raw_loss_unk_pseudo': _safe_float(train_stats.get('loss_unk_pseudo')),
-                'train_weighted_loss_decorr': _safe_float(train_stats.get('loss_decorr')),
-                'train_raw_loss_decorr': _safe_float(train_stats.get('loss_decorr')),
-                'train_weighted_loss_bbox_pseudo_cons': _safe_float(train_stats.get('loss_bbox_pseudo_cons')),
-                'train_weighted_loss_giou_pseudo_cons': _safe_float(train_stats.get('loss_giou_pseudo_cons')),
-                'num_selected_pseudo_positive_queries': _safe_float(train_stats.get('num_selected_pseudo_positive_queries', train_stats.get('stat_num_batch_selected_pos'))),
-                'num_selected_reliable_background_queries': _safe_float(train_stats.get('num_selected_reliable_background_queries', train_stats.get('stat_num_dummy_neg'))),
-                'num_pseudo_positive_candidates': _safe_float(train_stats.get('num_pseudo_positive_candidates', train_stats.get('stat_num_pos_candidates'))),
-                'num_classification_ignored_queries': _safe_float(train_stats.get('num_classification_ignored_queries', train_stats.get('stat_num_ignore_queries'))),
-                'pseudo_positive_selection_ratio': _safe_div(train_stats.get('num_selected_pseudo_positive_queries', train_stats.get('stat_num_batch_selected_pos')), train_stats.get('num_unmatched_queries_after_filter', train_stats.get('stat_num_valid_unmatched'))),
-                'pseudo_positive_accept_ratio': _safe_div(train_stats.get('num_selected_pseudo_positive_queries', train_stats.get('stat_num_batch_selected_pos')), train_stats.get('num_pseudo_positive_candidates', train_stats.get('stat_num_pos_candidates'))),
-                'train_total_knownness_loss': _sum_optional_floats(train_stats.get('loss_unk_known'), train_stats.get('loss_unk_pseudo')),
-            }
-            epoch_eval_record = {
-                'epoch': epoch,
-                'num_trainable_parameters': num_trainable_parameters,
-                'open_world_metrics': open_world_metrics,
-            }
-            append_json_record(output_dir / TRAIN_EPOCH_METRICS_FILE, epoch_train_record)
-            if open_world_metrics:
-                append_json_record(output_dir / EVAL_EPOCH_METRICS_FILE, epoch_eval_record)
-
-            if viz_cfg is not None:
-                try:
-                    refresh_metric_plots(
-                        output_dir,
-                        train_epoch_metrics_file=TRAIN_EPOCH_METRICS_FILE,
-                        eval_epoch_metrics_file=EVAL_EPOCH_METRICS_FILE,
-                        train_step_metrics_file=TRAIN_STEP_METRICS_FILE,
+            eval_stats = {}
+            eval_evaluator = None
+            checkpoint_paths = []
+            if output_dir is not None:
+                checkpoint_paths.append(viz_ctx.checkpoint_dir / 'checkpoint_latest.pth')
+                should_run_evaluation = ((epoch + 1) % args.lr_drop == 0) or (epoch == 0) or (epoch == 1) or ((epoch + 1) % args.eval_every == 0 or (epoch == args.epochs - 1))
+                if should_run_evaluation:
+                    eval_stats, eval_evaluator = evaluate(
+                        model,
+                        criterion,
+                        postprocessors,
+                        eval_loader,
+                        eval_dataset,
+                        device,
+                        args.output_dir,
+                        args,
+                        viz_ctx=viz_ctx,
+                        epoch=epoch,
                     )
-                except Exception as error:
-                    logging.error('Failed to refresh metric plots: %s', error)
+                    write_eval_scalars_to_tensorboard(viz_ctx, eval_stats, epoch)
+                    checkpoint_paths.append(viz_ctx.checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pth')
+                elif epoch > args.epochs - 6:
+                    checkpoint_paths.append(viz_ctx.checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pth')
 
-            if eval_evaluator is not None and epoch % args.eval_every == 0 and epoch > 0:
-                bbox_eval_dir = output_dir / 'eval' / 'bbox_eval'
-                bbox_eval_dir.mkdir(parents=True, exist_ok=True)
-                if 'bbox' in eval_evaluator.coco_eval:
-                    torch.save(eval_evaluator.coco_eval['bbox'].eval, bbox_eval_dir / 'latest.pth')
-                    if epoch % 50 == 0:
-                        torch.save(eval_evaluator.coco_eval['bbox'].eval, bbox_eval_dir / f'epoch_{epoch:04d}.pth')
+                checkpoint_args = _sanitize_for_checkpoint(args)
+                for checkpoint_path in checkpoint_paths:
+                    utils.save_on_master({
+                        'model': model_without_ddp.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'epoch': epoch,
+                        'args': checkpoint_args,
+                    }, checkpoint_path)
 
-    # =========== [及时释放显存] ===========
-    logging.info("Training finished. Releasing training resources to free VRAM...")
-    
-    # 1. 删除优化器和学习率调度器
-    if 'optimizer' in locals():
-        del optimizer
-    if 'lr_scheduler' in locals():
-        del lr_scheduler
-        
-    # 2. loss_dict 或 outputs 等大型 Tensor
-    if 'outputs' in locals():
-        del outputs
-    if 'loss_dict' in locals():
-        del loss_dict
+            write_epoch_reports(
+                viz_ctx=viz_ctx,
+                epoch=epoch,
+                train_stats=train_stats,
+                eval_stats=eval_stats,
+                num_trainable_parameters=num_trainable_parameters,
+                eval_evaluator=eval_evaluator,
+                args=args,
+            )
 
-    # 3. 最关键的一步：让 PyTorch 把闲置的显存真正还给 GPU
-    torch.cuda.empty_cache()
-    
-    import gc
-    gc.collect() # 强制 Python 进行一次垃圾回收
-    logging.info("Resources released. Proceeding to exemplar replay/evaluation.")
-    
-    
-    if args.exemplar_replay_selection:
-        exemplar_scores = get_exemplar_replay(model, exemplar_selection, device, train_loader)
-        create_ft_dataset(args, exemplar_scores)
+        # =========== [及时释放显存] ===========
+        logging.info("Training finished. Releasing training resources to free VRAM...")
 
-    total_training_time = time.time() - training_start_time
-    logging.info('Training time %s', str(datetime.timedelta(seconds=int(total_training_time))))
-    if tb_writer is not None:
-        tb_writer.close()
+        # 1. 删除优化器和学习率调度器
+        if 'optimizer' in locals():
+            del optimizer
+        if 'lr_scheduler' in locals():
+            del lr_scheduler
+
+        # 2. loss_dict 或 outputs 等大型 Tensor
+        if 'outputs' in locals():
+            del outputs
+        if 'loss_dict' in locals():
+            del loss_dict
+
+        # 3. 最关键的一步：让 PyTorch 把闲置的显存真正还给 GPU
+        torch.cuda.empty_cache()
+
+        import gc
+        gc.collect()  # 强制 Python 进行一次垃圾回收
+        logging.info("Resources released. Proceeding to exemplar replay/evaluation.")
+
+        if args.exemplar_replay_selection:
+            exemplar_scores = get_exemplar_replay(model, exemplar_selection, device, train_loader)
+            create_ft_dataset(args, exemplar_scores)
+
+        total_training_time = time.time() - training_start_time
+        logging.info('Training time %s', str(datetime.timedelta(seconds=int(total_training_time))))
+    finally:
+        viz_ctx.close()
 
 
 if __name__ == '__main__':
@@ -635,4 +506,3 @@ if __name__ == '__main__':
                 logging.info('Distributed process group destroyed successfully.')
         except Exception as cleanup_error:
             logging.error('Failed to destroy process group cleanly: %s', cleanup_error, exc_info=True)
-
