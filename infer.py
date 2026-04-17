@@ -292,5 +292,6 @@ if __name__ == '__main__':
     parser.add_argument('--min_area_ratio', default=0.002, type=float)
     parser.add_argument('--min_side_ratio', default=0.03, type=float)
     parser.add_argument('--max_aspect_ratio', default=5.0, type=float)
+    parser.add_argument('--uod_postprocess_unknown_scale', default=1.0, type=float)
     parser.add_argument('--save_layer_debug', action='store_true')
     run_inference(parser.parse_args())
