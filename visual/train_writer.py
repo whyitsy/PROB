@@ -90,15 +90,6 @@ def _compute_query_score_statistics(outputs, targets, criterion, args):
     stats['train/query_stats/unknown_probability_mean'] = _safe_float(unknown_probability.mean())
     stats['train/query_stats/max_known_class_probability_mean'] = _safe_float(max_known_class_probability.mean())
 
-    gate_mean = _get_output(outputs, 'odqe_gate_mean', 'gate_mean')
-    if gate_mean is not None:
-        stats['train/query_stats/odqe_gate_mean'] = _safe_float(gate_mean)
-
-    gate_per_layer = _get_output(outputs, 'odqe_gate_mean_per_layer', 'gate_mean_per_layer')
-    if gate_per_layer is not None and torch.is_tensor(gate_per_layer):
-        for layer_index, value in enumerate(gate_per_layer.detach().flatten()):
-            stats[f'train/query_stats/odqe_gate_mean_layer_{layer_index}'] = _safe_float(value)
-
     return stats
 
 
@@ -124,17 +115,7 @@ def write_train_step_artifacts(
         'epoch': int(epoch),
         'local_step': int(local_step),
         'train/loss/total': float(total_loss),
-        'train/optim/lr': _safe_float(optimizer.param_groups[0]['lr']),
-        'train/optim/grad_norm': _safe_float(grad_total_norm),
     }
-
-    if 'class_error' in reduced_loss_dict:
-        record['train/quality/class_error'] = _safe_float(reduced_loss_dict['class_error'])
-
-    for key, value in reduced_weighted_loss_dict.items():
-        record[f'train/loss_weighted/{key}'] = _safe_float(value)
-    for key, value in reduced_loss_dict.items():
-        record[f'train/loss_raw/{key}'] = _safe_float(value)
 
     selection_count = reduced_loss_dict.get('num_selected_pseudo_positive_queries', reduced_loss_dict.get('stat_num_batch_selected_pos'))
     unmatched_count = reduced_loss_dict.get('num_unmatched_queries_after_filter', reduced_loss_dict.get('stat_num_valid_unmatched'))

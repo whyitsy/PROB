@@ -188,12 +188,10 @@ def evaluate(
     data_loader,
     base_dataset,
     device,
-    output_dir,
     args,
     viz_ctx=None,
     epoch=0,
 ):
-    epoch = max(int(epoch), 0)
     model.eval()
     criterion.eval()
     metric_logger = utils.MetricLogger(delimiter='  ')

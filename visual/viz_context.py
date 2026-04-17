@@ -84,10 +84,6 @@ class VizContext:
             return None
         return self.output_dir / 'eval' / 'bbox_eval'
 
-    def add_args_text(self, args):
-        if self.tb_writer is None:
-            return
-        self.tb_writer.add_text('args', str(args), 0)
 
     def close(self):
         if self.tb_writer is None:
