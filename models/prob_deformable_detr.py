@@ -5,7 +5,6 @@
 # ------------------------------------------------------------------------
 import copy
 import math
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -390,7 +389,6 @@ class ExemplarSelection(nn.Module):
         self.num_seen_classes = args.PREV_INTRODUCED_CLS + args.CUR_INTRODUCED_CLS
         self.invalid_cls_logits = invalid_cls_logits
         self.temperature = temperature
-        print('running with exemplar_replay_selection')
 
     def calc_energy_per_image(self, outputs, targets, indices):
         class_logits = _get_output(outputs, 'pred_class_logits', 'pred_logits').clone()

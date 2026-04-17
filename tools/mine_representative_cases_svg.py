@@ -285,20 +285,39 @@ def draw_case_tile(dataset, entry, category, tile_size=420):
     return pil
 
 
+def _fmt_gt_iou(value):
+    if value is None:
+        return 'n/a'
+    try:
+        return f'{float(value):.3f}'
+    except Exception:
+        return 'n/a'
+
+
 def save_contact_sheet_svg(dataset, entries, category, output_path):
     if not entries:
         return
     items = []
     for entry in entries:
         tile = draw_case_tile(dataset, entry, category)
-        items.append({'pil_image': tile, 'label_lines': [f'{category} | sample {entry["sample_index"]}', f'img {entry["image_id"]} q{entry["query_index"]} s={entry["category_score"]:.3f}', f'obj={entry["obj_prob"]:.3f} unk={entry["unknown_prob"]:.3f} ov={entry.get("gt_overlap", "n/a")}']})
+        items.append({
+            'pil_image': tile,
+            'label_lines': [
+                f'{category} | sample {entry["sample_index"]}',
+                f'img {entry["image_id"]} q{entry["query_index"]} s={entry["category_score"]:.3f}',
+                f'obj={entry["obj_prob"]:.3f} unk={entry["unknown_prob"]:.3f} gt_iou={_fmt_gt_iou(entry.get("gt_overlap"))}',
+            ],
+        })
     write_gallery_svg(items, output_path, title=f'{category} representative cases', mode='sampling', cols=3, tile_width=420)
 
 
 def save_category_csv(entries, output_path):
-    if not entries:
-        return
-    fieldnames = ['category', 'sample_index', 'image_id', 'query_index', 'category_score', 'selection_source', 'pseudo_weight', 'gt_overlap', 'obj_prob', 'known_prob', 'unknown_prob', 'max_known', 'known_score', 'unknown_score', 'argmax_known', 'box_cxcywh', 'gate_mean', 'gate_peak', 'gate_depth_delta']
+    fieldnames = [
+        'category', 'sample_index', 'image_id', 'query_index', 'category_score', 'selection_source',
+        'pseudo_weight', 'gt_overlap', 'obj_prob', 'known_prob', 'unknown_prob', 'max_known',
+        'known_score', 'unknown_score', 'argmax_known', 'box_cxcywh', 'gate_mean', 'gate_peak',
+        'gate_depth_delta',
+    ]
     with open(output_path, 'w', encoding='utf-8', newline='') as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
@@ -306,6 +325,40 @@ def save_category_csv(entries, output_path):
             row = entry.copy()
             row['box_cxcywh'] = json.dumps(row['box_cxcywh'])
             writer.writerow(row)
+
+
+def write_summary_markdown(out_dir, manifest, top_cases):
+    lines = [
+        '# Representative Cases Summary',
+        '',
+        'This directory summarizes the mined representative queries used for downstream rendering.',
+        '',
+        '## What `gt_overlap` means',
+        '',
+        '- `known`: IoU overlap between the selected query box and the current known-class GT boxes.',
+        '- `unknown`: IoU overlap between the selected pseudo-unknown query box and the future-unknown GT boxes.',
+        '- `odqe_salient`: the same future-unknown GT overlap, while the ranking additionally emphasizes ODQE gate salience.',
+        '',
+        'In older contact sheets this field could appear as `ov`. It is now reported more explicitly as `gt_iou`.',
+        '',
+        '## Mining run',
+        '',
+        f'- split: `{manifest.get("split", "n/a")}`',
+        f'- scanned range: `{manifest.get("start_index", "n/a")} -> {manifest.get("end_index", "n/a")}`',
+        f'- top_k per category: `{manifest.get("top_k", "n/a")}`',
+        f'- pseudo epoch used: `{manifest.get("pseudo_epoch", "n/a")}`',
+        f'- future-unknown minimum IoU: `{manifest.get("unknown_gt_min_iou", "n/a")}`',
+        '',
+        '## Category counts',
+        '',
+    ]
+    for category in ['known', 'unknown', 'odqe_salient']:
+        lines.append(f'- `{category}`: {len(top_cases.get(category, []))} cases')
+    lines.append('')
+    lines.append('If `unknown` is empty in a given run, that does **not** necessarily mean the renderer lacks unknown support.')
+    lines.append('It usually means no candidate passed the future-unknown GT overlap filter for the scanned split/range/checkpoint.')
+    lines.append('')
+    (out_dir / 'SUMMARY.md').write_text('\n'.join(lines), encoding='utf-8')
 
 
 def build_parser():
@@ -355,27 +408,59 @@ def main(parsed_args):
         known_best = _select_best_known_query(scores, device_target, criterion, parsed_args)
         if known_best is not None:
             q, rank_score, overlap = known_best
-            update_top_cases(top_cases, make_case_entry('known', sample_index, cpu_target, scores, q, rank_score, gate_records, selection_source='known_gt_overlap', gt_overlap=overlap), parsed_args.top_k)
+            update_top_cases(
+                top_cases,
+                make_case_entry(
+                    'known', sample_index, cpu_target, scores, q, rank_score, gate_records,
+                    selection_source='known_gt_overlap', gt_overlap=overlap
+                ),
+                parsed_args.top_k,
+            )
 
         unknown_candidates = _select_unknown_candidates(outputs, device_target, scores, criterion, effective_epoch)
-        filtered_unknown = _filter_candidates_by_future_unknown_gt(unknown_candidates, scores, device_target, parsed_args, parsed_args.unknown_gt_min_iou)
+        filtered_unknown = _filter_candidates_by_future_unknown_gt(
+            unknown_candidates, scores, device_target, parsed_args, parsed_args.unknown_gt_min_iou
+        )
         if filtered_unknown:
             q, score, weight, iou = filtered_unknown[0]
-            update_top_cases(top_cases, make_case_entry('unknown', sample_index, cpu_target, scores, q, score, gate_records, selection_source='future_unknown_gt_overlap', pseudo_weight=weight, gt_overlap=iou), parsed_args.top_k)
+            update_top_cases(
+                top_cases,
+                make_case_entry(
+                    'unknown', sample_index, cpu_target, scores, q, score, gate_records,
+                    selection_source='future_unknown_gt_overlap', pseudo_weight=weight, gt_overlap=iou
+                ),
+                parsed_args.top_k,
+            )
             odqe_best = _select_best_odqe_query(filtered_unknown, gate_records, scores)
             if odqe_best is not None:
                 q_odqe, signal, _, weight_odqe, iou_odqe = odqe_best
-                update_top_cases(top_cases, make_case_entry('odqe_salient', sample_index, cpu_target, scores, q_odqe, signal, gate_records, selection_source='future_unknown_gt_overlap_odqe', pseudo_weight=weight_odqe, gt_overlap=iou_odqe), parsed_args.top_k)
+                update_top_cases(
+                    top_cases,
+                    make_case_entry(
+                        'odqe_salient', sample_index, cpu_target, scores, q_odqe, signal, gate_records,
+                        selection_source='future_unknown_gt_overlap_odqe', pseudo_weight=weight_odqe, gt_overlap=iou_odqe
+                    ),
+                    parsed_args.top_k,
+                )
 
     gate_recorder.restore()
     out_dir = Path(parsed_args.output_dir) / parsed_args.output_subdir
     out_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {'split': parsed_args.split, 'start_index': int(parsed_args.start_index), 'end_index': int(end_index), 'top_k': int(parsed_args.top_k), 'pseudo_epoch': int(effective_epoch), 'unknown_gt_min_iou': float(parsed_args.unknown_gt_min_iou), 'categories': top_cases}
+    manifest = {
+        'split': parsed_args.split,
+        'start_index': int(parsed_args.start_index),
+        'end_index': int(end_index),
+        'top_k': int(parsed_args.top_k),
+        'pseudo_epoch': int(effective_epoch),
+        'unknown_gt_min_iou': float(parsed_args.unknown_gt_min_iou),
+        'categories': top_cases,
+    }
     with open(out_dir / 'representative_case_manifest.json', 'w', encoding='utf-8') as file:
         json.dump(manifest, file, ensure_ascii=False, indent=2)
     for category, entries in top_cases.items():
         save_category_csv(entries, out_dir / f'{category}_top_cases.csv')
         save_contact_sheet_svg(dataset, entries, category, out_dir / f'{category}_contact_sheet.svg')
+    write_summary_markdown(out_dir, manifest, top_cases)
     print(f'Saved representative case mining results to: {out_dir}')
 
 

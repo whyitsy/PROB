@@ -472,6 +472,7 @@ def main(args):
             logging.info("Resources released. Proceeding to exemplar replay/evaluation.")
 
             if args.exemplar_replay_selection:
+                logging.info('running with exemplar_replay_selection')
                 exemplar_scores = get_exemplar_replay(model, exemplar_selection, device, train_loader)
                 create_ft_dataset(args, exemplar_scores)
 

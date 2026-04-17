@@ -1216,7 +1216,6 @@ class ExemplarSelection(nn.Module):
         self.invalid_cls_logits = invalid_cls_logits
         self.temperature = temperature
         self.args = args
-        print('running with exemplar_replay_selection')
 
     def calc_energy_per_image(self, outputs, targets, indices):
         fused = _compute_uod_fused_probabilities(
