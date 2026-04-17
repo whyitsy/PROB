@@ -9,7 +9,7 @@ export CUDA_VISIBLE_DEVICES=1,0
 CH3_CONFIG_PATH="configs/EVAL/S_OWODB/CH3_EVAL.sh"
 source "${CH3_CONFIG_PATH}"
 
-RERUN_EVAL=0 run_visual_pipeline
+RERUN_EVAL=1 run_visual_pipeline
 
 
 
