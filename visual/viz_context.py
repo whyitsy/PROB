@@ -1,3 +1,4 @@
+
 import datetime
 import logging
 from dataclasses import dataclass
@@ -20,7 +21,6 @@ class VizContext:
     eval_epoch_metrics_file: str = 'eval/metrics_epoch.jsonl'
     checkpoint_dir_name: str = 'train/checkpoints'
     tensorboard_dir_name: str = 'train/tensorboard'
-    infer_dir_name: str = 'infer'
 
     @classmethod
     def from_args(cls, args):
@@ -84,7 +84,6 @@ class VizContext:
             return None
         return self.output_dir / 'eval' / 'bbox_eval'
 
-
     def close(self):
         if self.tb_writer is None:
             return
@@ -97,7 +96,6 @@ class VizContext:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / 'train').mkdir(parents=True, exist_ok=True)
         (self.output_dir / 'eval').mkdir(parents=True, exist_ok=True)
-        (self.output_dir / self.infer_dir_name).mkdir(parents=True, exist_ok=True)
         checkpoint_dir = self.checkpoint_dir
         if checkpoint_dir is not None:
             checkpoint_dir.mkdir(parents=True, exist_ok=True)

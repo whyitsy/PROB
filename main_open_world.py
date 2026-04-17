@@ -261,7 +261,7 @@ def main(args):
     viz_ctx = VizContext.from_args(args)
     output_dir = viz_ctx.output_dir
     setup_logging(output=args.output_dir, distributed_rank=utils.get_rank(), abbrev_name='UOD')
-    logging.info('Arguments:\n%s', pformat(vars(args), width=100, compact=True)) # vars() 将 Namespace 转为 dict
+    logging.info('Arguments:\n%s', pformat(vars(args), indent=2, width=100, compact=True, sort_dicts=False)) # vars() 将 Namespace 转为 dict
 
     if args.resume and args.pretrain:
         logging.warning('Both --resume and --pretrain are provided. The script will use --resume and ignore --pretrain.')

@@ -1,8 +1,3 @@
-# ------------------------------------------------------------------------
-# Training and evaluation loops for official PROB / UOD experiments.
-# This refactor keeps the execution order linear while moving visualization
-# and TensorBoard writing into dedicated visual/* helpers.
-# ------------------------------------------------------------------------
 import logging
 import math
 import sys
@@ -45,9 +40,31 @@ def _forward_model_for_evaluation(model, samples, enable_visual_debug):
         return model(samples)
 
 
+def _rescale_postprocessed_results(results, from_sizes, to_sizes):
+    if results is None:
+        return None
+    scaled_results = []
+    for result, from_size, to_size in zip(results, from_sizes, to_sizes):
+        scaled_result = {
+            'scores': result['scores'],
+            'labels': result['labels'],
+            'boxes': result['boxes'].clone(),
+        }
+        from_h, from_w = [float(v) for v in from_size.tolist()]
+        to_h, to_w = [float(v) for v in to_size.tolist()]
+        scale = scaled_result['boxes'].new_tensor([
+            to_w / max(from_w, 1e-6),
+            to_h / max(from_h, 1e-6),
+            to_w / max(from_w, 1e-6),
+            to_h / max(from_h, 1e-6),
+        ])
+        scaled_result['boxes'] = scaled_result['boxes'] * scale.unsqueeze(0)
+        scaled_results.append(scaled_result)
+    return scaled_results
+
+
 @torch.inference_mode()
 def get_exemplar_replay(model, exemplar_selection, device, data_loader):
-    # replay 阶段只是打分和选样本，不参与训练
     model.eval()
     exemplar_selection.eval()
 
@@ -55,7 +72,6 @@ def get_exemplar_replay(model, exemplar_selection, device, data_loader):
     header = '[ExempReplay]'
     print_freq = 10
 
-    # replay 阶段关闭预取，减少下一批数据常驻 GPU 的显存开销
     prefetcher = data_prefetcher(data_loader, device, prefetch=False)
     samples, targets = prefetcher.next()
 
@@ -68,12 +84,11 @@ def get_exemplar_replay(model, exemplar_selection, device, data_loader):
         outputs = model(samples)
         image_sorted_scores = exemplar_selection(samples, outputs, targets)
 
-        for i in utils.combine_dict(image_sorted_scores):
-            image_sorted_scores_reduced.update(i[0])
+        for item in utils.combine_dict(image_sorted_scores):
+            image_sorted_scores_reduced.update(item[0])
 
         metric_logger.update(processed_images=len(image_sorted_scores_reduced.keys()))
 
-        # 显式释放中间变量，降低长循环中的碎片累积
         del outputs, image_sorted_scores
         samples, targets = prefetcher.next()
 
@@ -122,10 +137,16 @@ def train_one_epoch(
 
         total_loss = sum(loss_dict[key] * weight_dict[key] for key in loss_dict.keys() if key in weight_dict)
         reduced_loss_dict = utils.reduce_dict(loss_dict)
+
+        reduced_stat_dict = {
+            key: value
+            for key, value in reduced_loss_dict.items()
+            if key.startswith('stat_') or key.startswith('num_') or key == 'gate_mean'
+        }
         reduced_raw_loss_dict = {
             key: value
             for key, value in reduced_loss_dict.items()
-            if key in weight_dict or key.startswith('stat_') or key.startswith('num_')
+            if key in weight_dict
         }
         reduced_weighted_loss_dict = {
             key: value * weight_dict[key]
@@ -165,9 +186,10 @@ def train_one_epoch(
             args=args,
         )
 
-        metric_logger.update(loss=total_loss_value, **reduced_weighted_loss_dict)
-        for key, value in reduced_raw_loss_dict.items():
-            metric_logger.update(**{key: value})
+        metric_logger.update(loss=total_loss_value)
+        metric_logger.update(**{f'weighted_{key}': value for key, value in reduced_weighted_loss_dict.items()})
+        metric_logger.update(**{f'raw_{key}': value for key, value in reduced_raw_loss_dict.items()})
+        metric_logger.update(**reduced_stat_dict)
         if 'class_error' in reduced_loss_dict:
             metric_logger.update(class_error=reduced_loss_dict['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]['lr'])
@@ -208,8 +230,9 @@ def evaluate(
 
         original_sizes = torch.stack([target['orig_size'] for target in targets], dim=0)
         visual_sizes = torch.stack([target['size'] for target in targets], dim=0)
+
         results = postprocessors['bbox'](outputs, original_sizes)
-        visual_results = postprocessors['bbox'](outputs, visual_sizes) if visual_state is not None else None
+        visual_results = _rescale_postprocessed_results(results, original_sizes, visual_sizes) if visual_state is not None else None
 
         result_by_image_id = {target['image_id'].item(): output for target, output in zip(targets, results)}
         evaluator.update(result_by_image_id)

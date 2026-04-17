@@ -1,3 +1,4 @@
+
 import json
 from pathlib import Path
 
@@ -67,6 +68,8 @@ def _ema(values, alpha=0.15):
 
 
 class ExperimentMetricsPlotter:
+    step_bar_interval = 1000
+
     def __init__(
         self,
         output_dir: Path,
@@ -178,35 +181,47 @@ class ExperimentMetricsPlotter:
         axis.legend(frameon=False)
         self._save(figure, 'training_total_loss', split='train')
 
-        base_series = [
+        figure, axis = plt.subplots(figsize=(11, 6))
+        for label, key, color in [
             ('classification', 'train_raw_loss_ce', PALETTE['blue']),
             ('box_l1', 'train_raw_loss_bbox', PALETTE['orange']),
             ('giou', 'train_raw_loss_giou', PALETTE['green']),
-            ('matched_objectness', 'train_weighted_loss_obj_ll', PALETTE['cyan']),
-        ]
-        figure, axis = plt.subplots(figsize=(11, 6))
-        for label, key, color in base_series:
+        ]:
             ys = [_safe_float(row.get(key)) for row in self.train_epoch_rows if row.get('epoch') is not None]
             xs = [epoch for epoch, value in zip(epochs, ys) if value is not None]
             ys = [value for value in ys if value is not None]
             if xs:
                 axis.plot(xs, ys, marker='o', linewidth=2.0, color=color, label=label)
         axis.set_xlabel('Epoch')
-        axis.set_ylabel('Loss')
+        axis.set_ylabel('Raw loss')
         axis.set_title('Base Detection Loss Components')
         axis.grid(True, alpha=0.25)
         axis.legend(frameon=False, ncol=2)
         self._save(figure, 'training_base_loss_components', split='train')
 
-        uod_series = [
+        figure, axis = plt.subplots(figsize=(10, 6))
+        ys = [_safe_float(row.get('train_raw_loss_obj_ll')) for row in self.train_epoch_rows if row.get('epoch') is not None]
+        xs = [epoch for epoch, value in zip(epochs, ys) if value is not None]
+        ys = [value for value in ys if value is not None]
+        if xs:
+            axis.plot(xs, ys, marker='o', linewidth=2.2, color=PALETTE['cyan'], label='matched_objectness')
+            axis.set_xlabel('Epoch')
+            axis.set_ylabel('Raw loss')
+            axis.set_title('Matched Objectness Loss Component')
+            axis.grid(True, alpha=0.25)
+            axis.legend(frameon=False)
+            self._save(figure, 'training_matched_objectness_loss_component', split='train')
+        else:
+            plt.close(figure)
+
+        figure, axis = plt.subplots(figsize=(11, 6))
+        plotted = False
+        for label, key, color in [
             ('matched_known_knownness', 'train_raw_loss_unk_known', PALETTE['orange']),
             ('pseudo_positive_objectness', 'train_raw_loss_obj_pseudo', PALETTE['blue']),
             ('pseudo_unknown_knownness', 'train_raw_loss_unk_pseudo', PALETTE['magenta']),
             ('branch_decorrelation', 'train_raw_loss_decorr', PALETTE['green']),
-        ]
-        figure, axis = plt.subplots(figsize=(11, 6))
-        plotted = False
-        for label, key, color in uod_series:
+        ]:
             ys = [_safe_float(row.get(key)) for row in self.train_epoch_rows if row.get('epoch') is not None]
             xs = [epoch for epoch, value in zip(epochs, ys) if value is not None]
             ys = [value for value in ys if value is not None]
@@ -215,7 +230,7 @@ class ExperimentMetricsPlotter:
                 axis.plot(xs, ys, marker='o', linewidth=2.0, color=color, label=label)
         if plotted:
             axis.set_xlabel('Epoch')
-            axis.set_ylabel('Loss')
+            axis.set_ylabel('Raw loss')
             axis.set_title('Open-World Loss Components')
             axis.grid(True, alpha=0.25)
             axis.legend(frameon=False)
@@ -253,6 +268,7 @@ class ExperimentMetricsPlotter:
             plt.close(figure)
 
         figure, axis = plt.subplots(figsize=(10, 6))
+        plotted = False
         for label, key, color in [
             ('selection_ratio', 'pseudo_positive_selection_ratio', PALETTE['cyan']),
             ('accept_ratio', 'pseudo_positive_accept_ratio', PALETTE['red']),
@@ -261,13 +277,17 @@ class ExperimentMetricsPlotter:
             xs = [epoch for epoch, value in zip(epochs, ys) if value is not None]
             ys = [value for value in ys if value is not None]
             if xs:
+                plotted = True
                 axis.plot(xs, ys, marker='o', linewidth=2.0, color=color, label=label)
-        axis.set_xlabel('Epoch')
-        axis.set_ylabel('Ratio')
-        axis.set_title('Pseudo Mining Efficiency')
-        axis.grid(True, alpha=0.25)
-        axis.legend(frameon=False)
-        self._save(figure, 'pseudo_mining_efficiency', split='train')
+        if plotted:
+            axis.set_xlabel('Epoch')
+            axis.set_ylabel('Ratio')
+            axis.set_title('Pseudo Mining Efficiency')
+            axis.grid(True, alpha=0.25)
+            axis.legend(frameon=False)
+            self._save(figure, 'pseudo_mining_efficiency', split='train')
+        else:
+            plt.close(figure)
 
     def plot_epoch_branch_correlation_metrics(self):
         if not self.eval_epoch_rows:
@@ -315,17 +335,6 @@ class ExperimentMetricsPlotter:
             ylabel='Loss',
         )
         self._plot_step_group(
-            file_stem='step_base_losses',
-            title='Step-level Base Detection Losses',
-            series=[
-                ('classification', 'train/loss_raw/loss_ce', PALETTE['blue']),
-                ('box_l1', 'train/loss_raw/loss_bbox', PALETTE['orange']),
-                ('giou', 'train/loss_raw/loss_giou', PALETTE['green']),
-                ('matched_objectness', 'train/loss_weighted/loss_obj_ll', PALETTE['cyan']),
-            ],
-            ylabel='Loss',
-        )
-        self._plot_step_group(
             file_stem='step_open_world_losses',
             title='Step-level Open-World Losses',
             series=[
@@ -334,7 +343,7 @@ class ExperimentMetricsPlotter:
                 ('pseudo_unknown_knownness', 'train/loss_raw/loss_unk_pseudo', PALETTE['magenta']),
                 ('branch_decorrelation', 'train/loss_raw/loss_decorr', PALETTE['green']),
             ],
-            ylabel='Loss',
+            ylabel='Raw loss',
         )
         self._plot_step_group(
             file_stem='step_query_score_statistics',
@@ -351,33 +360,61 @@ class ExperimentMetricsPlotter:
     def plot_step_pseudo_statistics(self):
         if not self.train_step_rows:
             return
-        self._plot_step_group(
-            file_stem='step_pseudo_mining_statistics',
-            title='Step-level Pseudo Mining Statistics',
-            series=[
-                ('selected_pseudo_positive_queries', 'train/loss_raw/num_selected_pseudo_positive_queries', PALETTE['blue']),
-                ('candidate_queries', 'train/loss_raw/num_pseudo_positive_candidates', PALETTE['green']),
-                ('selection_ratio', 'train/pseudo/selection_ratio', PALETTE['cyan']),
-                ('accept_ratio', 'train/pseudo/accept_ratio', PALETTE['red']),
-            ],
-            ylabel='Value',
-        )
+        value_keys = [
+            ('selected', 'train/pseudo/selected_queries', PALETTE['blue']),
+            ('candidates', 'train/pseudo/candidate_queries', PALETTE['green']),
+            ('reliable_bg', 'train/pseudo/reliable_background_queries', PALETTE['orange']),
+            ('ignored', 'train/pseudo/ignored_queries', PALETTE['magenta']),
+        ]
+        aggregated = self._aggregate_step_values([key for _, key, _ in value_keys], window_size=self.step_bar_interval)
+        if aggregated is None:
+            return
+        xs, data = aggregated
+        if len(xs) == 0:
+            return
+        figure, axis = plt.subplots(figsize=(13, 6.5))
+        bar_width = self.step_bar_interval * 0.18
+        offsets = np.linspace(-1.5 * bar_width, 1.5 * bar_width, num=len(value_keys))
+        for offset, (label, key, color) in zip(offsets, value_keys):
+            ys = data[key]
+            axis.bar(np.asarray(xs) + offset, ys, width=bar_width, color=color, alpha=0.9, label=label)
+        axis.set_xlabel(f'Global step (window={self.step_bar_interval})')
+        axis.set_ylabel('Average count per step')
+        axis.set_title('Pseudo Mining Counts Aggregated by Step Window')
+        axis.grid(True, axis='y', alpha=0.25)
+        axis.legend(frameon=False, ncol=2)
+        self._save(figure, 'step_pseudo_mining_counts_bars', split='train')
 
     def plot_step_auxiliary_losses(self):
         if not self.train_step_rows:
             return
-        aux_keys = sorted({
+        self._plot_step_auxiliary_family(
+            prefixes=['train/loss_raw/loss_obj_pseudo_'],
+            file_stem='step_aux_obj_pseudo_loss_trends',
+            title='Step-level Auxiliary Objectness Pseudo Loss Trends',
+        )
+        self._plot_step_auxiliary_family(
+            prefixes=['train/loss_raw/loss_unk_pseudo_'],
+            file_stem='step_aux_unk_pseudo_loss_trends',
+            title='Step-level Auxiliary Unknownness Pseudo Loss Trends',
+        )
+        self._plot_step_auxiliary_family(
+            prefixes=['train/loss_raw/loss_decorr_'],
+            file_stem='step_aux_decorr_loss_trends',
+            title='Step-level Auxiliary Decorrelation Loss Trends',
+        )
+
+    def _plot_step_auxiliary_family(self, prefixes, file_stem, title):
+        keys = sorted({
             key for row in self.train_step_rows for key in row.keys()
-            if key.startswith('train/loss_raw/loss_obj_pseudo_')
-            or key.startswith('train/loss_raw/loss_unk_pseudo_')
-            or key.startswith('train/loss_raw/loss_decorr_')
+            if any(key.startswith(prefix) for prefix in prefixes)
         })
-        if not aux_keys:
+        if not keys:
             return
         figure, axis = plt.subplots(figsize=(12, 6.5))
         colors = [PALETTE['blue'], PALETTE['orange'], PALETTE['green'], PALETTE['magenta'], PALETTE['cyan'], PALETTE['red'], PALETTE['purple']]
         plotted = False
-        for index, key in enumerate(aux_keys):
+        for index, key in enumerate(keys):
             xs = []
             ys = []
             for row in self.train_step_rows:
@@ -392,13 +429,41 @@ class ExperimentMetricsPlotter:
                 axis.plot(xs, _ema(ys, alpha=0.08), linewidth=1.8, color=colors[index % len(colors)], label=key.replace('train/loss_raw/', ''))
         if plotted:
             axis.set_xlabel('Global Step')
-            axis.set_ylabel('Loss')
-            axis.set_title('Step-level Auxiliary Loss Trends')
+            axis.set_ylabel('Raw loss')
+            axis.set_title(title)
             axis.grid(True, alpha=0.25)
             axis.legend(frameon=False, fontsize=8, ncol=2)
-            self._save(figure, 'step_auxiliary_loss_trends', split='train')
+            self._save(figure, file_stem, split='train')
         else:
             plt.close(figure)
+
+    def _aggregate_step_values(self, keys, window_size=1000):
+        valid_rows = [row for row in self.train_step_rows if row.get('global_step') is not None]
+        if not valid_rows:
+            return None
+        valid_rows = sorted(valid_rows, key=lambda item: int(item['global_step']))
+        grouped = {}
+        counts = {}
+        for row in valid_rows:
+            step = int(row['global_step'])
+            bucket_end = ((step // window_size) + 1) * window_size
+            if bucket_end not in grouped:
+                grouped[bucket_end] = {key: 0.0 for key in keys}
+                counts[bucket_end] = {key: 0 for key in keys}
+            for key in keys:
+                value = _safe_float(row.get(key))
+                if value is None:
+                    continue
+                grouped[bucket_end][key] += value
+                counts[bucket_end][key] += 1
+        xs = sorted(grouped.keys())
+        data = {}
+        for key in keys:
+            data[key] = []
+            for bucket in xs:
+                count = counts[bucket][key]
+                data[key].append(grouped[bucket][key] / max(count, 1))
+        return xs, data
 
     def _plot_step_group(self, file_stem, title, series, ylabel='Value'):
         figure, axis = plt.subplots(figsize=(12, 6.5))

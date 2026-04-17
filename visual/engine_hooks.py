@@ -1,11 +1,12 @@
+
 import util.misc as utils
 from visual.eval_visualizer import (
-    collect_eval_visual_stats,
     compute_branch_correlation_metrics,
     finalize_eval_visualizations,
     init_eval_visual_state as _init_eval_visual_state,
     save_eval_qualitative_cases,
 )
+from visual.postprocess_aligned_stats import collect_eval_visual_stats_aligned
 from visual.train_writer import write_train_step_artifacts
 
 
@@ -54,7 +55,7 @@ def init_eval_visual_state(viz_ctx):
 def collect_eval_visuals(viz_ctx, visual_state, samples, targets, visual_results, outputs, criterion, args, epoch=0):
     if viz_ctx is None or visual_state is None:
         return
-    collect_eval_visual_stats(visual_state, outputs, targets, criterion, args)
+    collect_eval_visual_stats_aligned(visual_state, outputs, targets, criterion, args)
     visual_output_dir = viz_ctx.eval_visualization_dir(epoch)
     save_eval_qualitative_cases(
         visual_state,

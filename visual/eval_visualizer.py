@@ -437,119 +437,6 @@ def init_eval_visual_state(viz_cfg):
     }
 
 
-def _append_limited(destination, values, max_length):
-    remaining = max_length - len(destination)
-    if remaining <= 0:
-        return
-    if len(values) > remaining:
-        values = values[:remaining]
-    destination.extend(values)
-
-
-def collect_eval_visual_stats(state, outputs, targets, criterion, args):
-    if len(state['objectness_probability']) >= state['max_query_samples'] and len(state['objectness_features']) >= state['max_feature_samples']:
-        return
-
-    objectness_energy = _get_output(outputs, 'pred_objectness_energy', 'pred_obj')
-    class_logits = _get_output(outputs, 'pred_class_logits', 'pred_logits')
-    if objectness_energy is None or class_logits is None:
-        return
-
-    hidden_dim = float(getattr(args, 'hidden_dim', 256))
-    objectness_temperature = float(getattr(args, 'obj_temp', 1.0)) / hidden_dim
-    objectness_probability = torch.exp(-objectness_temperature * objectness_energy.detach())
-
-    knownness_energy = _get_output(outputs, 'pred_knownness_energy', 'pred_known')
-    unknown_logit = _get_output(outputs, 'pred_unknown_logit', 'pred_unk')
-    if knownness_energy is not None:
-        knownness_temperature = float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / hidden_dim
-        knownness_probability = torch.exp(-knownness_temperature * knownness_energy.detach())
-        unknown_probability = (1.0 - knownness_probability).clamp(min=0.0, max=1.0)
-    elif unknown_logit is not None:
-        unknown_probability = torch.sigmoid(unknown_logit.detach())
-    else:
-        unknown_probability = torch.zeros_like(objectness_probability)
-
-    class_probability = class_logits.detach().sigmoid().clone()
-    invalid_class_indices = getattr(criterion, 'invalid_cls_logits', [])
-    if len(invalid_class_indices) > 0:
-        class_probability[:, :, invalid_class_indices] = 0.0
-    if class_probability.shape[-1] > 0:
-        class_probability[:, :, -1] = 0.0
-    max_known_class_probability = class_probability.max(-1).values
-
-    matcher_outputs = {
-        'pred_logits': _get_output(outputs, 'pred_class_logits', 'pred_logits'),
-        'pred_boxes': outputs['pred_boxes'],
-    }
-    matched_indices = criterion.matcher(matcher_outputs, targets)
-    matched_mask = torch.zeros_like(objectness_probability, dtype=torch.bool)
-    for batch_index, (source_indices, _) in enumerate(matched_indices):
-        if len(source_indices) > 0:
-            matched_mask[batch_index, source_indices] = True
-
-    objectness_np = objectness_probability.flatten().cpu().numpy()
-    unknown_np = unknown_probability.flatten().cpu().numpy()
-    max_known_np = max_known_class_probability.flatten().cpu().numpy()
-    matched_np = matched_mask.flatten().cpu().numpy()
-    group_np = np.where(matched_np, 0, np.where(unknown_np > 0.5, 1, 2)).astype(np.int64)
-
-    _append_limited(state['objectness_probability'], objectness_np.tolist(), state['max_query_samples'])
-    _append_limited(state['unknown_probability'], unknown_np.tolist(), state['max_query_samples'])
-    _append_limited(state['max_known_class_probability'], max_known_np.tolist(), state['max_query_samples'])
-    _append_limited(state['query_group'], group_np.tolist(), state['max_query_samples'])
-
-    objectness_features = _get_output(outputs, 'decoder_objectness_features', 'proj_obj')
-    knownness_features = _get_output(outputs, 'decoder_knownness_features', 'proj_known', 'proj_unk')
-    classification_features = _get_output(outputs, 'decoder_classification_features', 'proj_cls')
-    if objectness_features is not None and knownness_features is not None and classification_features is not None:
-        obj_feat = objectness_features.detach().flatten(0, 1).cpu().numpy()
-        known_feat = knownness_features.detach().flatten(0, 1).cpu().numpy()
-        cls_feat = classification_features.detach().flatten(0, 1).cpu().numpy()
-        feature_groups = group_np
-        remaining = state['max_feature_samples'] - len(state['objectness_features'])
-        if remaining > 0:
-            if obj_feat.shape[0] > remaining:
-                obj_feat = obj_feat[:remaining]
-                known_feat = known_feat[:remaining]
-                cls_feat = cls_feat[:remaining]
-                feature_groups = feature_groups[:remaining]
-            state['objectness_features'].extend(list(obj_feat))
-            state['knownness_features'].extend(list(known_feat))
-            state['classification_features'].extend(list(cls_feat))
-            state['feature_groups'].extend(feature_groups.tolist())
-
-    vis_debug = outputs.get('vis_debug', None)
-    if vis_debug is not None:
-        layer_objectness_probability = vis_debug.get('layer_objectness_probability', None)
-        layer_knownness_probability = vis_debug.get('layer_knownness_probability', None)
-        layer_unknown_probability = vis_debug.get('layer_unknown_probability', None)
-        layer_max_known_class_probability = vis_debug.get('layer_max_known_class_probability', None)
-        layer_count = 0
-        if layer_objectness_probability is not None:
-            layer_objectness_probability = layer_objectness_probability.detach().mean(dim=(1, 2)).cpu().numpy()
-            layer_count = 1
-            if state['layer_debug']['layer_objectness_probability_sum'] is None:
-                state['layer_debug']['layer_objectness_probability_sum'] = np.zeros_like(layer_objectness_probability, dtype=np.float64)
-            state['layer_debug']['layer_objectness_probability_sum'] += layer_objectness_probability
-        if layer_knownness_probability is not None:
-            layer_knownness_probability = layer_knownness_probability.detach().mean(dim=(1, 2)).cpu().numpy()
-            if state['layer_debug']['layer_knownness_probability_sum'] is None:
-                state['layer_debug']['layer_knownness_probability_sum'] = np.zeros_like(layer_knownness_probability, dtype=np.float64)
-            state['layer_debug']['layer_knownness_probability_sum'] += layer_knownness_probability
-        if layer_unknown_probability is not None:
-            layer_unknown_probability = layer_unknown_probability.detach().mean(dim=(1, 2)).cpu().numpy()
-            if state['layer_debug']['layer_unknown_probability_sum'] is None:
-                state['layer_debug']['layer_unknown_probability_sum'] = np.zeros_like(layer_unknown_probability, dtype=np.float64)
-            state['layer_debug']['layer_unknown_probability_sum'] += layer_unknown_probability
-        if layer_max_known_class_probability is not None:
-            layer_max_known_class_probability = layer_max_known_class_probability.detach().mean(dim=(1, 2)).cpu().numpy()
-            if state['layer_debug']['layer_max_known_class_probability_sum'] is None:
-                state['layer_debug']['layer_max_known_class_probability_sum'] = np.zeros_like(layer_max_known_class_probability, dtype=np.float64)
-            state['layer_debug']['layer_max_known_class_probability_sum'] += layer_max_known_class_probability
-        state['layer_debug']['count'] += layer_count
-
-
 def _box_iou_numpy(boxes1, boxes2):
     if boxes1 is None or boxes2 is None or len(boxes1) == 0 or len(boxes2) == 0:
         return np.zeros((0, 0), dtype=np.float32)
@@ -590,28 +477,6 @@ def _extract_error_cases(prediction_boxes, prediction_labels, ground_truth_boxes
     return errors
 
 
-def _save_panel(images_with_titles, output_path, viz_cfg):
-    tile_width = viz_cfg['panel_tile_width']
-    tile_height = viz_cfg['panel_tile_height']
-    cols = viz_cfg['panel_cols']
-    images = []
-    for image_np, title in images_with_titles:
-        image = Image.fromarray(image_np).convert('RGB').resize((tile_width, tile_height))
-        canvas = Image.new('RGB', (tile_width, tile_height), (20, 20, 20))
-        canvas.paste(image, (0, 0))
-        draw = ImageDraw.Draw(canvas)
-        font = _get_font(np.asarray(canvas), viz_cfg['font_size_scale'], viz_cfg['min_font_size'])
-        _draw_text_with_background(draw, (8, 8), title, font, (255, 255, 255))
-        images.append(canvas)
-    rows = int(math.ceil(len(images) / cols))
-    sheet = Image.new('RGB', (cols * tile_width, rows * tile_height), (15, 15, 15))
-    for index, image in enumerate(images):
-        x = (index % cols) * tile_width
-        y = (index // cols) * tile_height
-        sheet.paste(image, (x, y))
-    sheet.save(output_path)
-
-
 def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictions, outputs, criterion, args, output_dir, viz_cfg, tb_writer=None, global_step=0, epoch=0):
     epoch = max(int(epoch), 0)
     unknown_label = int(getattr(args, 'num_classes', 81) - 1)
@@ -641,7 +506,7 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
         prediction_scores = prediction['scores'].detach().cpu().numpy()
         summary_text = f'ID={image_id} | epoch={int(epoch):04d} | pred={len(prediction_boxes)} | gt={len(ground_truth_boxes)}'
 
-        final_prediction_panel = _draw_boxes(
+        final_prediction_image = _draw_boxes(
             image_np,
             viz_cfg,
             prediction_boxes=prediction_boxes,
@@ -656,19 +521,49 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
         )
         known_mask = prediction_labels != unknown_label if len(prediction_labels) > 0 else np.array([], dtype=bool)
         unknown_mask = prediction_labels == unknown_label if len(prediction_labels) > 0 else np.array([], dtype=bool)
-        prediction_known_panel = _draw_boxes(image_np, viz_cfg, prediction_boxes=prediction_boxes[known_mask], prediction_labels=prediction_labels[known_mask], prediction_scores=prediction_scores[known_mask], title='Known Predictions', summary_text=summary_text, unknown_label=unknown_label, show_legend=True)
-        prediction_unknown_panel = _draw_boxes(image_np, viz_cfg, prediction_boxes=prediction_boxes[unknown_mask], prediction_labels=prediction_labels[unknown_mask], prediction_scores=prediction_scores[unknown_mask], title='Unknown Predictions', summary_text=summary_text, unknown_label=unknown_label, show_legend=True)
-        ground_truth_panel = _draw_boxes(image_np, viz_cfg, ground_truth_boxes=ground_truth_boxes, ground_truth_labels=ground_truth_labels, title='Ground Truth', summary_text=summary_text, unknown_label=unknown_label, show_legend=True)
+        prediction_known_image = _draw_boxes(
+            image_np,
+            viz_cfg,
+            prediction_boxes=prediction_boxes[known_mask],
+            prediction_labels=prediction_labels[known_mask],
+            prediction_scores=prediction_scores[known_mask],
+            title='Known Predictions',
+            summary_text=summary_text,
+            unknown_label=unknown_label,
+            show_legend=False,
+        )
+        prediction_unknown_image = _draw_boxes(
+            image_np,
+            viz_cfg,
+            prediction_boxes=prediction_boxes[unknown_mask],
+            prediction_labels=prediction_labels[unknown_mask],
+            prediction_scores=prediction_scores[unknown_mask],
+            title='Unknown Predictions',
+            summary_text=summary_text,
+            unknown_label=unknown_label,
+            show_legend=False,
+        )
+        ground_truth_image = _draw_boxes(
+            image_np,
+            viz_cfg,
+            ground_truth_boxes=ground_truth_boxes,
+            ground_truth_labels=ground_truth_labels,
+            title='Ground Truth',
+            summary_text=summary_text,
+            unknown_label=unknown_label,
+            show_legend=False,
+        )
 
         case_prefix = f'{image_id:012d}__epoch_{int(epoch):04d}'
-        primary_panel_path = os.path.join(final_dir, f'{case_prefix}__panel.png')
-        _save_panel([
-            (ground_truth_panel, 'Ground Truth'),
-            (final_prediction_panel, 'Prediction vs GT'),
-            (prediction_known_panel, 'Known Predictions'),
-            (prediction_unknown_panel, 'Unknown Predictions'),
-        ], primary_panel_path, viz_cfg)
-        state['saved_primary_panels'].append(primary_panel_path)
+        ground_truth_path = os.path.join(final_dir, f'{case_prefix}__ground_truth.png')
+        prediction_path = os.path.join(final_dir, f'{case_prefix}__prediction_vs_gt.png')
+        known_path = os.path.join(final_dir, f'{case_prefix}__known_predictions.png')
+        unknown_path = os.path.join(final_dir, f'{case_prefix}__unknown_predictions.png')
+        _save_image(ground_truth_image, ground_truth_path)
+        _save_image(final_prediction_image, prediction_path)
+        _save_image(prediction_known_image, known_path)
+        _save_image(prediction_unknown_image, unknown_path)
+        state['saved_primary_panels'].append(prediction_path)
 
         if viz_cfg['save_error_panel']:
             errors = _extract_error_cases(prediction_boxes, prediction_labels, ground_truth_boxes, ground_truth_labels, unknown_label, viz_cfg['error_match_iou'])
@@ -676,7 +571,7 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
             u2k_gt = np.asarray(sorted(set(errors['unknown_to_known_ground_truth_indices'])), dtype=np.int64)
             k2u_pred = np.asarray(sorted(set(errors['known_to_unknown_prediction_indices'])), dtype=np.int64)
             k2u_gt = np.asarray(sorted(set(errors['known_to_unknown_ground_truth_indices'])), dtype=np.int64)
-            unknown_to_known_panel = _draw_boxes(
+            unknown_to_known_image = _draw_boxes(
                 image_np,
                 viz_cfg,
                 prediction_boxes=prediction_boxes[u2k_pred] if len(u2k_pred) > 0 else None,
@@ -687,9 +582,9 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
                 title='Error: Unknown -> Known',
                 summary_text=summary_text,
                 unknown_label=unknown_label,
-                show_legend=True,
+                show_legend=False,
             )
-            known_to_unknown_panel = _draw_boxes(
+            known_to_unknown_image = _draw_boxes(
                 image_np,
                 viz_cfg,
                 prediction_boxes=prediction_boxes[k2u_pred] if len(k2u_pred) > 0 else None,
@@ -700,16 +595,16 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
                 title='Error: Known -> Unknown',
                 summary_text=summary_text,
                 unknown_label=unknown_label,
-                show_legend=True,
+                show_legend=False,
             )
-            error_panel_path = os.path.join(final_dir, f'{case_prefix}__errors.png')
-            _save_panel([
-                (final_prediction_panel, 'Prediction vs GT'),
-                (unknown_to_known_panel, 'Error: Unknown -> Known'),
-                (known_to_unknown_panel, 'Error: Known -> Unknown'),
-                (prediction_unknown_panel, 'Unknown Predictions'),
-            ], error_panel_path, viz_cfg)
-            state['saved_error_panels'].append(error_panel_path)
+            u2k_path = os.path.join(final_dir, f'{case_prefix}__error_unknown_to_known.png')
+            k2u_path = os.path.join(final_dir, f'{case_prefix}__error_known_to_unknown.png')
+            _save_image(unknown_to_known_image, u2k_path)
+            _save_image(known_to_unknown_image, k2u_path)
+            if len(u2k_gt) > 0:
+                state['saved_error_panels'].append(u2k_path)
+            elif len(k2u_gt) > 0:
+                state['saved_error_panels'].append(k2u_path)
             state['error_rows'].append({
                 'image_id': image_id,
                 'num_predictions': int(len(prediction_boxes)),
@@ -720,21 +615,27 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
 
         if viz_cfg['save_mining_stage_panel'] and mining_debug is not None and batch_index < len(mining_debug):
             debug_item = mining_debug[batch_index]
-            stage_panel_path = os.path.join(debug_dir, f'{case_prefix}__mining_stages.png')
+            final_prediction_stage_path = os.path.join(debug_dir, f'{case_prefix}__final_prediction.png')
+            after_overlap_path = os.path.join(debug_dir, f'{case_prefix}__after_gt_overlap_filter.png')
+            after_geometry_path = os.path.join(debug_dir, f'{case_prefix}__after_geometry_filter.png')
+            candidate_path = os.path.join(debug_dir, f'{case_prefix}__pseudo_positive_candidates.png')
+            selected_pos_path = os.path.join(debug_dir, f'{case_prefix}__selected_pseudo_positives.png')
+            selected_bg_path = os.path.join(debug_dir, f'{case_prefix}__reliable_background_queries.png')
             stage_images = [
-                (final_prediction_panel, 'Final prediction'),
-                (_draw_stage_boxes(image_np, viz_cfg, debug_item.get('after_gt_overlap_filter_boxes', []), 'After GT-overlap filter', COLOR['pseudo_positive_candidate']), 'After GT-overlap filter'),
-                (_draw_stage_boxes(image_np, viz_cfg, debug_item.get('after_geometry_filter_boxes', []), 'After geometry filter', COLOR['pseudo_positive_candidate']), 'After geometry filter'),
-                (_draw_stage_boxes(image_np, viz_cfg, debug_item.get('candidate_boxes_before_selection', []), 'Pseudo-positive candidates', COLOR['pseudo_positive_candidate'], debug_item.get('candidate_score_texts')), 'Pseudo-positive candidates'),
-                (_draw_stage_boxes(image_np, viz_cfg, debug_item.get('selected_pseudo_positive_boxes', []), 'Selected pseudo positives', COLOR['pseudo_positive_selected']), 'Selected pseudo positives'),
-                (_draw_stage_boxes(image_np, viz_cfg, debug_item.get('selected_reliable_background_boxes', []), 'Reliable background queries', COLOR['reliable_background_selected']), 'Reliable background queries'),
+                (final_prediction_stage_path, final_prediction_image),
+                (after_overlap_path, _draw_stage_boxes(image_np, viz_cfg, debug_item.get('after_gt_overlap_filter_boxes', []), 'After GT-overlap filter', COLOR['pseudo_positive_candidate'])),
+                (after_geometry_path, _draw_stage_boxes(image_np, viz_cfg, debug_item.get('after_geometry_filter_boxes', []), 'After geometry filter', COLOR['pseudo_positive_candidate'])),
+                (candidate_path, _draw_stage_boxes(image_np, viz_cfg, debug_item.get('candidate_boxes_before_selection', []), 'Pseudo-positive candidates', COLOR['pseudo_positive_candidate'], debug_item.get('candidate_score_texts'))),
+                (selected_pos_path, _draw_stage_boxes(image_np, viz_cfg, debug_item.get('selected_pseudo_positive_boxes', []), 'Selected pseudo positives', COLOR['pseudo_positive_selected'])),
+                (selected_bg_path, _draw_stage_boxes(image_np, viz_cfg, debug_item.get('selected_reliable_background_boxes', []), 'Reliable background queries', COLOR['reliable_background_selected'])),
             ]
-            _save_panel(stage_images, stage_panel_path, viz_cfg)
-            state['saved_stage_panels'].append(stage_panel_path)
+            for stage_path, stage_image in stage_images:
+                _save_image(stage_image, stage_path)
+            state['saved_stage_panels'].append(final_prediction_stage_path)
 
         if tb_writer is not None and state['saved_case_count'] < viz_cfg['max_tensorboard_cases']:
-            tb_writer.add_image(f'eval_qualitative/{image_id:012d}_panel', np.array(Image.open(primary_panel_path)), global_step=global_step, dataformats='HWC')
-
+            tb_writer.add_image(f'eval_qualitative/{image_id:012d}_prediction_vs_gt', final_prediction_image, global_step=global_step, dataformats='HWC')
+            tb_writer.add_image(f'eval_qualitative/{image_id:012d}_ground_truth', ground_truth_image, global_step=global_step, dataformats='HWC')
         state['saved_case_count'] += 1
 
 
@@ -792,6 +693,6 @@ def finalize_eval_visualizations(state, output_dir, epoch, viz_cfg, tb_writer=No
         _plot_feature_embeddings(state, stats_dir, viz_cfg, tb_writer, epoch)
 
     if viz_cfg['save_contact_sheet']:
-        _save_contact_sheet(state['saved_primary_panels'], os.path.join(final_dir, 'primary_panels_contact_sheet.png'), viz_cfg)
-        _save_contact_sheet(state['saved_error_panels'], os.path.join(final_dir, 'error_panels_contact_sheet.png'), viz_cfg)
+        _save_contact_sheet(state['saved_primary_panels'], os.path.join(final_dir, 'prediction_vs_gt_contact_sheet.png'), viz_cfg)
+        _save_contact_sheet(state['saved_error_panels'], os.path.join(final_dir, 'error_cases_contact_sheet.png'), viz_cfg)
         _save_contact_sheet(state['saved_stage_panels'], os.path.join(debug_dir, 'mining_stage_panels_contact_sheet.png'), viz_cfg)

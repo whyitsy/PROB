@@ -22,7 +22,7 @@ COMMON_EVAL_ARGS=(
   --dataset OWDETR
   --train_set owdetr_t1_train
   --test_set owdetr_test
-  --eval_batch_size 15
+  --eval_batch_size 10
 )
 
 CH3_ARGS=(
