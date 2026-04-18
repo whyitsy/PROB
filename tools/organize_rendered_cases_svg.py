@@ -3,7 +3,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-from tools.figure_svg_utils import write_gallery_svg
+from util.visual.helper import write_gallery_svg
 
 DEFAULT_CHAPTER_SPECS = {
     'chapter3': {
@@ -62,24 +62,26 @@ def enrich_cases(render_manifest, representative_lookup):
         rendered_by_mode = defaultdict(list)
         for path_str in case.get('rendered_files', []):
             rendered_by_mode[infer_mode(path_str)].append(path_str)
-        enriched.append({
-            'category': category,
-            'sample_index': sample_index,
-            'image_id': int(case.get('image_id', sample_index)),
-            'query_index': query_index,
-            'query_kind': case.get('query_kind', category),
-            'case_dir': case.get('case_dir'),
-            'rendered_files': case.get('rendered_files', []),
-            'rendered_by_mode': dict(rendered_by_mode),
-            'category_score': float(rep_entry.get('category_score', -1.0)),
-            'obj_prob': rep_entry.get('obj_prob'),
-            'unknown_prob': rep_entry.get('unknown_prob'),
-            'max_known': rep_entry.get('max_known'),
-            'known_score': rep_entry.get('known_score'),
-            'unknown_score': rep_entry.get('unknown_score'),
-            'gate_mean': rep_entry.get('gate_mean'),
-            'gate_depth_delta': rep_entry.get('gate_depth_delta'),
-        })
+        enriched.append(
+            {
+                'category': category,
+                'sample_index': sample_index,
+                'image_id': int(case.get('image_id', sample_index)),
+                'query_index': query_index,
+                'query_kind': case.get('query_kind', category),
+                'case_dir': case.get('case_dir'),
+                'rendered_files': case.get('rendered_files', []),
+                'rendered_by_mode': dict(rendered_by_mode),
+                'category_score': float(rep_entry.get('category_score', -1.0)),
+                'obj_prob': rep_entry.get('obj_prob'),
+                'unknown_prob': rep_entry.get('unknown_prob'),
+                'max_known': rep_entry.get('max_known'),
+                'known_score': rep_entry.get('known_score'),
+                'unknown_score': rep_entry.get('unknown_score'),
+                'gate_mean': rep_entry.get('gate_mean'),
+                'gate_depth_delta': rep_entry.get('gate_depth_delta'),
+            }
+        )
     enriched.sort(key=lambda item: (item['category'], -item['category_score'], item['sample_index'], item['query_index']))
     return enriched
 
@@ -115,11 +117,7 @@ def select_board_items(entries, categories, modes, per_group_limit):
             for mode in modes:
                 paths = entry.get('rendered_by_mode', {}).get(mode, [])
                 if paths:
-                    items.append({
-                        'image_path': paths[0],
-                        'label_lines': _label_lines(entry, mode),
-                        'mode': mode,
-                    })
+                    items.append({'image_path': paths[0], 'label_lines': _label_lines(entry, mode), 'mode': mode})
     return items
 
 
@@ -219,13 +217,7 @@ def main(args):
         'render_manifest': str(args.render_manifest),
         'representative_manifest': str(args.representative_manifest) if args.representative_manifest else None,
         'num_cases': len(entries),
-        'boards': [
-            {
-                'title': title,
-                'path': str(path),
-            }
-            for title, path in board_paths
-        ],
+        'boards': [{'title': title, 'path': str(path)} for title, path in board_paths],
         'categories': sorted({entry['category'] for entry in entries}),
     }
     with open(output_dir / 'atlas_manifest.json', 'w', encoding='utf-8') as file:
