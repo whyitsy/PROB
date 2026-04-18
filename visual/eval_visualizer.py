@@ -1,7 +1,6 @@
 import csv
 import math
 import os
-import textwrap
 from pathlib import Path
 
 import matplotlib
@@ -17,6 +16,7 @@ from util import box_ops
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
 COLOR = {
     'prediction_known': '#00A65A',
     'prediction_unknown': '#D81B60',
@@ -28,10 +28,12 @@ COLOR = {
     'semantic_known': '#00A65A',
     'semantic_unknown': '#F39C12',
 }
+
 GROUP_NAMES = ['matched-known', 'unmatched-high-unknown', 'other-unmatched']
 GROUP_COLORS = [COLOR['matched_known'], COLOR['high_unknown_unmatched'], COLOR['other_unmatched']]
 SEMANTIC_NAMES = ['matched-known-gt', 'matched-unknown-gt']
 SEMANTIC_COLORS = [COLOR['semantic_known'], COLOR['semantic_unknown']]
+
 QUERY_STATS_COLUMNS = [
     'objectness_probability',
     'unknown_probability',
@@ -46,6 +48,7 @@ QUERY_STATS_COLUMNS = [
     'image_id',
     'query_index',
 ]
+
 FEATURE_METADATA_COLUMNS = [
     'feature_groups',
     'feature_is_matched',
@@ -129,104 +132,57 @@ def _ground_truth_text(label, unknown_label):
     return f'GT-K[{int(label)}]'
 
 
-def _build_legend_items():
-    return [
-        ('Pred Known', COLOR['prediction_known']),
-        ('Pred Unknown', COLOR['prediction_unknown']),
-        ('GT Known', COLOR['ground_truth_known']),
-        ('GT Unknown', COLOR['ground_truth_unknown']),
-    ]
+def _build_legend_items(include_predictions=False, include_ground_truth=False):
+    items = []
+    if include_predictions:
+        items.extend([
+            ('Pred Known', COLOR['prediction_known']),
+            ('Pred Unknown', COLOR['prediction_unknown']),
+        ])
+    if include_ground_truth:
+        items.extend([
+            ('GT Known', COLOR['ground_truth_known']),
+            ('GT Unknown', COLOR['ground_truth_unknown']),
+        ])
+    return items
 
 
-def _wrap_lines(draw, lines, font, width_limit):
-    wrapped = []
-    for line in lines:
-        line = '' if line is None else str(line)
-        if not line:
-            wrapped.append('')
-            continue
-        words = line.split()
-        current = words[0] if words else ''
-        for word in words[1:]:
-            candidate = f'{current} {word}'.strip()
-            bbox = draw.textbbox((0, 0), candidate, font=font)
-            if (bbox[2] - bbox[0]) <= width_limit:
-                current = candidate
-            else:
-                wrapped.append(current)
-                current = word
-        if current:
-            wrapped.append(current)
-    return wrapped or ['']
+def _draw_overlay_legend(base_image, legend_items, viz_cfg):
+    if not legend_items:
+        return base_image
+    image = base_image.convert('RGBA')
+    overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    ref = max(image.size)
+    font = _get_font(ref, viz_cfg['legend_font_size_scale'], viz_cfg['min_font_size'])
+    box_size = max(12, int(ref * 0.014))
+    line_gap = max(6, int(ref * 0.006))
+    inner_pad = max(10, int(ref * 0.010))
+    margin = max(10, int(ref * 0.012))
 
+    dummy = ImageDraw.Draw(Image.new('RGBA', (16, 16), (0, 0, 0, 0)))
+    max_text_width = 0
+    total_height = inner_pad * 2
+    for label, _ in legend_items:
+        bbox = dummy.textbbox((0, 0), label, font=font)
+        max_text_width = max(max_text_width, bbox[2] - bbox[0])
+        total_height += max(box_size, bbox[3] - bbox[1]) + line_gap
+    total_height -= line_gap
+    panel_width = inner_pad * 3 + box_size + max_text_width
+    x2 = image.size[0] - margin
+    x1 = x2 - panel_width
+    y1 = margin
+    y2 = y1 + total_height
+    draw.rounded_rectangle([x1, y1, x2, y2], radius=10, fill=(18, 20, 28, 210), outline=(78, 82, 90, 235), width=2)
 
-def _estimate_header_height(image_np, header_sections, viz_cfg, include_legend):
-    ref = max(image_np.shape[0], image_np.shape[1])
-    title_font = _get_font(ref, viz_cfg['title_font_size_scale'], viz_cfg['min_font_size'] + 2)
-    info_font = _get_font(ref, viz_cfg['info_font_size_scale'], viz_cfg['min_font_size'])
-    dummy = ImageDraw.Draw(Image.new('RGB', (16, 16)))
-    section_gap = int(viz_cfg.get('header_section_gap', 18))
-    line_gap = int(viz_cfg.get('header_text_line_gap', 7))
-    width = image_np.shape[1]
-    section_widths = [
-        int(width * 0.42),
-        int(width * 0.30),
-    ]
-    max_text_height = 0
-    for idx, lines in enumerate(header_sections):
-        font = title_font if idx == 0 else info_font
-        width_limit = section_widths[min(idx, len(section_widths) - 1)]
-        wrapped = _wrap_lines(dummy, lines, font, width_limit)
-        height = 18
-        for line in wrapped:
-            bbox = dummy.textbbox((0, 0), line or ' ', font=font)
-            height += (bbox[3] - bbox[1]) + line_gap
-        max_text_height = max(max_text_height, height)
-    legend_height = 0
-    if include_legend:
-        legend_font = _get_font(ref, viz_cfg['legend_font_size_scale'], viz_cfg['min_font_size'])
-        box_size = max(12, int(ref * 0.014))
-        legend_height = 18 + len(_build_legend_items()) * (box_size + 8) + (legend_font.size if hasattr(legend_font, 'size') else 12)
-    minimum = max(viz_cfg['header_min_height'], int(image_np.shape[0] * viz_cfg['header_height_ratio']))
-    return max(minimum, max_text_height + 18, legend_height + 18, section_gap * 2)
+    y = y1 + inner_pad
+    for label, color_hex in legend_items:
+        color = _hex_to_rgb(color_hex)
+        draw.rectangle([x1 + inner_pad, y + 2, x1 + inner_pad + box_size, y + 2 + box_size], outline=color + (255,), width=2, fill=(30, 30, 30, 180))
+        _draw_text_with_background(draw, (x1 + inner_pad * 2 + box_size, y), label, font, (255, 255, 255, 255), background_fill=(20, 20, 20, 0), pad=0)
+        y += max(box_size, getattr(font, 'size', box_size)) + line_gap
 
-
-def _draw_header(draw, canvas_width, header_height, image_np, header_sections, viz_cfg, include_legend):
-    ref = max(image_np.shape[0], image_np.shape[1])
-    title_font = _get_font(ref, viz_cfg['title_font_size_scale'], viz_cfg['min_font_size'] + 2)
-    info_font = _get_font(ref, viz_cfg['info_font_size_scale'], viz_cfg['min_font_size'])
-    legend_font = _get_font(ref, viz_cfg['legend_font_size_scale'], viz_cfg['min_font_size'])
-    section_gap = int(viz_cfg.get('header_section_gap', 18))
-    line_gap = int(viz_cfg.get('header_text_line_gap', 7))
-
-    left_x = 14
-    center_x = int(canvas_width * 0.42)
-    legend_x = int(canvas_width * (1.0 - viz_cfg.get('header_legend_width_ratio', 0.24)))
-    top_y = 12
-
-    section_specs = [
-        (header_sections[0], title_font, left_x, int(canvas_width * 0.36)),
-        (header_sections[1], info_font, center_x, int(canvas_width * 0.26)),
-    ]
-    for lines, font, x0, width_limit in section_specs:
-        y = top_y
-        for line in _wrap_lines(draw, lines, font, width_limit):
-            bbox = _draw_text_with_background(draw, (x0, y), line or ' ', font, (255, 255, 255))
-            y = bbox[3] + line_gap
-
-    if include_legend:
-        draw.rounded_rectangle([legend_x - 8, top_y - 4, canvas_width - 12, header_height - 14], radius=10, outline=(78, 82, 90), width=2, fill=(18, 20, 28))
-        y = top_y + 6
-        _draw_text_with_background(draw, (legend_x, y), 'Legend', legend_font, (255, 255, 255))
-        y += max(22, legend_font.size + 10 if hasattr(legend_font, 'size') else 22)
-        box_size = max(12, int(ref * 0.014))
-        for label, color_hex in _build_legend_items():
-            color = _hex_to_rgb(color_hex)
-            draw.rectangle([legend_x, y + 3, legend_x + box_size, y + 3 + box_size], outline=color, width=2, fill=(30, 30, 30))
-            _draw_text_with_background(draw, (legend_x + box_size + 8, y), label, legend_font, (255, 255, 255))
-            y += box_size + 8
-
-    draw.line([(0, header_height - 2), (canvas_width, header_height - 2)], fill=(70, 70, 70), width=2)
+    return Image.alpha_composite(image, overlay).convert('RGB')
 
 
 def _nms_xyxy(boxes, scores, iou_threshold):
@@ -237,11 +193,11 @@ def _nms_xyxy(boxes, scores, iou_threshold):
     order = np.argsort(-scores)
     keep = []
     while order.size > 0:
-        i = int(order[0])
-        keep.append(i)
+        current_index = int(order[0])
+        keep.append(current_index)
         if order.size == 1:
             break
-        current = boxes[i:i + 1]
+        current = boxes[current_index:current_index + 1]
         rest = boxes[order[1:]]
         ious = box_ops.box_iou(torch.from_numpy(current), torch.from_numpy(rest))[0].numpy()[0]
         order = order[1:][ious < float(iou_threshold)]
@@ -287,12 +243,12 @@ def _filter_prediction_display(prediction_boxes, prediction_labels, prediction_s
     final_keep = []
     for select_unknown in [False, True]:
         mask = labels == int(unknown_label) if select_unknown else labels != int(unknown_label)
-        idxs = np.nonzero(mask)[0]
-        if idxs.size == 0:
+        selected = np.nonzero(mask)[0]
+        if selected.size == 0:
             continue
-        kept_local = _nms_xyxy(boxes[idxs], scores[idxs], viz_cfg['display_nms_iou'])
+        kept_local = _nms_xyxy(boxes[selected], scores[selected], viz_cfg['display_nms_iou'])
         if kept_local.size > 0:
-            final_keep.append(idxs[kept_local])
+            final_keep.append(selected[kept_local])
     if not final_keep:
         return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.float32)
     final_keep = np.concatenate(final_keep, axis=0)
@@ -308,11 +264,8 @@ def _draw_boxes(
     prediction_scores=None,
     ground_truth_boxes=None,
     ground_truth_labels=None,
-    header_title=None,
-    header_meta_lines=None,
-    header_stat_lines=None,
     unknown_label=80,
-    show_legend=False,
+    legend_items=None,
 ):
     image = Image.fromarray(image_np).convert('RGBA')
     overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
@@ -338,18 +291,7 @@ def _draw_boxes(
             _draw_text_with_background(draw_overlay, (x1 + 2, y1 + 2), _prediction_text(label, score, unknown_label), font, color + (255,))
 
     composed = Image.alpha_composite(image, overlay).convert('RGB')
-    header_meta_lines = list(header_meta_lines or [])
-    header_stat_lines = list(header_stat_lines or [])
-    header_sections = [
-        [header_title] + header_meta_lines,
-        header_stat_lines,
-    ]
-    header_height = _estimate_header_height(image_np, header_sections, viz_cfg, show_legend)
-    canvas = Image.new('RGB', (composed.width, composed.height + header_height), (10, 12, 18))
-    canvas.paste(composed, (0, header_height))
-    header_draw = ImageDraw.Draw(canvas)
-    _draw_header(header_draw, canvas.width, header_height, image_np, header_sections, viz_cfg, show_legend)
-    return np.array(canvas)
+    return np.array(_draw_overlay_legend(composed, legend_items or [], viz_cfg))
 
 
 def _save_image(np_image, output_path):
@@ -391,6 +333,26 @@ def _save_figure(figure, output_path, tb_writer=None, tb_tag=None, global_step=0
     plt.close(figure)
 
 
+def _make_stats_dirs(stats_dir):
+    data_dir = os.path.join(stats_dir, 'data')
+    summary_dir = os.path.join(stats_dir, 'summary')
+    embeddings_dir = os.path.join(stats_dir, 'embeddings')
+    feature_2d_dir = os.path.join(embeddings_dir, 'feature', '2d')
+    feature_3d_dir = os.path.join(embeddings_dir, 'feature', '3d')
+    score_2d_dir = os.path.join(embeddings_dir, 'score_space', '2d')
+    score_3d_dir = os.path.join(embeddings_dir, 'score_space', '3d')
+    for path in [data_dir, summary_dir, feature_2d_dir, feature_3d_dir, score_2d_dir, score_3d_dir]:
+        _ensure_dir(path)
+    return {
+        'data': data_dir,
+        'summary': summary_dir,
+        'feature_2d': feature_2d_dir,
+        'feature_3d': feature_3d_dir,
+        'score_2d': score_2d_dir,
+        'score_3d': score_3d_dir,
+    }
+
+
 def _plot_histograms(state, output_dir, viz_cfg, tb_writer=None, global_step=0):
     if not state['objectness_probability']:
         return
@@ -418,13 +380,7 @@ def _plot_histograms(state, output_dir, viz_cfg, tb_writer=None, global_step=0):
         axis.set_title(title)
         axis.grid(alpha=0.2)
         axis.legend(frameon=False, fontsize=8)
-    _save_figure(
-        figure,
-        os.path.join(output_dir, f'query_probability_histograms_by_group.{viz_cfg["figure_format"]}'),
-        tb_writer,
-        'eval_viz/query_probability_histograms_by_group',
-        global_step,
-    )
+    _save_figure(figure, os.path.join(output_dir, f'query_probability_histograms_by_group.{viz_cfg["figure_format"]}'), tb_writer, 'eval_viz/query_probability_histograms_by_group', global_step)
 
 
 def _plot_scatter(state, output_dir, viz_cfg, tb_writer=None, global_step=0):
@@ -449,13 +405,7 @@ def _plot_scatter(state, output_dir, viz_cfg, tb_writer=None, global_step=0):
     for axis in axes:
         axis.grid(alpha=0.2)
         axis.legend(frameon=False, fontsize=8)
-    _save_figure(
-        figure,
-        os.path.join(output_dir, f'query_relationship_scatter.{viz_cfg["figure_format"]}'),
-        tb_writer,
-        'eval_viz/query_relationship_scatter',
-        global_step,
-    )
+    _save_figure(figure, os.path.join(output_dir, f'query_relationship_scatter.{viz_cfg["figure_format"]}'), tb_writer, 'eval_viz/query_relationship_scatter', global_step)
 
 
 def _plot_correlation_heatmap(state, output_dir, viz_cfg, tb_writer=None, global_step=0):
@@ -484,13 +434,7 @@ def _plot_correlation_heatmap(state, output_dir, viz_cfg, tb_writer=None, global
                 axis.text(j, i, f'{corr[i, j]:.2f}', ha='center', va='center', color='black' if abs(corr[i, j]) > 0.45 else 'white')
     color_axis = figure.add_axes([0.88, 0.17, 0.02, 0.68])
     figure.colorbar(heatmap, cax=color_axis)
-    _save_figure(
-        figure,
-        os.path.join(output_dir, f'branch_correlation_heatmap.{viz_cfg["figure_format"]}'),
-        tb_writer,
-        'eval_viz/branch_correlation_heatmap',
-        global_step,
-    )
+    _save_figure(figure, os.path.join(output_dir, f'branch_correlation_heatmap.{viz_cfg["figure_format"]}'), tb_writer, 'eval_viz/branch_correlation_heatmap', global_step)
 
 
 def _select_embedding_max_points(method, dim, viz_cfg):
@@ -514,25 +458,14 @@ def _compute_embedding(features, method, dim, viz_cfg):
         return PCA(n_components=dim, random_state=random_state).fit_transform(features)
     if method == 'tsne':
         perplexity = min(int(viz_cfg.get('embedding_tsne_perplexity_cap', 30)), max(2, features.shape[0] // 4))
-        return TSNE(
-            n_components=dim,
-            perplexity=perplexity,
-            init='pca',
-            learning_rate='auto',
-            random_state=random_state,
-        ).fit_transform(features)
+        return TSNE(n_components=dim, perplexity=perplexity, init='pca', learning_rate='auto', random_state=random_state).fit_transform(features)
     if method == 'umap':
         try:
             import umap
         except Exception:
             return None
         n_neighbors = min(int(viz_cfg.get('embedding_umap_n_neighbors', 20)), max(2, features.shape[0] - 1))
-        reducer = umap.UMAP(
-            n_components=dim,
-            n_neighbors=n_neighbors,
-            min_dist=float(viz_cfg.get('embedding_umap_min_dist', 0.15)),
-            random_state=random_state,
-        )
+        reducer = umap.UMAP(n_components=dim, n_neighbors=n_neighbors, min_dist=float(viz_cfg.get('embedding_umap_min_dist', 0.15)), random_state=random_state)
         return reducer.fit_transform(features)
     raise ValueError(f'Unsupported embedding method: {method}')
 
@@ -544,83 +477,96 @@ def _scatter_embedding(axis, embedding, labels, names, colors, dim):
             continue
         if dim == 3:
             axis.scatter(embedding[mask, 0], embedding[mask, 1], embedding[mask, 2], s=9, alpha=0.58, c=color, label=name)
+            axis.set_zlabel('C3')
         else:
             axis.scatter(embedding[mask, 0], embedding[mask, 1], s=9, alpha=0.58, c=color, label=name)
-    axis.grid(alpha=0.2)
-    if dim == 3:
         axis.set_xlabel('C1')
         axis.set_ylabel('C2')
-        axis.set_zlabel('C3')
-    else:
-        axis.set_xlabel('C1')
-        axis.set_ylabel('C2')
+        axis.grid(alpha=0.2)
 
 
-def _create_embedding_axes(dim):
+def _create_embedding_axes(dim, count):
     if dim == 3:
         figure = plt.figure(figsize=(17.8, 5.6))
-        axes = [figure.add_subplot(1, 3, idx + 1, projection='3d') for idx in range(3)]
+        axes = [figure.add_subplot(1, count, idx + 1, projection='3d') for idx in range(count)]
     else:
-        figure, axes = plt.subplots(1, 3, figsize=(16.4, 5.1))
+        figure, axes = plt.subplots(1, count, figsize=(16.4, 5.1))
         axes = list(axes)
     return figure, axes
 
 
-def _plot_embedding_views(feature_specs, metadata, output_dir, viz_cfg, tb_writer=None, global_step=0):
-    methods = list(viz_cfg.get('embedding_methods', ['pca', 'tsne', 'umap']))
-    dims = list(viz_cfg.get('embedding_dims', [2, 3]))
+def _build_view_specs(query_groups, feature_is_matched, feature_matched_gt_is_unknown):
+    return [
+        {
+            'key': 'group01',
+            'display_name': 'Matched-known + high-unknown unmatched',
+            'mask': np.isin(query_groups, [0, 1]),
+            'labels': np.where(query_groups == 0, 0, 1),
+            'names': ['matched-known', 'unmatched-high-unknown'],
+            'colors': [COLOR['matched_known'], COLOR['high_unknown_unmatched']],
+        },
+        {
+            'key': 'group012',
+            'display_name': 'All query groups',
+            'mask': np.ones_like(query_groups, dtype=bool),
+            'labels': query_groups,
+            'names': GROUP_NAMES,
+            'colors': GROUP_COLORS,
+        },
+        {
+            'key': 'semantic_known_unknown',
+            'display_name': 'Matched GT: known vs unknown',
+            'mask': feature_is_matched.astype(bool),
+            'labels': feature_matched_gt_is_unknown.astype(np.int64),
+            'names': SEMANTIC_NAMES,
+            'colors': SEMANTIC_COLORS,
+        },
+    ]
 
-    query_groups = np.asarray(metadata['feature_groups'], dtype=np.int64)
-    matched_gt_is_unknown = np.asarray(metadata['feature_matched_gt_is_unknown'], dtype=np.int64)
-    feature_is_matched = np.asarray(metadata['feature_is_matched'], dtype=np.int64)
 
-    view_specs = []
-    if viz_cfg.get('save_embedding_group01_views', True):
-        view_specs.append(('group01', np.isin(query_groups, [0, 1]), np.where(query_groups == 0, 0, 1), ['matched-known', 'unmatched-high-unknown'], [COLOR['matched_known'], COLOR['high_unknown_unmatched']]))
-    if viz_cfg.get('save_embedding_group012_views', True):
-        view_specs.append(('group012', np.ones_like(query_groups, dtype=bool), query_groups, GROUP_NAMES, GROUP_COLORS))
-    if viz_cfg.get('save_embedding_semantic_views', True):
-        semantic_mask = feature_is_matched.astype(bool)
-        semantic_labels = matched_gt_is_unknown.astype(np.int64)
-        view_specs.append(('semantic_known_unknown', semantic_mask, semantic_labels, SEMANTIC_NAMES, SEMANTIC_COLORS))
+def _plot_feature_embeddings(state, output_dirs, viz_cfg, tb_writer=None, global_step=0):
+    if not state['feature_groups'] or not state['objectness_features']:
+        return
 
-    for dim in dims:
+    feature_specs = [
+        ('objectness_features', 'Objectness features'),
+        ('knownness_features', 'Knownness features'),
+        ('classification_features', 'Classification features'),
+    ]
+    query_groups = np.asarray(state['feature_groups'], dtype=np.int64)
+    feature_is_matched = np.asarray(state['feature_is_matched'], dtype=np.int64)
+    feature_matched_gt_is_unknown = np.asarray(state['feature_matched_gt_is_unknown'], dtype=np.int64)
+
+    for dim in viz_cfg.get('embedding_dims', [2, 3]):
+        dim_output_dir = output_dirs['feature_2d'] if dim == 2 else output_dirs['feature_3d']
         min_points = int(viz_cfg['embedding_min_points_2d'] if dim == 2 else viz_cfg['embedding_min_points_3d'])
-        for method in methods:
-            for view_name, base_mask, base_labels, view_names, view_colors in view_specs:
-                figure, axes = _create_embedding_axes(dim)
+        for method in viz_cfg.get('embedding_methods', ['pca', 'tsne', 'umap']):
+            for view in _build_view_specs(query_groups, feature_is_matched, feature_matched_gt_is_unknown):
+                figure, axes = _create_embedding_axes(dim, len(feature_specs))
                 plotted_any = False
                 legend_handles = None
                 legend_labels = None
-                for axis, (feature_key, title) in zip(axes, feature_specs):
-                    feature_list = feature_specs[(feature_key, title)] if isinstance(feature_specs, dict) else None
-                    if feature_list is None:
+                for axis, (feature_key, feature_title) in zip(axes, feature_specs):
+                    features = np.asarray(state[feature_key], dtype=np.float32)
+                    labels = view['labels'][view['mask']]
+                    masked_features = features[view['mask']]
+                    if masked_features.shape[0] < min_points:
                         axis.set_axis_off()
                         continue
-                    features = np.asarray(feature_list, dtype=np.float32)
-                    mask = base_mask.copy()
-                    if view_name == 'semantic_known_unknown':
-                        mask = np.logical_and(mask, np.isin(base_labels, [0, 1]))
-                    labels = base_labels[mask]
-                    features = features[mask]
-                    if features.shape[0] < min_points or np.unique(labels).size < 1:
+                    if np.unique(labels).size < 2:
                         axis.set_axis_off()
                         continue
-                    if view_name == 'semantic_known_unknown' and np.unique(labels).size < 2:
-                        axis.set_axis_off()
-                        continue
-                    max_points = _select_embedding_max_points(method, dim, viz_cfg)
-                    features, labels = _subsample_evenly(features, labels, max_points)
+                    masked_features, labels = _subsample_evenly(masked_features, labels, _select_embedding_max_points(method, dim, viz_cfg))
                     try:
-                        embedding = _compute_embedding(features, method, dim, viz_cfg)
+                        embedding = _compute_embedding(masked_features, method, dim, viz_cfg)
                     except Exception:
                         axis.set_axis_off()
                         continue
                     if embedding is None:
                         axis.set_axis_off()
                         continue
-                    _scatter_embedding(axis, embedding, labels, view_names, view_colors, dim)
-                    axis.set_title(f'{title} · {method.upper()} · {dim}D · {view_name}')
+                    _scatter_embedding(axis, embedding, labels, view['names'], view['colors'], dim)
+                    axis.set_title(f'{feature_title} · {method.upper()} · {view["display_name"]}')
                     handles, labels_text = axis.get_legend_handles_labels()
                     if handles:
                         legend_handles, legend_labels = handles, labels_text
@@ -628,27 +574,52 @@ def _plot_embedding_views(feature_specs, metadata, output_dir, viz_cfg, tb_write
                 if plotted_any:
                     if legend_handles:
                         figure.legend(legend_handles, legend_labels, loc='upper center', bbox_to_anchor=(0.5, 1.03), ncol=max(2, len(legend_labels)), frameon=False)
-                    filename = f'feature_embedding_{method}_{dim}d_{view_name}.{viz_cfg["figure_format"]}'
-                    tb_tag = f'eval_viz/feature_embedding_{method}_{dim}d_{view_name}'
-                    _save_figure(figure, os.path.join(output_dir, filename), tb_writer, tb_tag, global_step)
+                    filename = f'feature_embedding_{method}_{dim}d_{view["key"]}.{viz_cfg["figure_format"]}'
+                    tb_tag = f'eval_viz/feature_embedding_{method}_{dim}d_{view["key"]}'
+                    _save_figure(figure, os.path.join(dim_output_dir, filename), tb_writer, tb_tag, global_step)
                 else:
                     plt.close(figure)
 
 
-def _plot_feature_embeddings(state, output_dir, viz_cfg, tb_writer=None, global_step=0):
-    if not state['feature_groups'] or not state['objectness_features']:
+def _plot_score_space_embeddings(state, output_dirs, viz_cfg, tb_writer=None, global_step=0):
+    if not state['objectness_probability']:
         return
-    feature_specs = {
-        ('objectness_features', 'Objectness features'): state['objectness_features'],
-        ('knownness_features', 'Knownness features'): state['knownness_features'],
-        ('classification_features', 'Classification features'): state['classification_features'],
-    }
-    metadata = {
-        'feature_groups': np.asarray(state['feature_groups'], dtype=np.int64),
-        'feature_is_matched': np.asarray(state['feature_is_matched'], dtype=np.int64),
-        'feature_matched_gt_is_unknown': np.asarray(state['feature_matched_gt_is_unknown'], dtype=np.int64),
-    }
-    _plot_embedding_views(feature_specs, metadata, output_dir, viz_cfg, tb_writer, global_step)
+    features = np.stack([
+        np.asarray(state['objectness_probability'], dtype=np.float32),
+        np.asarray(state['unknown_probability'], dtype=np.float32),
+        np.asarray(state['max_known_class_probability'], dtype=np.float32),
+    ], axis=1)
+    query_groups = np.asarray(state['query_group'], dtype=np.int64)
+    feature_is_matched = np.asarray(state['is_matched'], dtype=np.int64)
+    feature_matched_gt_is_unknown = np.asarray(state['matched_gt_is_unknown'], dtype=np.int64)
+
+    for dim in viz_cfg.get('embedding_dims', [2, 3]):
+        dim_output_dir = output_dirs['score_2d'] if dim == 2 else output_dirs['score_3d']
+        min_points = int(viz_cfg['embedding_min_points_2d'] if dim == 2 else viz_cfg['embedding_min_points_3d'])
+        for method in viz_cfg.get('embedding_methods', ['pca', 'tsne', 'umap']):
+            for view in _build_view_specs(query_groups, feature_is_matched, feature_matched_gt_is_unknown):
+                masked_features = features[view['mask']]
+                labels = view['labels'][view['mask']]
+                if masked_features.shape[0] < min_points or np.unique(labels).size < 2:
+                    continue
+                masked_features, labels = _subsample_evenly(masked_features, labels, _select_embedding_max_points(method, dim, viz_cfg))
+                try:
+                    embedding = _compute_embedding(masked_features, method, dim, viz_cfg)
+                except Exception:
+                    continue
+                if embedding is None:
+                    continue
+                if dim == 3:
+                    figure = plt.figure(figsize=(7.8, 6.2))
+                    axis = figure.add_subplot(1, 1, 1, projection='3d')
+                else:
+                    figure, axis = plt.subplots(1, 1, figsize=(7.0, 5.8))
+                _scatter_embedding(axis, embedding, labels, view['names'], view['colors'], dim)
+                axis.set_title(f'Score-space · {method.upper()} · {view["display_name"]}')
+                axis.legend(frameon=False, fontsize=8)
+                filename = f'score_space_{method}_{dim}d_{view["key"]}.{viz_cfg["figure_format"]}'
+                tb_tag = f'eval_viz/score_space_{method}_{dim}d_{view["key"]}'
+                _save_figure(figure, os.path.join(dim_output_dir, filename), tb_writer, tb_tag, global_step)
 
 
 def _plot_layer_debug_summary(state, output_dir, viz_cfg, tb_writer=None, global_step=0):
@@ -674,13 +645,7 @@ def _plot_layer_debug_summary(state, output_dir, viz_cfg, tb_writer=None, global
     axis.set_title('Layer-wise Prediction Statistics')
     axis.grid(alpha=0.25)
     axis.legend(frameon=False)
-    _save_figure(
-        figure,
-        os.path.join(output_dir, f'layer_prediction_summary.{viz_cfg["figure_format"]}'),
-        tb_writer,
-        'eval_viz/layer_prediction_summary',
-        global_step,
-    )
+    _save_figure(figure, os.path.join(output_dir, f'layer_prediction_summary.{viz_cfg["figure_format"]}'), tb_writer, 'eval_viz/layer_prediction_summary', global_step)
 
 
 def compute_branch_correlation_metrics(state):
@@ -794,27 +759,8 @@ def _extract_error_cases(prediction_boxes, prediction_labels, ground_truth_boxes
     return errors
 
 
-def _base_meta_lines(image_id, epoch):
-    return [
-        f'image_id: {image_id}',
-        f'epoch: {int(epoch):04d}',
-    ]
-
-
-def _base_stat_lines(raw_pred_count, filtered_pred_count, gt_count, extra_lines=None):
-    lines = [
-        f'pred(raw): {raw_pred_count}',
-        f'pred(filtered): {filtered_pred_count}',
-        f'gt: {gt_count}',
-    ]
-    lines.extend(list(extra_lines or []))
-    return lines
-
-
 def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictions, outputs, criterion, args, output_dir, viz_cfg, tb_writer=None, global_step=0, epoch=0):
-    del outputs, criterion  # 当前定性图路径不再依赖 mining-stage debug
-
-    epoch = max(int(epoch), 0)
+    del outputs, criterion, epoch
     unknown_label = int(getattr(args, 'num_classes', 81) - 1)
     final_dir = os.path.join(output_dir, 'final')
     _ensure_dir(final_dir)
@@ -845,8 +791,12 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
         known_mask = prediction_labels != unknown_label if len(prediction_labels) > 0 else np.array([], dtype=bool)
         unknown_mask = prediction_labels == unknown_label if len(prediction_labels) > 0 else np.array([], dtype=bool)
 
-        case_dir = os.path.join(final_dir, f'{image_id:012d}__epoch_{int(epoch):04d}')
+        case_dir = os.path.join(final_dir, f'{image_id:012d}')
         _ensure_dir(case_dir)
+
+        gt_legend = _build_legend_items(include_predictions=False, include_ground_truth=True)
+        pred_legend = _build_legend_items(include_predictions=True, include_ground_truth=False)
+        full_legend = _build_legend_items(include_predictions=True, include_ground_truth=True)
 
         final_prediction_image = _draw_boxes(
             image_np,
@@ -856,21 +806,8 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
             prediction_scores=prediction_scores,
             ground_truth_boxes=ground_truth_boxes,
             ground_truth_labels=ground_truth_labels,
-            header_title='Prediction vs Ground Truth',
-            header_meta_lines=_base_meta_lines(image_id, epoch),
-            header_stat_lines=_base_stat_lines(
-                len(raw_prediction_boxes),
-                len(prediction_boxes),
-                len(ground_truth_boxes),
-                extra_lines=[
-                    f'known_thr: {viz_cfg["display_known_score_thresh"]:.2f}',
-                    f'unknown_thr: {viz_cfg["display_unknown_score_thresh"]:.2f}',
-                    f'nms_iou: {viz_cfg["display_nms_iou"]:.2f}',
-                    f'geometry_filter: {int(bool(viz_cfg["display_apply_geometry_filter"]))}',
-                ],
-            ),
             unknown_label=unknown_label,
-            show_legend=True,
+            legend_items=full_legend,
         )
 
         prediction_known_image = _draw_boxes(
@@ -879,16 +816,8 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
             prediction_boxes=prediction_boxes[known_mask] if len(prediction_boxes) > 0 else None,
             prediction_labels=prediction_labels[known_mask] if len(prediction_labels) > 0 else None,
             prediction_scores=prediction_scores[known_mask] if len(prediction_scores) > 0 else None,
-            header_title='Known Predictions',
-            header_meta_lines=_base_meta_lines(image_id, epoch),
-            header_stat_lines=_base_stat_lines(
-                len(raw_prediction_boxes),
-                int(known_mask.sum()) if len(known_mask) > 0 else 0,
-                len(ground_truth_boxes),
-                extra_lines=['view: known-only'],
-            ),
             unknown_label=unknown_label,
-            show_legend=False,
+            legend_items=pred_legend,
         )
 
         prediction_unknown_image = _draw_boxes(
@@ -897,16 +826,8 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
             prediction_boxes=prediction_boxes[unknown_mask] if len(prediction_boxes) > 0 else None,
             prediction_labels=prediction_labels[unknown_mask] if len(prediction_labels) > 0 else None,
             prediction_scores=prediction_scores[unknown_mask] if len(prediction_scores) > 0 else None,
-            header_title='Unknown Predictions',
-            header_meta_lines=_base_meta_lines(image_id, epoch),
-            header_stat_lines=_base_stat_lines(
-                len(raw_prediction_boxes),
-                int(unknown_mask.sum()) if len(unknown_mask) > 0 else 0,
-                len(ground_truth_boxes),
-                extra_lines=['view: unknown-only'],
-            ),
             unknown_label=unknown_label,
-            show_legend=False,
+            legend_items=pred_legend,
         )
 
         ground_truth_image = _draw_boxes(
@@ -914,11 +835,8 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
             viz_cfg,
             ground_truth_boxes=ground_truth_boxes,
             ground_truth_labels=ground_truth_labels,
-            header_title='Ground Truth',
-            header_meta_lines=_base_meta_lines(image_id, epoch),
-            header_stat_lines=_base_stat_lines(len(raw_prediction_boxes), len(prediction_boxes), len(ground_truth_boxes)),
             unknown_label=unknown_label,
-            show_legend=False,
+            legend_items=gt_legend,
         )
 
         _save_image(ground_truth_image, os.path.join(case_dir, 'ground_truth.png'))
@@ -943,16 +861,8 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
                 prediction_scores=prediction_scores[u2k_pred] if len(prediction_scores) > 0 else None,
                 ground_truth_boxes=ground_truth_boxes[u2k_gt] if len(u2k_gt) > 0 else None,
                 ground_truth_labels=ground_truth_labels[u2k_gt] if len(u2k_gt) > 0 else None,
-                header_title='Error: Unknown -> Known',
-                header_meta_lines=_base_meta_lines(image_id, epoch),
-                header_stat_lines=_base_stat_lines(
-                    len(raw_prediction_boxes),
-                    len(prediction_boxes),
-                    len(ground_truth_boxes),
-                    extra_lines=[f'error_pairs: {len(u2k_gt)}'],
-                ),
                 unknown_label=unknown_label,
-                show_legend=True,
+                legend_items=full_legend,
             )
             known_to_unknown_image = _draw_boxes(
                 image_np,
@@ -961,17 +871,9 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
                 prediction_labels=prediction_labels[k2u_pred] if len(prediction_labels) > 0 else None,
                 prediction_scores=prediction_scores[k2u_pred] if len(prediction_scores) > 0 else None,
                 ground_truth_boxes=ground_truth_boxes[k2u_gt] if len(k2u_gt) > 0 else None,
-                ground_truth_labels=ground_truth_labels[k2u_gt] if len(k2u_gt) > 0 else None,
-                header_title='Error: Known -> Unknown',
-                header_meta_lines=_base_meta_lines(image_id, epoch),
-                header_stat_lines=_base_stat_lines(
-                    len(raw_prediction_boxes),
-                    len(prediction_boxes),
-                    len(ground_truth_boxes),
-                    extra_lines=[f'error_pairs: {len(k2u_gt)}'],
-                ),
+                ground_truth_labels=ground_truth_labels[k2u_gt] if len(ground_truth_labels) > 0 else None,
                 unknown_label=unknown_label,
-                show_legend=True,
+                legend_items=full_legend,
             )
             u2k_path = os.path.join(case_dir, 'error_unknown_to_known.png')
             k2u_path = os.path.join(case_dir, 'error_known_to_unknown.png')
@@ -1003,6 +905,7 @@ def finalize_eval_visualizations(state, output_dir, epoch, viz_cfg, tb_writer=No
     final_dir = os.path.join(output_dir, 'final')
     _ensure_dir(stats_dir)
     _ensure_dir(final_dir)
+    stats_dirs = _make_stats_dirs(stats_dir)
 
     layer_count = state['layer_debug']['count']
     if layer_count > 0:
@@ -1016,7 +919,7 @@ def finalize_eval_visualizations(state, output_dir, epoch, viz_cfg, tb_writer=No
             state['layer_debug']['layer_max_known_class_probability_mean'] = (state['layer_debug']['layer_max_known_class_probability_sum'] / layer_count).tolist()
 
     if viz_cfg['save_query_stats_csv'] and state['objectness_probability']:
-        with open(os.path.join(stats_dir, 'query_statistics.csv'), 'w', newline='') as file:
+        with open(os.path.join(stats_dirs['data'], 'query_statistics.csv'), 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(QUERY_STATS_COLUMNS)
             rows = zip(*(state[column] for column in QUERY_STATS_COLUMNS))
@@ -1031,23 +934,24 @@ def finalize_eval_visualizations(state, output_dir, epoch, viz_cfg, tb_writer=No
         }
         for key in FEATURE_METADATA_COLUMNS:
             save_dict[key] = np.asarray(state[key], dtype=np.int64)
-        np.savez_compressed(os.path.join(stats_dir, 'feature_samples.npz'), **save_dict)
+        np.savez_compressed(os.path.join(stats_dirs['data'], 'feature_samples.npz'), **save_dict)
 
     if viz_cfg['save_error_summary_csv'] and state['error_rows']:
-        with open(os.path.join(stats_dir, 'error_case_summary.csv'), 'w', newline='') as file:
+        with open(os.path.join(stats_dirs['data'], 'error_case_summary.csv'), 'w', newline='') as file:
             writer = csv.DictWriter(file, fieldnames=['image_id', 'num_predictions_raw', 'num_predictions_filtered', 'num_ground_truth_boxes', 'num_unknown_to_known_errors', 'num_known_to_unknown_errors'])
             writer.writeheader()
             for row in state['error_rows']:
                 writer.writerow(row)
 
     if viz_cfg['save_query_distribution_plots']:
-        _plot_histograms(state, stats_dir, viz_cfg, tb_writer, epoch)
-        _plot_scatter(state, stats_dir, viz_cfg, tb_writer, epoch)
-        _plot_correlation_heatmap(state, stats_dir, viz_cfg, tb_writer, epoch)
-        _plot_layer_debug_summary(state, stats_dir, viz_cfg, tb_writer, epoch)
+        _plot_histograms(state, stats_dirs['summary'], viz_cfg, tb_writer, epoch)
+        _plot_scatter(state, stats_dirs['summary'], viz_cfg, tb_writer, epoch)
+        _plot_correlation_heatmap(state, stats_dirs['summary'], viz_cfg, tb_writer, epoch)
+        _plot_layer_debug_summary(state, stats_dirs['summary'], viz_cfg, tb_writer, epoch)
 
     if viz_cfg['save_feature_embedding_plots']:
-        _plot_feature_embeddings(state, stats_dir, viz_cfg, tb_writer, epoch)
+        _plot_feature_embeddings(state, stats_dirs, viz_cfg, tb_writer, epoch)
+        _plot_score_space_embeddings(state, stats_dirs, viz_cfg, tb_writer, epoch)
 
     if viz_cfg['save_contact_sheet']:
         _save_contact_sheet(state['saved_primary_panels'], os.path.join(final_dir, 'prediction_vs_gt_contact_sheet.png'), viz_cfg)
