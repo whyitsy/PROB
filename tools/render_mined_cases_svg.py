@@ -13,12 +13,20 @@ if str(REPO_ROOT) not in sys.path:
 from main_open_world import get_args_parser, build_datasets
 from models import build_model
 from util.misc import nested_tensor_from_tensor_list
-from tools.figure_svg_utils import save_svg_image
-from tools.visualize_deformable_queries import compute_query_scores
-from tools.visualize_odqe_gates import ODQEGateRecorder, ordered_gate_records, plot_query_gate_curve, plot_query_gate_heatmap
-from tools.visualize_odqe_query_mechanism import MSDeformAttnRecorder, ordered_attention_records, plot_joint_panel
-from tools.visualize_deformable_queries_svg import to_numpy_image, draw_gt_boxes, plot_query_sampling
-from tools.visualize_query_trajectory_svg import compute_per_layer_scores, plot_query_trajectory_panel
+from util.visual.cases import (
+    MSDeformAttnRecorder,
+    ODQEGateRecorder,
+    compute_per_layer_scores,
+    compute_query_scores,
+    ordered_attention_records,
+    ordered_gate_records,
+    plot_joint_panel,
+    plot_query_gate_curve,
+    plot_query_gate_heatmap,
+    plot_query_sampling,
+    plot_query_trajectory_panel,
+)
+from util.visual.helper import draw_gt_boxes, save_svg_image, to_numpy_image
 
 
 def parse_categories(value):
