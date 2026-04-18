@@ -13,6 +13,7 @@ from util.visual.training import (
     plot_step_base_losses,
     plot_step_open_world_losses,
     plot_step_pseudo_mining_counts_bars,
+    plot_step_pseudo_mining_statistics,
     plot_step_query_score_statistics,
     plot_step_total_loss,
     plot_training_base_loss_components,
@@ -107,6 +108,7 @@ class ExperimentMetricsPlotter:
     def refresh_step_pseudo_plots(self):
         if not self.train_step_rows:
             return
+        plot_step_pseudo_mining_statistics(self.train_step_rows, self.train_plots_dir / 'step_pseudo_mining_statistics.svg')
         plot_step_pseudo_mining_counts_bars(self.train_step_rows, self.train_plots_dir / 'step_pseudo_mining_counts_bars.svg')
 
     def refresh_step_auxiliary_plots(self):
