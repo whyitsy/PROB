@@ -1,0 +1,422 @@
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+
+from util.visual.helper import save_svg_figure
+
+
+PALETTE = {
+    'blue': '#0077BB',
+    'orange': '#EE7733',
+    'cyan': '#33BBEE',
+    'red': '#CC3311',
+    'green': '#009988',
+    'magenta': '#EE3377',
+    'yellow': '#EEDD44',
+    'purple': '#7A52A5',
+    'gray': '#6C757D',
+}
+
+
+def safe_float(value):
+    """把值转成 float。"""
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def ema(values, alpha=0.15):
+    """计算一维序列的 EMA 平滑。"""
+    smoothed = []
+    previous = None
+    for value in values:
+        if value is None:
+            smoothed.append(previous)
+            continue
+        if previous is None:
+            previous = value
+        else:
+            previous = alpha * value + (1.0 - alpha) * previous
+        smoothed.append(previous)
+    return smoothed
+
+
+def epoch_series(rows, key):
+    """提取按 epoch 对齐的序列。"""
+    epochs = [int(row['epoch']) for row in rows if row.get('epoch') is not None]
+    values = [safe_float(row.get(key)) for row in rows if row.get('epoch') is not None]
+    xs = [epoch for epoch, value in zip(epochs, values) if value is not None]
+    ys = [value for value in values if value is not None]
+    return xs, ys
+
+
+def step_series(rows, key):
+    """提取按 global step 对齐的序列。"""
+    xs = []
+    ys = []
+    for row in rows:
+        step = row.get('global_step')
+        value = safe_float(row.get(key))
+        if step is None or value is None:
+            continue
+        xs.append(int(step))
+        ys.append(value)
+    return xs, ys
+
+
+def aggregate_step_values(rows, keys, window_size=1000):
+    """按 step 窗口聚合多条序列。"""
+    valid_rows = [row for row in rows if row.get('global_step') is not None]
+    if not valid_rows:
+        return None
+    valid_rows = sorted(valid_rows, key=lambda item: int(item['global_step']))
+    grouped = {}
+    counts = {}
+    for row in valid_rows:
+        step = int(row['global_step'])
+        bucket_end = ((step // window_size) + 1) * window_size
+        if bucket_end not in grouped:
+            grouped[bucket_end] = {key: 0.0 for key in keys}
+            counts[bucket_end] = {key: 0 for key in keys}
+        for key in keys:
+            value = safe_float(row.get(key))
+            if value is None:
+                continue
+            grouped[bucket_end][key] += value
+            counts[bucket_end][key] += 1
+    xs = sorted(grouped.keys())
+    data = {}
+    for key in keys:
+        data[key] = []
+        for bucket in xs:
+            count = counts[bucket][key]
+            data[key].append(grouped[bucket][key] / max(count, 1))
+    return xs, data
+
+
+def plot_training_total_loss(rows, output_path):
+    """绘制训练总 loss 曲线。"""
+    xs, ys = epoch_series(rows, 'train_total_loss')
+    if not xs:
+        return None
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(xs, ys, marker='o', linewidth=2.2, color=PALETTE['blue'], label='total_loss')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title('Training Total Loss Trend')
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False)
+    return save_svg_figure(fig, output_path)
+
+
+def plot_training_base_loss_components(rows, output_path):
+    """绘制基础 loss 组成曲线。"""
+    fig, ax = plt.subplots(figsize=(11, 6))
+    plotted = False
+    for label, key, color in [
+        ('classification', 'train_raw_loss_ce', PALETTE['blue']),
+        ('box_l1', 'train_raw_loss_bbox', PALETTE['orange']),
+        ('giou', 'train_raw_loss_giou', PALETTE['green']),
+    ]:
+        xs, ys = epoch_series(rows, key)
+        if xs:
+            plotted = True
+            ax.plot(xs, ys, marker='o', linewidth=2.0, color=color, label=label)
+    if not plotted:
+        plt.close(fig)
+        return None
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Raw loss')
+    ax.set_title('Base Detection Loss Components')
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False, ncol=2)
+    return save_svg_figure(fig, output_path)
+
+
+def plot_training_matched_objectness_loss_component(rows, output_path):
+    """绘制 matched objectness loss 曲线。"""
+    xs, ys = epoch_series(rows, 'train_raw_loss_obj_ll')
+    if not xs:
+        return None
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(xs, ys, marker='o', linewidth=2.2, color=PALETTE['cyan'], label='matched_objectness')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Raw loss')
+    ax.set_title('Matched Objectness Loss Component')
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False)
+    return save_svg_figure(fig, output_path)
+
+
+def plot_training_open_world_loss_components(rows, output_path):
+    """绘制 open-world loss 组成曲线。"""
+    fig, ax = plt.subplots(figsize=(11, 6))
+    plotted = False
+    for label, key, color in [
+        ('matched_known_knownness', 'train_raw_loss_unk_known', PALETTE['orange']),
+        ('pseudo_positive_objectness', 'train_raw_loss_obj_pseudo', PALETTE['blue']),
+        ('pseudo_unknown_knownness', 'train_raw_loss_unk_pseudo', PALETTE['magenta']),
+        ('branch_decorrelation', 'train_raw_loss_decorr', PALETTE['green']),
+    ]:
+        xs, ys = epoch_series(rows, key)
+        if xs:
+            plotted = True
+            ax.plot(xs, ys, marker='o', linewidth=2.0, color=color, label=label)
+    if not plotted:
+        plt.close(fig)
+        return None
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Raw loss')
+    ax.set_title('Open-World Loss Components')
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False)
+    return save_svg_figure(fig, output_path)
+
+
+def plot_pseudo_mining_counts(rows, output_path):
+    """绘制 pseudo mining 数量曲线。"""
+    fig, ax = plt.subplots(figsize=(11, 6))
+    plotted = False
+    for label, key, color in [
+        ('selected_pseudo_positive_queries', 'num_selected_pseudo_positive_queries', PALETTE['blue']),
+        ('reliable_background_queries', 'num_selected_reliable_background_queries', PALETTE['orange']),
+        ('candidate_queries', 'num_pseudo_positive_candidates', PALETTE['green']),
+        ('ignored_queries', 'num_classification_ignored_queries', PALETTE['magenta']),
+    ]:
+        xs, ys = epoch_series(rows, key)
+        if xs:
+            plotted = True
+            ax.plot(xs, ys, marker='o', linewidth=2.0, color=color, label=label)
+    if not plotted:
+        plt.close(fig)
+        return None
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Count')
+    ax.set_title('Pseudo Mining Count Statistics')
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False)
+    return save_svg_figure(fig, output_path)
+
+
+def plot_pseudo_mining_efficiency(rows, output_path):
+    """绘制 pseudo mining 效率曲线。"""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    plotted = False
+    for label, key, color in [
+        ('selection_ratio', 'pseudo_positive_selection_ratio', PALETTE['cyan']),
+        ('accept_ratio', 'pseudo_positive_accept_ratio', PALETTE['red']),
+    ]:
+        xs, ys = epoch_series(rows, key)
+        if xs:
+            plotted = True
+            ax.plot(xs, ys, marker='o', linewidth=2.0, color=color, label=label)
+    if not plotted:
+        plt.close(fig)
+        return None
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Ratio')
+    ax.set_title('Pseudo Mining Efficiency')
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False)
+    return save_svg_figure(fig, output_path)
+
+
+def plot_step_group(rows, output_path, *, title, ylabel, series):
+    """绘制一组 step 曲线。"""
+    fig, ax = plt.subplots(figsize=(12, 6.5))
+    plotted = False
+    for label, key, color in series:
+        xs, ys = step_series(rows, key)
+        if xs:
+            plotted = True
+            ax.plot(xs, ys, alpha=0.18, linewidth=0.9, color=color)
+            ax.plot(xs, ema(ys, alpha=0.08), linewidth=2.0, color=color, label=label)
+    if not plotted:
+        plt.close(fig)
+        return None
+    ax.set_xlabel('Global Step')
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False, ncol=2)
+    return save_svg_figure(fig, output_path)
+
+
+def plot_step_total_loss(rows, output_path):
+    """绘制 step 总 loss 曲线。"""
+    return plot_step_group(
+        rows,
+        output_path,
+        title='Step-level Total Loss',
+        ylabel='Loss',
+        series=[('total_loss', 'train/loss/total', PALETTE['blue'])],
+    )
+
+
+def plot_step_base_losses(rows, output_path):
+    """绘制 step 基础 loss 曲线。"""
+    return plot_step_group(
+        rows,
+        output_path,
+        title='Step-level Base Losses',
+        ylabel='Raw loss',
+        series=[
+            ('classification', 'train/loss_raw/loss_ce', PALETTE['blue']),
+            ('box_l1', 'train/loss_raw/loss_bbox', PALETTE['orange']),
+            ('giou', 'train/loss_raw/loss_giou', PALETTE['green']),
+            ('matched_objectness', 'train/loss_raw/loss_obj_ll', PALETTE['cyan']),
+        ],
+    )
+
+
+def plot_step_open_world_losses(rows, output_path):
+    """绘制 step open-world loss 曲线。"""
+    return plot_step_group(
+        rows,
+        output_path,
+        title='Step-level Open-World Losses',
+        ylabel='Raw loss',
+        series=[
+            ('matched_known_knownness', 'train/loss_raw/loss_unk_known', PALETTE['orange']),
+            ('pseudo_positive_objectness', 'train/loss_raw/loss_obj_pseudo', PALETTE['blue']),
+            ('pseudo_unknown_knownness', 'train/loss_raw/loss_unk_pseudo', PALETTE['magenta']),
+            ('branch_decorrelation', 'train/loss_raw/loss_decorr', PALETTE['green']),
+        ],
+    )
+
+
+def plot_step_query_score_statistics(rows, output_path):
+    """绘制 step query score 统计曲线。"""
+    return plot_step_group(
+        rows,
+        output_path,
+        title='Step-level Query Score Statistics',
+        ylabel='Value',
+        series=[
+            ('matched_objectness_prob', 'train/query_stats/matched_objectness_prob_mean', PALETTE['blue']),
+            ('unmatched_objectness_prob', 'train/query_stats/unmatched_objectness_prob_mean', PALETTE['orange']),
+            ('unknown_probability', 'train/query_stats/unknown_probability_mean', PALETTE['magenta']),
+            ('max_known_class_probability', 'train/query_stats/max_known_class_probability_mean', PALETTE['green']),
+        ],
+    )
+
+
+def plot_step_pseudo_mining_counts_bars(rows, output_path, step_bar_interval=1000):
+    """绘制 step pseudo mining 柱状统计图。"""
+    value_keys = [
+        ('selected', 'train/pseudo/selected_queries', PALETTE['blue']),
+        ('candidates', 'train/pseudo/candidate_queries', PALETTE['green']),
+        ('reliable_bg', 'train/pseudo/reliable_background_queries', PALETTE['orange']),
+        ('ignored', 'train/pseudo/ignored_queries', PALETTE['magenta']),
+    ]
+    aggregated = aggregate_step_values(rows, [key for _, key, _ in value_keys], window_size=step_bar_interval)
+    if aggregated is None:
+        return None
+    xs, data = aggregated
+    if len(xs) == 0:
+        return None
+
+    fig, ax = plt.subplots(figsize=(13, 6.5))
+    bar_width = step_bar_interval * 0.18
+    offsets = np.linspace(-1.5 * bar_width, 1.5 * bar_width, num=len(value_keys))
+    for offset, (label, key, color) in zip(offsets, value_keys):
+        ax.bar(np.asarray(xs) + offset, data[key], width=bar_width, color=color, alpha=0.9, label=label)
+    ax.set_xlabel(f'Global step (window={step_bar_interval})')
+    ax.set_ylabel('Average count per step')
+    ax.set_title('Pseudo Mining Counts Aggregated by Step Window')
+    ax.grid(True, axis='y', alpha=0.25)
+    ax.legend(frameon=False, ncol=2)
+    return save_svg_figure(fig, output_path)
+
+
+def plot_step_auxiliary_family(rows, output_path, *, title, prefixes):
+    """绘制一组辅助 loss 曲线。"""
+    keys = sorted(
+        {
+            key
+            for row in rows
+            for key in row.keys()
+            if any(key.startswith(prefix) for prefix in prefixes)
+        }
+    )
+    if not keys:
+        return None
+
+    fig, ax = plt.subplots(figsize=(12, 6.5))
+    colors = [
+        PALETTE['blue'],
+        PALETTE['orange'],
+        PALETTE['green'],
+        PALETTE['magenta'],
+        PALETTE['cyan'],
+        PALETTE['red'],
+        PALETTE['purple'],
+    ]
+    plotted = False
+    for index, key in enumerate(keys):
+        xs, ys = step_series(rows, key)
+        if xs:
+            plotted = True
+            ax.plot(
+                xs,
+                ema(ys, alpha=0.08),
+                linewidth=1.8,
+                color=colors[index % len(colors)],
+                label=key.replace('train/loss_raw/', ''),
+            )
+    if not plotted:
+        plt.close(fig)
+        return None
+    ax.set_xlabel('Global Step')
+    ax.set_ylabel('Raw loss')
+    ax.setTitle = title
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False, fontsize=8, ncol=2)
+    return save_svg_figure(fig, output_path)
+
+
+def plot_step_aux_obj_pseudo_loss_trends(rows, output_path):
+    """绘制 obj pseudo 辅助 loss 曲线。"""
+    return plot_step_auxiliary_family(
+        rows,
+        output_path,
+        title='Step-level Auxiliary Objectness Pseudo Loss Trends',
+        prefixes=['train/loss_raw/loss_obj_pseudo_'],
+    )
+
+
+def plot_step_aux_unk_pseudo_loss_trends(rows, output_path):
+    """绘制 unk pseudo 辅助 loss 曲线。"""
+    return plot_step_auxiliary_family(
+        rows,
+        output_path,
+        title='Step-level Auxiliary Unknownness Pseudo Loss Trends',
+        prefixes=['train/loss_raw/loss_unk_pseudo_'],
+    )
+
+
+def plot_step_aux_decorr_loss_trends(rows, output_path):
+    """绘制 decorr 辅助 loss 曲线。"""
+    return plot_step_auxiliary_family(
+        rows,
+        output_path,
+        title='Step-level Auxiliary Decorrelation Loss Trends',
+        prefixes=['train/loss_raw/loss_decorr_'],
+    )
+
+
+def plot_step_auxiliary_loss_trends(rows, output_path):
+    """绘制全部辅助 loss 汇总曲线。"""
+    return plot_step_auxiliary_family(
+        rows,
+        output_path,
+        title='Step-level Auxiliary Loss Trends',
+        prefixes=[
+            'train/loss_raw/loss_obj_pseudo_',
+            'train/loss_raw/loss_unk_pseudo_',
+            'train/loss_raw/loss_decorr_',
+        ],
+    )
