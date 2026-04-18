@@ -834,3 +834,384 @@ def save_case_contact_sheet_svg(dataset, entries, category, output_path):
             }
         )
     return write_gallery_svg(items, output_path, title=f'{category} representative cases', mode='sampling', cols=3, tile_width=420)
+
+
+def energy_to_prob(energy, temperature):
+    """把能量转成概率。"""
+    return torch.exp(-temperature * energy.detach()).clamp(min=1e-6, max=1.0)
+
+
+def compute_query_scores(outputs, args, invalid_cls_logits):
+    """计算 query 的最终分数。"""
+    hidden_dim = float(getattr(args, 'hidden_dim', 256))
+    obj_temp = float(getattr(args, 'obj_temp', 1.0)) / hidden_dim
+    obj_prob = energy_to_prob(outputs['pred_obj'], obj_temp)
+    class_prob = outputs['pred_logits'].detach().sigmoid().clone()
+    if invalid_cls_logits:
+        class_prob[:, :, invalid_cls_logits] = 0.0
+    if class_prob.shape[-1] > 0:
+        class_prob[:, :, -1] = 0.0
+    max_known = class_prob.max(-1).values
+    if 'pred_known' in outputs and outputs['pred_known'] is not None:
+        known_temp = float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / hidden_dim
+        known_prob = energy_to_prob(outputs['pred_known'], known_temp)
+        unknown_prob = (1.0 - known_prob).clamp(min=0.0, max=1.0)
+    else:
+        known_prob = torch.ones_like(obj_prob)
+        unknown_prob = torch.zeros_like(obj_prob)
+    known_score = obj_prob * known_prob * max_known
+    unknown_score = obj_prob * unknown_prob * float(getattr(args, 'uod_postprocess_unknown_scale', 20.0))
+    return {
+        'obj_prob': obj_prob[0].cpu().numpy(),
+        'known_prob': known_prob[0].cpu().numpy(),
+        'unknown_prob': unknown_prob[0].cpu().numpy(),
+        'max_known': max_known[0].cpu().numpy(),
+        'known_score': known_score[0].cpu().numpy(),
+        'unknown_score': unknown_score[0].cpu().numpy(),
+    }
+
+
+def select_queries(scores, num_known, num_unknown):
+    """选择 known 和 unknown query。"""
+    known_indices = np.argsort(-scores['known_score'])[:num_known].tolist()
+    unknown_indices = np.argsort(-scores['unknown_score'])[:num_unknown].tolist()
+    return [('known', idx) for idx in known_indices] + [('unknown', idx) for idx in unknown_indices if idx not in known_indices]
+
+
+class MSDeformAttnRecorder:
+    """记录 decoder cross attention 的 sampling 信息。"""
+    def __init__(self, model):
+        from models.ops.modules import MSDeformAttn
+
+        self.records = []
+        self.patches = []
+        for name, module in model.named_modules():
+            if isinstance(module, MSDeformAttn) and 'transformer.decoder.layers' in name and name.endswith('cross_attn'):
+                self._patch_module(name, module)
+
+    def _patch_module(self, name, module):
+        original_forward = module.forward
+        recorder = self
+
+        def wrapped_forward(query, reference_points, input_flatten, input_spatial_shapes, input_level_start_index, input_padding_mask=None):
+            N, Len_q, _ = query.shape
+            value = module.value_proj(input_flatten)
+            if input_padding_mask is not None:
+                value = value.masked_fill(input_padding_mask[..., None], float(0))
+            value = value.view(N, input_flatten.shape[1], module.n_heads, module.d_model // module.n_heads)
+            sampling_offsets = module.sampling_offsets(query).view(N, Len_q, module.n_heads, module.n_levels, module.n_points, 2)
+            attention_weights = module.attention_weights(query).view(N, Len_q, module.n_heads, module.n_levels * module.n_points)
+            attention_weights = torch.softmax(attention_weights, -1).view(N, Len_q, module.n_heads, module.n_levels, module.n_points)
+            if reference_points.shape[-1] == 2:
+                offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
+                sampling_locations = reference_points[:, :, None, :, None, :] + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
+            elif reference_points.shape[-1] == 4:
+                sampling_locations = reference_points[:, :, None, :, None, :2] + sampling_offsets / module.n_points * reference_points[:, :, None, :, None, 2:] * 0.5
+            else:
+                raise ValueError('Unsupported reference point shape')
+            recorder.records.append(
+                {
+                    'name': name,
+                    'sampling_locations': sampling_locations.detach().cpu(),
+                    'attention_weights': attention_weights.detach().cpu(),
+                    'reference_points': reference_points.detach().cpu(),
+                }
+            )
+            return original_forward(query, reference_points, input_flatten, input_spatial_shapes, input_level_start_index, input_padding_mask)
+
+        module.forward = wrapped_forward
+        self.patches.append((module, original_forward))
+
+    def restore(self):
+        for module, original_forward in self.patches:
+            module.forward = original_forward
+
+
+class ODQEGateRecorder:
+    """记录 ODQE gate 输出。"""
+    def __init__(self, model):
+        self.records = []
+        self.patches = []
+        self.decay = None
+        if hasattr(model, 'odqe_layer_decay'):
+            try:
+                self.decay = model.odqe_layer_decay.detach().cpu().numpy().astype(np.float32)
+            except Exception:
+                self.decay = None
+        for name, module in model.named_modules():
+            if name.startswith('gate_mlp.') and hasattr(module, 'layers') and callable(getattr(module, 'forward', None)):
+                self._patch_module(name, module)
+
+    @staticmethod
+    def parse_layer_id(name):
+        """从 gate 模块名解析层号。"""
+        try:
+            return int(name.split('gate_mlp.')[1].split('.')[0])
+        except Exception:
+            return -1
+
+    def _patch_module(self, name, module):
+        original_forward = module.forward
+        recorder = self
+        layer_id = self.parse_layer_id(name)
+
+        def wrapped_forward(x):
+            out = original_forward(x)
+            gate = torch.sigmoid(out)
+            decay_value = 1.0
+            if recorder.decay is not None and 0 <= layer_id < len(recorder.decay):
+                decay_value = float(recorder.decay[layer_id])
+            recorder.records.append(
+                {
+                    'name': name,
+                    'layer_id': layer_id,
+                    'raw_gate': gate.detach().cpu(),
+                    'effective_gate': (gate * decay_value).detach().cpu(),
+                    'decay': decay_value,
+                }
+            )
+            return out
+
+        module.forward = wrapped_forward
+        self.patches.append((module, original_forward))
+
+    def restore(self):
+        for module, original_forward in self.patches:
+            module.forward = original_forward
+
+
+def ordered_attention_records(records):
+    """返回按层排序的 attention 记录。"""
+    return [record for _, record in layer_order(records)]
+
+
+def ordered_gate_records(records):
+    """返回按层排序的 gate 记录。"""
+    ordered = sorted(records, key=lambda item: item['layer_id'])
+    return [item for item in ordered if item['layer_id'] >= 0]
+
+
+def compute_per_layer_scores(outputs, args, invalid_cls_logits):
+    """计算每个 decoder layer 的 query 分数。"""
+    layers = []
+    hidden_dim = float(getattr(args, 'hidden_dim', 256))
+    obj_temp = float(getattr(args, 'obj_temp', 1.0)) / hidden_dim
+    known_temp = float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / hidden_dim
+    aux_outputs = list(outputs.get('aux_outputs', []))
+    all_outputs = aux_outputs + [
+        {
+            'pred_logits': outputs['pred_logits'],
+            'pred_boxes': outputs['pred_boxes'],
+            'pred_obj': outputs.get('pred_obj'),
+            'pred_known': outputs.get('pred_known'),
+        }
+    ]
+    for layer_id, out in enumerate(all_outputs):
+        pred_logits = out['pred_logits'].detach()
+        pred_boxes = out['pred_boxes'].detach()
+        pred_obj = out.get('pred_obj')
+        pred_known = out.get('pred_known')
+        class_prob = pred_logits.sigmoid().clone()
+        if invalid_cls_logits:
+            class_prob[:, :, invalid_cls_logits] = 0.0
+        if class_prob.shape[-1] > 0:
+            class_prob[:, :, -1] = 0.0
+        max_known = class_prob.max(-1).values
+        argmax_known = class_prob.argmax(-1)
+        if pred_obj is not None:
+            obj_prob = energy_to_prob(pred_obj, obj_temp)
+        else:
+            obj_prob = torch.ones_like(max_known)
+        if pred_known is not None:
+            known_prob = energy_to_prob(pred_known, known_temp)
+            unknown_prob = (1.0 - known_prob).clamp(min=0.0, max=1.0)
+        else:
+            known_prob = torch.ones_like(obj_prob)
+            unknown_prob = torch.zeros_like(obj_prob)
+        known_score = obj_prob * known_prob * max_known
+        unknown_score = obj_prob * unknown_prob * float(getattr(args, 'uod_postprocess_unknown_scale', 20.0))
+        layers.append(
+            {
+                'layer_id': layer_id,
+                'boxes': pred_boxes[0].cpu().numpy(),
+                'obj_prob': obj_prob[0].cpu().numpy(),
+                'known_prob': known_prob[0].cpu().numpy(),
+                'unknown_prob': unknown_prob[0].cpu().numpy(),
+                'max_known': max_known[0].cpu().numpy(),
+                'argmax_known': argmax_known[0].cpu().numpy(),
+                'known_score': known_score[0].cpu().numpy(),
+                'unknown_score': unknown_score[0].cpu().numpy(),
+            }
+        )
+    return layers
+
+
+def save_query_summary_csv(selected, scores, output_path):
+    """保存已选 query 的摘要 CSV。"""
+    ensure_header = 'query_kind,query_index,obj_prob,known_prob,unknown_prob,max_known,known_score,unknown_score\n'
+    with open(output_path, 'w', encoding='utf-8') as file:
+        file.write(ensure_header)
+        for query_kind, query_index in selected:
+            row = [
+                query_kind,
+                str(query_index),
+                f"{scores['obj_prob'][query_index]:.6f}",
+                f"{scores['known_prob'][query_index]:.6f}",
+                f"{scores['unknown_prob'][query_index]:.6f}",
+                f"{scores['max_known'][query_index]:.6f}",
+                f"{scores['known_score'][query_index]:.6f}",
+                f"{scores['unknown_score'][query_index]:.6f}",
+            ]
+            file.write(','.join(row) + '\n')
+
+
+def save_trajectory_csv(selected, layer_scores, gate_records, output_path):
+    """保存 query trajectory 统计 CSV。"""
+    import csv
+
+    with open(output_path, 'w', encoding='utf-8', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            [
+                'query_kind', 'query_index', 'layer_id',
+                'cx', 'cy', 'w', 'h',
+                'obj_prob', 'known_prob', 'unknown_prob', 'max_known', 'argmax_known',
+                'known_score', 'unknown_score',
+                'raw_gate_mean', 'effective_gate_mean', 'decay',
+            ]
+        )
+        for query_kind, query_index in selected:
+            for layer_id, layer in enumerate(layer_scores):
+                box = layer['boxes'][query_index]
+                gate_mean = None
+                effective_gate_mean = None
+                decay = None
+                if layer_id < len(gate_records):
+                    gate_mean = float(gate_records[layer_id]['raw_gate'][0, query_index].mean().item())
+                    effective_gate_mean = float(gate_records[layer_id]['effective_gate'][0, query_index].mean().item())
+                    decay = float(gate_records[layer_id]['decay'])
+                writer.writerow(
+                    [
+                        query_kind,
+                        int(query_index),
+                        int(layer_id),
+                        float(box[0]),
+                        float(box[1]),
+                        float(box[2]),
+                        float(box[3]),
+                        float(layer['obj_prob'][query_index]),
+                        float(layer['known_prob'][query_index]),
+                        float(layer['unknown_prob'][query_index]),
+                        float(layer['max_known'][query_index]),
+                        int(layer['argmax_known'][query_index]),
+                        float(layer['known_score'][query_index]),
+                        float(layer['unknown_score'][query_index]),
+                        gate_mean,
+                        effective_gate_mean,
+                        decay,
+                    ]
+                )
+
+
+def save_gate_statistics_csv(selected, ordered_records, scores, output_path):
+    """保存 gate 统计 CSV。"""
+    import csv
+
+    with open(output_path, 'w', encoding='utf-8', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            [
+                'query_kind', 'query_index', 'layer_id', 'decay',
+                'raw_gate_mean', 'raw_gate_std', 'raw_gate_max',
+                'effective_gate_mean', 'effective_gate_std', 'effective_gate_max',
+                'obj_prob', 'unknown_prob', 'max_known', 'known_score', 'unknown_score',
+            ]
+        )
+        for query_kind, query_index in selected:
+            for record in ordered_records:
+                raw_gate = record['raw_gate'][0, query_index].numpy()
+                effective_gate = record['effective_gate'][0, query_index].numpy()
+                writer.writerow(
+                    [
+                        query_kind,
+                        int(query_index),
+                        int(record['layer_id']),
+                        float(record['decay']),
+                        float(raw_gate.mean()),
+                        float(raw_gate.std()),
+                        float(raw_gate.max()),
+                        float(effective_gate.mean()),
+                        float(effective_gate.std()),
+                        float(effective_gate.max()),
+                        float(scores['obj_prob'][query_index]),
+                        float(scores['unknown_prob'][query_index]),
+                        float(scores['max_known'][query_index]),
+                        float(scores['known_score'][query_index]),
+                        float(scores['unknown_score'][query_index]),
+                    ]
+                )
+
+
+def save_joint_statistics_csv(selected, attn_records, gate_records, scores, output_path):
+    """保存 joint mechanism 统计 CSV。"""
+    import csv
+
+    with open(output_path, 'w', encoding='utf-8', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            [
+                'query_kind', 'query_index', 'layer_id', 'decay',
+                'obj_prob', 'unknown_prob', 'max_known', 'known_score', 'unknown_score',
+                'raw_gate_mean', 'raw_gate_std', 'effective_gate_mean', 'effective_gate_std',
+                'attention_mean', 'attention_max',
+            ]
+        )
+        for query_kind, query_index in selected:
+            for layer_id, (attn_record, gate_record) in enumerate(zip(attn_records, gate_records)):
+                raw_gate = gate_record['raw_gate'][0, query_index].numpy()
+                effective_gate = gate_record['effective_gate'][0, query_index].numpy()
+                attn = attn_record['attention_weights'][0, query_index].numpy()
+                writer.writerow(
+                    [
+                        query_kind,
+                        int(query_index),
+                        int(layer_id),
+                        float(gate_record['decay']),
+                        float(scores['obj_prob'][query_index]),
+                        float(scores['unknown_prob'][query_index]),
+                        float(scores['max_known'][query_index]),
+                        float(scores['known_score'][query_index]),
+                        float(scores['unknown_score'][query_index]),
+                        float(raw_gate.mean()),
+                        float(raw_gate.std()),
+                        float(effective_gate.mean()),
+                        float(effective_gate.std()),
+                        float(attn.mean()),
+                        float(attn.max()),
+                    ]
+                )
+
+
+def plot_selected_query_gate_overview(selected, ordered_records, output_path):
+    """绘制已选 query 的 effective gate 总览。"""
+    if not selected:
+        return None
+    matrix = []
+    row_labels = []
+    for query_kind, query_index in selected:
+        eff_mean = [record['effective_gate'][0, query_index].mean().item() for record in ordered_records]
+        matrix.append(eff_mean)
+        row_labels.append(f'{query_kind[0].upper()}-{int(query_index):03d}')
+    matrix = np.asarray(matrix, dtype=np.float32)
+    layers = [record['layer_id'] for record in ordered_records]
+    fig, ax = plt.subplots(figsize=(1.4 * len(layers) + 3.2, 0.52 * len(selected) + 2.4))
+    im = ax.imshow(matrix, aspect='auto', cmap='magma', vmin=0.0, vmax=max(1e-6, float(matrix.max())))
+    ax.set_xlabel('decoder layer')
+    ax.set_ylabel('selected query')
+    ax.set_xticks(range(len(layers)))
+    ax.set_xticklabels(layers)
+    ax.set_yticks(range(len(row_labels)))
+    ax.set_yticklabels(row_labels)
+    ax.set_title('Effective ODQE gate mean for selected queries')
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    return save_svg_figure(fig, output_path)
