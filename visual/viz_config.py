@@ -42,7 +42,7 @@ DEFAULT_VIZ_CFG = {
     'line_width_scale': 0.0045,
     'min_font_size': 8,
     'font_size_scale': 0.024,
-    'legend_font_size_scale': 0.030,
+    'legend_font_size_scale': 0.020,
     'title_font_size_scale': 0.020,
     'info_font_size_scale': 0.019,
     'header_height_ratio': 0.24,

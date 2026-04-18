@@ -41,6 +41,7 @@ run_stage "${BASE_EXP_DIR}/C3_1_UnknownOnly" \
   --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
   --train_set owdetr_t1_train \
   --lr_drop 31 \
+  --resume '/mnt/data/kky/output/PROB/exps/SOWODB/UOD_ABL_T1_CH3/C3_1_UnknownOnly/train/checkpoints/checkpoint_latest.pth' \
   --uod_enable_unknown
 
 sleep 5
