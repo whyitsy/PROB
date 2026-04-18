@@ -4,9 +4,7 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
 import torch
-from PIL import Image, ImageDraw
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -16,28 +14,10 @@ from main_open_world import get_args_parser, build_datasets
 from models import build_model
 from util import box_ops
 from util.misc import nested_tensor_from_tensor_list
-from tools.figure_svg_utils import write_gallery_svg
-
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-CATEGORY_COLORS = {
-    'known': (0, 166, 90),
-    'unknown': (216, 27, 96),
-    'odqe_salient': (30, 136, 229),
-}
+from util.visual.cases import ODQEGateRecorder, ordered_gate_records, save_case_contact_sheet_svg
 
 
-def to_numpy_image(image_tensor, target_hw=None):
-    image = image_tensor.detach().cpu().float().numpy().transpose(1, 2, 0)
-    image = image * IMAGENET_STD + IMAGENET_MEAN
-    image = np.clip(image, 0.0, 1.0)
-    if target_hw is not None:
-        height, width = int(target_hw[0]), int(target_hw[1])
-        image = image[:height, :width]
-    return (image * 255).astype(np.uint8)
-
-
-def _energy_to_prob(energy, temperature):
+def energy_to_prob(energy, temperature):
     return torch.exp(-temperature * energy.detach()).clamp(min=1e-6, max=1.0)
 
 
@@ -45,12 +25,10 @@ def compute_final_scores(outputs, args, invalid_cls_logits):
     hidden_dim = float(getattr(args, 'hidden_dim', 256))
     obj_temp = float(getattr(args, 'obj_temp', 1.0)) / hidden_dim
     known_temp = float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / hidden_dim
-
     pred_logits = outputs['pred_logits'].detach()
     pred_boxes = outputs['pred_boxes'].detach()
     pred_obj = outputs.get('pred_obj')
     pred_known = outputs.get('pred_known')
-
     class_prob = pred_logits.sigmoid().clone()
     if invalid_cls_logits:
         class_prob[:, :, invalid_cls_logits] = 0.0
@@ -58,19 +36,16 @@ def compute_final_scores(outputs, args, invalid_cls_logits):
         class_prob[:, :, -1] = 0.0
     max_known = class_prob.max(-1).values
     argmax_known = class_prob.argmax(-1)
-
     if pred_obj is not None:
-        obj_prob = _energy_to_prob(pred_obj, obj_temp)
+        obj_prob = energy_to_prob(pred_obj, obj_temp)
     else:
         obj_prob = torch.ones_like(max_known)
-
     if pred_known is not None:
-        known_prob = _energy_to_prob(pred_known, known_temp)
+        known_prob = energy_to_prob(pred_known, known_temp)
         unknown_prob = (1.0 - known_prob).clamp(min=0.0, max=1.0)
     else:
         known_prob = torch.ones_like(obj_prob)
         unknown_prob = torch.zeros_like(obj_prob)
-
     known_score = obj_prob * known_prob * max_known
     unknown_score = obj_prob * unknown_prob * float(getattr(args, 'uod_postprocess_unknown_scale', 20.0))
     return {
@@ -83,57 +58,6 @@ def compute_final_scores(outputs, args, invalid_cls_logits):
         'known_score': known_score[0],
         'unknown_score': unknown_score[0],
     }
-
-
-class ODQEGateRecorder:
-    def __init__(self, model):
-        self.records = []
-        self.patches = []
-        self.decay = None
-        if hasattr(model, 'odqe_layer_decay'):
-            try:
-                self.decay = model.odqe_layer_decay.detach().cpu().numpy().astype(np.float32)
-            except Exception:
-                self.decay = None
-        for name, module in model.named_modules():
-            if name.startswith('gate_mlp.') and hasattr(module, 'layers') and callable(getattr(module, 'forward', None)):
-                self._patch_module(name, module)
-
-    @staticmethod
-    def _parse_layer_id(name):
-        try:
-            return int(name.split('gate_mlp.')[1].split('.')[0])
-        except Exception:
-            return -1
-
-    def _patch_module(self, name, module):
-        original_forward = module.forward
-        recorder = self
-        layer_id = self._parse_layer_id(name)
-
-        def wrapped_forward(x):
-            out = original_forward(x)
-            gate = torch.sigmoid(out)
-            decay_value = 1.0
-            if recorder.decay is not None and 0 <= layer_id < len(recorder.decay):
-                decay_value = float(recorder.decay[layer_id])
-            recorder.records.append({'layer_id': layer_id, 'effective_gate': (gate * decay_value).detach().cpu()})
-            return out
-
-        module.forward = wrapped_forward
-        self.patches.append((module, original_forward))
-
-    def clear(self):
-        self.records.clear()
-
-    def restore(self):
-        for module, original_forward in self.patches:
-            module.forward = original_forward
-
-
-def ordered_gate_records(records):
-    ordered = sorted(records, key=lambda item: item['layer_id'])
-    return [item for item in ordered if item['layer_id'] >= 0]
 
 
 def _to_cpu_target(target):
@@ -221,7 +145,7 @@ def _select_best_odqe_query(candidates, gate_records, scores):
         return None
     best = None
     for q, _, weight, iou in candidates:
-        eff_gate_mean = float(np.mean([record['effective_gate'][0, q].mean().item() for record in gate_records]))
+        eff_gate_mean = float(sum(record['effective_gate'][0, q].mean().item() for record in gate_records) / len(gate_records))
         signal = eff_gate_mean * float(scores['unknown_prob'][q].item()) * float(scores['obj_prob'][q].item()) * float(iou)
         if best is None or signal > best[1]:
             best = (int(q), float(signal), eff_gate_mean, weight, iou)
@@ -235,8 +159,8 @@ def make_case_entry(category, sample_index, target, scores, query_index, categor
     gate_depth_delta = None
     if gate_records:
         per_layer_gate = [float(record['effective_gate'][0, query_index].mean().item()) for record in gate_records]
-        gate_mean = float(np.mean(per_layer_gate))
-        gate_peak = float(np.max(per_layer_gate))
+        gate_mean = float(sum(per_layer_gate) / len(per_layer_gate))
+        gate_peak = float(max(per_layer_gate))
         gate_depth_delta = float(per_layer_gate[-1] - per_layer_gate[0]) if len(per_layer_gate) >= 2 else 0.0
     return {
         'category': category,
@@ -265,34 +189,6 @@ def update_top_cases(top_cases, entry, top_k):
     category = entry['category']
     top_cases[category].append(entry)
     top_cases[category] = sorted(top_cases[category], key=lambda item: item['category_score'], reverse=True)[:top_k]
-
-
-def draw_case_tile(dataset, entry, category, tile_size=420):
-    image, target = dataset[entry['sample_index']]
-    image_hw = target['size'].tolist() if 'size' in target else image.shape[-2:]
-    image_np = to_numpy_image(image, image_hw)
-    h, w = image_np.shape[:2]
-    box = np.array(entry['box_cxcywh'], dtype=np.float32)[None, :]
-    box_xyxy = box_ops.box_cxcywh_to_xyxy(torch.from_numpy(box)).numpy()[0]
-    box_xyxy[[0, 2]] *= w
-    box_xyxy[[1, 3]] *= h
-    pil = Image.fromarray(image_np).convert('RGB').resize((tile_size, tile_size))
-    draw = ImageDraw.Draw(pil)
-    sx = tile_size / max(float(w), 1.0)
-    sy = tile_size / max(float(h), 1.0)
-    x1, y1, x2, y2 = box_xyxy
-    draw.rectangle([x1 * sx, y1 * sy, x2 * sx, y2 * sy], outline=CATEGORY_COLORS[category], width=4)
-    return pil
-
-
-def save_contact_sheet_svg(dataset, entries, category, output_path):
-    if not entries:
-        return
-    items = []
-    for entry in entries:
-        tile = draw_case_tile(dataset, entry, category)
-        items.append({'pil_image': tile, 'label_lines': [f'{category} | sample {entry["sample_index"]}', f'img {entry["image_id"]} q{entry["query_index"]} s={entry["category_score"]:.3f}', f'obj={entry["obj_prob"]:.3f} unk={entry["unknown_prob"]:.3f} ov={entry.get("gt_overlap", "n/a")}']})
-    write_gallery_svg(items, output_path, title=f'{category} representative cases', mode='sampling', cols=3, tile_width=420)
 
 
 def save_category_csv(entries, output_path):
@@ -346,7 +242,7 @@ def main(parsed_args):
         samples = nested_tensor_from_tensor_list([image]).to(device)
         cpu_target = _to_cpu_target(target)
         device_target = _to_device_target(target, device)
-        gate_recorder.clear()
+        gate_recorder.records.clear()
         with torch.no_grad():
             outputs = model(samples)
         gate_records = ordered_gate_records(gate_recorder.records)
@@ -370,12 +266,20 @@ def main(parsed_args):
     gate_recorder.restore()
     out_dir = Path(parsed_args.output_dir) / parsed_args.output_subdir
     out_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {'split': parsed_args.split, 'start_index': int(parsed_args.start_index), 'end_index': int(end_index), 'top_k': int(parsed_args.top_k), 'pseudo_epoch': int(effective_epoch), 'unknown_gt_min_iou': float(parsed_args.unknown_gt_min_iou), 'categories': top_cases}
+    manifest = {
+        'split': parsed_args.split,
+        'start_index': int(parsed_args.start_index),
+        'end_index': int(end_index),
+        'top_k': int(parsed_args.top_k),
+        'pseudo_epoch': int(effective_epoch),
+        'unknown_gt_min_iou': float(parsed_args.unknown_gt_min_iou),
+        'categories': top_cases,
+    }
     with open(out_dir / 'representative_case_manifest.json', 'w', encoding='utf-8') as file:
         json.dump(manifest, file, ensure_ascii=False, indent=2)
     for category, entries in top_cases.items():
         save_category_csv(entries, out_dir / f'{category}_top_cases.csv')
-        save_contact_sheet_svg(dataset, entries, category, out_dir / f'{category}_contact_sheet.svg')
+        save_case_contact_sheet_svg(dataset, entries, category, out_dir / f'{category}_contact_sheet.svg')
     print(f'Saved representative case mining results to: {out_dir}')
 
 
