@@ -45,10 +45,15 @@ def ema(values, alpha=0.15):
 
 def epoch_series(rows, key):
     """提取按 epoch 对齐的序列。"""
-    epochs = [int(row['epoch']) for row in rows if row.get('epoch') is not None]
-    values = [safe_float(row.get(key)) for row in rows if row.get('epoch') is not None]
-    xs = [epoch for epoch, value in zip(epochs, values) if value is not None]
-    ys = [value for value in values if value is not None]
+    xs = []
+    ys = []
+    for row in rows:
+        epoch = row.get('epoch')
+        value = safe_float(row.get(key))
+        if epoch is None or value is None:
+            continue
+        xs.append(int(epoch))
+        ys.append(value)
     return xs, ys
 
 
@@ -139,11 +144,13 @@ def plot_training_matched_objectness_loss_component(rows, output_path):
     """绘制 matched objectness loss 曲线。"""
     xs, ys = epoch_series(rows, 'train_raw_loss_obj_ll')
     if not xs:
+        xs, ys = epoch_series(rows, 'train_weighted_loss_obj_ll')
+    if not xs:
         return None
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.plot(xs, ys, marker='o', linewidth=2.2, color=PALETTE['cyan'], label='matched_objectness')
     ax.set_xlabel('Epoch')
-    ax.set_ylabel('Raw loss')
+    ax.set_ylabel('Loss')
     ax.set_title('Matched Objectness Loss Component')
     ax.grid(True, alpha=0.25)
     ax.legend(frameon=False)
@@ -303,6 +310,22 @@ def plot_step_query_score_statistics(rows, output_path):
     )
 
 
+def plot_step_pseudo_mining_statistics(rows, output_path):
+    """绘制 step pseudo mining 统计曲线。"""
+    return plot_step_group(
+        rows,
+        output_path,
+        title='Step-level Pseudo Mining Statistics',
+        ylabel='Value',
+        series=[
+            ('selected_queries', 'train/pseudo/selected_queries', PALETTE['blue']),
+            ('candidate_queries', 'train/pseudo/candidate_queries', PALETTE['green']),
+            ('reliable_background_queries', 'train/pseudo/reliable_background_queries', PALETTE['orange']),
+            ('ignored_queries', 'train/pseudo/ignored_queries', PALETTE['magenta']),
+        ],
+    )
+
+
 def plot_step_pseudo_mining_counts_bars(rows, output_path, step_bar_interval=1000):
     """绘制 step pseudo mining 柱状统计图。"""
     value_keys = [
@@ -371,7 +394,6 @@ def plot_step_auxiliary_family(rows, output_path, *, title, prefixes):
         return None
     ax.set_xlabel('Global Step')
     ax.set_ylabel('Raw loss')
-    ax.setTitle = title
     ax.set_title(title)
     ax.grid(True, alpha=0.25)
     ax.legend(frameon=False, fontsize=8, ncol=2)
