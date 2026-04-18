@@ -8,6 +8,7 @@
 # ------------------------------------------------------------------------
 import copy
 import math
+import logging
 
 import torch
 import torch.nn.functional as F
@@ -1245,7 +1246,7 @@ class ExemplarSelection(nn.Module):
 def build(args):
     num_classes = args.num_classes
     invalid_cls_logits = list(range(args.PREV_INTRODUCED_CLS + args.CUR_INTRODUCED_CLS, num_classes - 1))
-    print('Invalid class range: ' + str(invalid_cls_logits))
+    logging.info('Invalid class range: ' + str(invalid_cls_logits))
     device = torch.device(args.device)
 
     backbone = build_backbone(args)

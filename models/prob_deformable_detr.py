@@ -8,6 +8,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
+import logging
 
 from util import box_ops
 from util.misc import (
@@ -422,7 +423,7 @@ def _get_output(outputs, *keys):
 def build(args):
     num_classes = args.num_classes
     invalid_cls_logits = list(range(args.PREV_INTRODUCED_CLS + args.CUR_INTRODUCED_CLS, num_classes - 1))
-    print('Invalid class range: ' + str(invalid_cls_logits))
+    logging.info('Invalid class range: ' + str(invalid_cls_logits))
     device = torch.device(args.device)
 
     backbone = build_backbone(args)

@@ -394,7 +394,8 @@ def setup_for_distributed(is_master):
         force = kwargs.pop('force', False)
         if is_master or force:
             builtin_print(*args, **kwargs)
-
+    
+    globals()['print'] = print
     __builtin__.print = print
 
 

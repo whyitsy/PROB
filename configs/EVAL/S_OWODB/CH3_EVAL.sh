@@ -111,8 +111,6 @@ run_stage_offline_visualization() {
   latest_eval_dir="$(latest_eval_epoch_dir "${stage_out_dir}")"
   stats_dir="${latest_eval_dir}/stats"
 
-  run_python_module tools.plot_uod_manifold_3d_svg \
-    --stats_dir "${stats_dir}"
 
   run_python_module tools.mine_representative_cases_svg \
     --checkpoint "${checkpoint_path}" \

@@ -1,6 +1,9 @@
 import csv
 import math
 import os
+import traceback
+import importlib
+import importlib.util
 from pathlib import Path
 
 import matplotlib
@@ -506,9 +509,27 @@ def _compute_embedding(features, method, dim, viz_cfg):
         perplexity = min(int(viz_cfg.get('embedding_tsne_perplexity_cap', 30)), max(2, features.shape[0] // 4))
         return TSNE(n_components=dim, perplexity=perplexity, init='pca', learning_rate='auto', random_state=random_state).fit_transform(features)
     if method == 'umap':
-        from umap.umap_ import UMAP
-        n_neighbors = min(int(viz_cfg.get('embedding_umap_n_neighbors', 20)), max(2, features.shape[0] - 1))
-        reducer = UMAP(n_components=dim, n_neighbors=n_neighbors, min_dist=float(viz_cfg.get('embedding_umap_min_dist', 0.15)), random_state=random_state)
+        spec_root = importlib.util.find_spec('umap')
+        spec_sub = importlib.util.find_spec('umap.umap_')
+
+        if spec_root is None:
+            raise ImportError('Cannot find package "umap"')
+        if spec_sub is None:
+            raise ImportError(f'Cannot find submodule "umap.umap_" (root origin={getattr(spec_root, "origin", None)})')
+
+        umap_module = importlib.import_module('umap.umap_')
+        UMAP = getattr(umap_module, 'UMAP')
+
+        n_neighbors = min(
+            int(viz_cfg.get('embedding_umap_n_neighbors', 20)),
+            max(2, features.shape[0] - 1),
+        )
+        reducer = UMAP(
+            n_components=dim,
+            n_neighbors=n_neighbors,
+            min_dist=float(viz_cfg.get('embedding_umap_min_dist', 0.15)),
+            random_state=random_state,
+        )
         return reducer.fit_transform(features)
     raise ValueError(f'Unsupported embedding method: {method}')
 
@@ -577,12 +598,20 @@ def _embedding_output_dir(output_dirs, family, dim, method):
 
 
 
-def _write_embedding_error(output_dir, filename_stem, error):
+def _write_embedding_error(output_dir, filename_stem, error, trace_text=None, extra_info=None):
     _ensure_dir(output_dir)
     error_path = os.path.join(output_dir, f'{filename_stem}_error.txt')
     try:
         with open(error_path, 'w', encoding='utf-8') as file:
-            file.write(str(error))
+            file.write(f'ERROR: {repr(error)}\n\n')
+            if extra_info:
+                file.write('EXTRA INFO:\n')
+                for key, value in extra_info.items():
+                    file.write(f'- {key}: {value}\n')
+                file.write('\n')
+            if trace_text:
+                file.write('TRACEBACK:\n')
+                file.write(trace_text)
     except Exception:
         pass
 
@@ -623,7 +652,15 @@ def _plot_feature_embeddings(state, output_dirs, viz_cfg, tb_writer=None, global
                         embedding = _compute_embedding(masked_features, method, dim, viz_cfg)
                     except Exception as error:
                         axis.set_axis_off()
-                        _write_embedding_error(output_dir, filename_stem, error)
+                        trace_text = traceback.format_exc()
+                        extra_info = {
+                            'method': method,
+                            'dim': dim,
+                            'view_key': view['key'],
+                            'umap_root_origin': getattr(importlib.util.find_spec('umap'), 'origin', None),
+                            'umap_sub_origin': getattr(importlib.util.find_spec('umap.umap_'), 'origin', None),
+                        }
+                        _write_embedding_error(output_dir, filename_stem, error, trace_text=trace_text, extra_info=extra_info)
                         continue
                     _scatter_embedding(axis, embedding, labels, view['names'], view['colors'], dim)
                     axis.set_title(feature_title)
@@ -668,7 +705,15 @@ def _plot_score_space_embeddings(state, output_dirs, viz_cfg, tb_writer=None, gl
                 try:
                     embedding = _compute_embedding(masked_features, method, dim, viz_cfg)
                 except Exception as error:
-                    _write_embedding_error(output_dir, filename_stem, error)
+                    trace_text = traceback.format_exc()
+                    extra_info = {
+                        'method': method,
+                        'dim': dim,
+                        'view_key': view['key'],
+                        'umap_root_origin': getattr(importlib.util.find_spec('umap'), 'origin', None),
+                        'umap_sub_origin': getattr(importlib.util.find_spec('umap.umap_'), 'origin', None),
+                    }
+                    _write_embedding_error(output_dir, filename_stem, error, trace_text=trace_text, extra_info=extra_info)
                     continue
                 if dim == 3:
                     figure = plt.figure(figsize=(7.8, 6.2))
