@@ -2,7 +2,7 @@
 
 
 set -euo pipefail
-set -x
+# set -x
 
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -22,7 +22,7 @@ COMMON_EVAL_ARGS=(
   --dataset OWDETR
   --train_set owdetr_t1_train
   --test_set owdetr_test
-  --eval_batch_size 10
+  --eval_batch_size 15
 )
 
 CH3_ARGS=(
