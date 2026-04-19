@@ -1,8 +1,6 @@
-
 import util.misc as utils
 from util.visual.evaluation import compute_branch_correlation_metrics
 from visual.eval_visualizer import (
-    compute_branch_correlation_metrics,
     finalize_eval_visualizations,
     init_eval_visual_state as _init_eval_visual_state,
     save_eval_qualitative_cases,
