@@ -1,12 +1,11 @@
 import util.misc as utils
-from util.visual.evaluation import compute_branch_correlation_metrics
+from util.visual.evaluation import collect_eval_visual_stats_aligned, compute_branch_correlation_metrics
+from util.visual.training import write_train_step_artifacts
 from visual.eval_visualizer import (
     finalize_eval_visualizations,
     init_eval_visual_state as _init_eval_visual_state,
     save_eval_qualitative_cases,
 )
-from visual.postprocess_aligned_stats import collect_eval_visual_stats_aligned
-from visual.train_writer import write_train_step_artifacts
 
 
 def log_train_step_artifacts(
