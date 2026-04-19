@@ -7,6 +7,7 @@ from util.visual.evaluation import (
     plot_open_world_percentage_metrics,
 )
 from util.visual.training import (
+    append_json_record,
     plot_pseudo_mining_counts,
     plot_pseudo_mining_efficiency,
     plot_step_auxiliary_loss_trends,
@@ -21,12 +22,6 @@ from util.visual.training import (
     plot_training_open_world_loss_components,
     plot_training_total_loss,
 )
-
-
-def append_json_record(path: Path, record: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('a', encoding='utf-8') as file:
-        file.write(json.dumps(record, ensure_ascii=False) + '\n')
 
 
 class JsonlSeriesReader:
@@ -115,7 +110,6 @@ class ExperimentMetricsPlotter:
         if not self.train_step_rows:
             return
         plot_step_auxiliary_loss_trends(self.train_step_rows, self.train_plots_dir / 'step_auxiliary_loss_trends.svg')
-
 
 
 def refresh_metric_plots(
