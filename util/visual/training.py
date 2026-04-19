@@ -1,8 +1,13 @@
+import json
+from pathlib import Path
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
+from util.visual.evaluation import compute_train_query_score_statistics
 from util.visual.helper import save_svg_figure
 
 
@@ -18,13 +23,60 @@ PALETTE = {
     'gray': '#6C757D',
 }
 
+MODEL_STAT_KEYS = {
+    'stat_num_dummy_pos': 'train/model_stats/num_dummy_pos',
+    'stat_num_dummy_neg': 'train/model_stats/num_dummy_neg',
+    'stat_num_ignore_queries': 'train/model_stats/num_ignore_queries',
+    'stat_num_valid_unmatched': 'train/model_stats/num_valid_unmatched',
+    'stat_num_pos_candidates': 'train/model_stats/num_pos_candidates',
+    'stat_num_neg_candidates': 'train/model_stats/num_neg_candidates',
+    'stat_num_batch_selected_pos': 'train/model_stats/num_batch_selected_pos',
+    'stat_pos_thresh_mean': 'train/model_stats/pos_thresh_mean',
+    'stat_cls_attn_mean': 'train/model_stats/cls_attn_mean',
+    'stat_num_cls_soft': 'train/model_stats/num_cls_soft',
+    'gate_mean': 'train/model_stats/gate_mean',
+}
+
 
 def safe_float(value):
     """把值转成 float。"""
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        try:
+            return float(value.detach().cpu().item())
+        except Exception:
+            return None
     try:
         return float(value)
     except Exception:
         return None
+
+
+def safe_div(numerator, denominator):
+    """安全做除法。"""
+    numerator = safe_float(numerator)
+    denominator = safe_float(denominator)
+    if numerator is None or denominator is None or abs(denominator) < 1e-12:
+        return None
+    return float(numerator / denominator)
+
+
+def sum_optional_floats(*values):
+    """把可转 float 的值求和。"""
+    valid_values = []
+    for value in values:
+        numeric_value = safe_float(value)
+        if numeric_value is not None:
+            valid_values.append(numeric_value)
+    return None if not valid_values else float(sum(valid_values))
+
+
+def append_json_record(path: Path, record: dict):
+    """向 jsonl 文件追加一条记录。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a', encoding='utf-8') as file:
+        file.write(json.dumps(record, ensure_ascii=False) + '\n')
 
 
 def ema(values, alpha=0.15):
@@ -253,13 +305,7 @@ def plot_step_group(rows, output_path, *, title, ylabel, series):
 
 def plot_step_total_loss(rows, output_path):
     """绘制 step 总 loss 曲线。"""
-    return plot_step_group(
-        rows,
-        output_path,
-        title='Step-level Total Loss',
-        ylabel='Loss',
-        series=[('total_loss', 'train/loss/total', PALETTE['blue'])],
-    )
+    return plot_step_group(rows, output_path, title='Step-level Total Loss', ylabel='Loss', series=[('total_loss', 'train/loss/total', PALETTE['blue'])])
 
 
 def plot_step_base_losses(rows, output_path):
@@ -356,39 +402,18 @@ def plot_step_pseudo_mining_counts_bars(rows, output_path, step_bar_interval=100
 
 def plot_step_auxiliary_family(rows, output_path, *, title, prefixes):
     """绘制一组辅助 loss 曲线。"""
-    keys = sorted(
-        {
-            key
-            for row in rows
-            for key in row.keys()
-            if any(key.startswith(prefix) for prefix in prefixes)
-        }
-    )
+    keys = sorted({key for row in rows for key in row.keys() if any(key.startswith(prefix) for prefix in prefixes)})
     if not keys:
         return None
 
     fig, ax = plt.subplots(figsize=(12, 6.5))
-    colors = [
-        PALETTE['blue'],
-        PALETTE['orange'],
-        PALETTE['green'],
-        PALETTE['magenta'],
-        PALETTE['cyan'],
-        PALETTE['red'],
-        PALETTE['purple'],
-    ]
+    colors = [PALETTE['blue'], PALETTE['orange'], PALETTE['green'], PALETTE['magenta'], PALETTE['cyan'], PALETTE['red'], PALETTE['purple']]
     plotted = False
     for index, key in enumerate(keys):
         xs, ys = step_series(rows, key)
         if xs:
             plotted = True
-            ax.plot(
-                xs,
-                ema(ys, alpha=0.08),
-                linewidth=1.8,
-                color=colors[index % len(colors)],
-                label=key.replace('train/loss_raw/', ''),
-            )
+            ax.plot(xs, ema(ys, alpha=0.08), linewidth=1.8, color=colors[index % len(colors)], label=key.replace('train/loss_raw/', ''))
     if not plotted:
         plt.close(fig)
         return None
@@ -402,32 +427,17 @@ def plot_step_auxiliary_family(rows, output_path, *, title, prefixes):
 
 def plot_step_aux_obj_pseudo_loss_trends(rows, output_path):
     """绘制 obj pseudo 辅助 loss 曲线。"""
-    return plot_step_auxiliary_family(
-        rows,
-        output_path,
-        title='Step-level Auxiliary Objectness Pseudo Loss Trends',
-        prefixes=['train/loss_raw/loss_obj_pseudo_'],
-    )
+    return plot_step_auxiliary_family(rows, output_path, title='Step-level Auxiliary Objectness Pseudo Loss Trends', prefixes=['train/loss_raw/loss_obj_pseudo_'])
 
 
 def plot_step_aux_unk_pseudo_loss_trends(rows, output_path):
     """绘制 unk pseudo 辅助 loss 曲线。"""
-    return plot_step_auxiliary_family(
-        rows,
-        output_path,
-        title='Step-level Auxiliary Unknownness Pseudo Loss Trends',
-        prefixes=['train/loss_raw/loss_unk_pseudo_'],
-    )
+    return plot_step_auxiliary_family(rows, output_path, title='Step-level Auxiliary Unknownness Pseudo Loss Trends', prefixes=['train/loss_raw/loss_unk_pseudo_'])
 
 
 def plot_step_aux_decorr_loss_trends(rows, output_path):
     """绘制 decorr 辅助 loss 曲线。"""
-    return plot_step_auxiliary_family(
-        rows,
-        output_path,
-        title='Step-level Auxiliary Decorrelation Loss Trends',
-        prefixes=['train/loss_raw/loss_decorr_'],
-    )
+    return plot_step_auxiliary_family(rows, output_path, title='Step-level Auxiliary Decorrelation Loss Trends', prefixes=['train/loss_raw/loss_decorr_'])
 
 
 def plot_step_auxiliary_loss_trends(rows, output_path):
@@ -436,9 +446,143 @@ def plot_step_auxiliary_loss_trends(rows, output_path):
         rows,
         output_path,
         title='Step-level Auxiliary Loss Trends',
-        prefixes=[
-            'train/loss_raw/loss_obj_pseudo_',
-            'train/loss_raw/loss_unk_pseudo_',
-            'train/loss_raw/loss_decorr_',
-        ],
+        prefixes=['train/loss_raw/loss_obj_pseudo_', 'train/loss_raw/loss_unk_pseudo_', 'train/loss_raw/loss_decorr_'],
     )
+
+
+def _add_numeric_items(record, prefix, values):
+    """把字典里的数值写入记录。"""
+    for key, value in values.items():
+        numeric_value = safe_float(value)
+        if numeric_value is not None:
+            record[f'{prefix}/{key}'] = numeric_value
+
+
+def _add_model_stat_items(record, reduced_model_stat_dict):
+    """把模型中间统计写入记录。"""
+    reduced_model_stat_dict = reduced_model_stat_dict or {}
+    for source_key, record_key in MODEL_STAT_KEYS.items():
+        numeric_value = safe_float(reduced_model_stat_dict.get(source_key))
+        if numeric_value is not None:
+            record[record_key] = numeric_value
+
+
+def write_train_step_artifacts(tb_writer, step_jsonl_path, global_step, epoch, local_step, optimizer, grad_total_norm, outputs, targets, criterion, total_loss, reduced_loss_dict, reduced_weighted_loss_dict, reduced_model_stat_dict=None, viz_cfg=None, args=None):
+    """写训练 step 的数值记录和 tensorboard 标量。"""
+    record = {
+        'global_step': int(global_step),
+        'epoch': int(epoch),
+        'local_step': int(local_step),
+        'train/loss/total': float(total_loss),
+        'train/lr': safe_float(optimizer.param_groups[0]['lr']) if optimizer is not None else None,
+        'train/grad_norm': safe_float(grad_total_norm),
+    }
+    _add_numeric_items(record, 'train/loss_raw', reduced_loss_dict)
+    _add_numeric_items(record, 'train/loss_weighted', reduced_weighted_loss_dict)
+    _add_model_stat_items(record, reduced_model_stat_dict)
+
+    model_stats = reduced_model_stat_dict or {}
+    selected_count = reduced_loss_dict.get('num_selected_pseudo_positive_queries', model_stats.get('stat_num_batch_selected_pos'))
+    candidate_count = reduced_loss_dict.get('num_pseudo_positive_candidates', model_stats.get('stat_num_pos_candidates'))
+    unmatched_count = reduced_loss_dict.get('num_unmatched_queries_after_filter', model_stats.get('stat_num_valid_unmatched'))
+    reliable_background_count = reduced_loss_dict.get('num_selected_reliable_background_queries', model_stats.get('stat_num_dummy_neg'))
+    ignored_count = reduced_loss_dict.get('num_classification_ignored_queries', model_stats.get('stat_num_ignore_queries'))
+    record['train/pseudo/selected_queries'] = safe_float(selected_count)
+    record['train/pseudo/candidate_queries'] = safe_float(candidate_count)
+    record['train/pseudo/valid_unmatched_queries'] = safe_float(unmatched_count)
+    record['train/pseudo/reliable_background_queries'] = safe_float(reliable_background_count)
+    record['train/pseudo/ignored_queries'] = safe_float(ignored_count)
+
+    record.update(compute_train_query_score_statistics(outputs, targets, criterion, args))
+    append_json_record(Path(step_jsonl_path), record)
+
+    if tb_writer is None or viz_cfg is None:
+        return
+    for key, value in record.items():
+        if key in {'global_step', 'epoch', 'local_step'} or value is None:
+            continue
+        tb_writer.add_scalar(key, value, global_step)
+
+    objectness_energy = outputs.get('pred_obj', outputs.get('pred_objectness_energy', None))
+    unknown_logit = outputs.get('pred_unk', outputs.get('pred_unknown_logit', None))
+    if global_step % 100 == 0:
+        if objectness_energy is not None:
+            tb_writer.add_histogram('train/distribution/objectness_energy', objectness_energy.detach().float().cpu(), global_step)
+        if unknown_logit is not None:
+            tb_writer.add_histogram('train/distribution/unknown_logit', unknown_logit.detach().float().cpu(), global_step)
+            tb_writer.add_histogram('train/distribution/unknown_probability', torch.sigmoid(unknown_logit.detach()).float().cpu(), global_step)
+
+
+def build_train_epoch_record(epoch, train_stats, num_trainable_parameters):
+    """构建训练 epoch 记录。"""
+    train_stats = train_stats or {}
+    return {
+        'epoch': int(epoch),
+        'num_trainable_parameters': num_trainable_parameters,
+        'train_total_loss': safe_float(train_stats.get('loss')),
+        'train_lr': safe_float(train_stats.get('lr')),
+        'train_grad_norm': safe_float(train_stats.get('grad_norm')),
+        'train_class_error': safe_float(train_stats.get('class_error')),
+        'train_weighted_loss_ce': safe_float(train_stats.get('weighted_loss_ce')),
+        'train_raw_loss_ce': safe_float(train_stats.get('raw_loss_ce')),
+        'train_weighted_loss_bbox': safe_float(train_stats.get('weighted_loss_bbox')),
+        'train_raw_loss_bbox': safe_float(train_stats.get('raw_loss_bbox')),
+        'train_weighted_loss_giou': safe_float(train_stats.get('weighted_loss_giou')),
+        'train_raw_loss_giou': safe_float(train_stats.get('raw_loss_giou')),
+        'train_weighted_loss_obj_ll': safe_float(train_stats.get('weighted_loss_obj_ll')),
+        'train_raw_loss_obj_ll': safe_float(train_stats.get('raw_loss_obj_ll')),
+        'train_weighted_loss_unk_known': safe_float(train_stats.get('weighted_loss_unk_known')),
+        'train_raw_loss_unk_known': safe_float(train_stats.get('raw_loss_unk_known')),
+        'train_weighted_loss_obj_pseudo': safe_float(train_stats.get('weighted_loss_obj_pseudo')),
+        'train_raw_loss_obj_pseudo': safe_float(train_stats.get('raw_loss_obj_pseudo')),
+        'train_weighted_loss_obj_neg': safe_float(train_stats.get('weighted_loss_obj_neg')),
+        'train_raw_loss_obj_neg': safe_float(train_stats.get('raw_loss_obj_neg')),
+        'train_weighted_loss_unk_pseudo': safe_float(train_stats.get('weighted_loss_unk_pseudo')),
+        'train_raw_loss_unk_pseudo': safe_float(train_stats.get('raw_loss_unk_pseudo')),
+        'train_weighted_loss_decorr': safe_float(train_stats.get('weighted_loss_decorr')),
+        'train_raw_loss_decorr': safe_float(train_stats.get('raw_loss_decorr')),
+        'train_weighted_loss_bbox_pseudo_cons': safe_float(train_stats.get('weighted_loss_bbox_pseudo_cons')),
+        'train_raw_loss_bbox_pseudo_cons': safe_float(train_stats.get('raw_loss_bbox_pseudo_cons')),
+        'train_weighted_loss_giou_pseudo_cons': safe_float(train_stats.get('weighted_loss_giou_pseudo_cons')),
+        'train_raw_loss_giou_pseudo_cons': safe_float(train_stats.get('raw_loss_giou_pseudo_cons')),
+        'num_selected_pseudo_positive_queries': safe_float(train_stats.get('num_selected_pseudo_positive_queries', train_stats.get('stat_num_batch_selected_pos'))),
+        'num_selected_reliable_background_queries': safe_float(train_stats.get('num_selected_reliable_background_queries', train_stats.get('stat_num_dummy_neg'))),
+        'num_pseudo_positive_candidates': safe_float(train_stats.get('num_pseudo_positive_candidates', train_stats.get('stat_num_pos_candidates'))),
+        'num_classification_ignored_queries': safe_float(train_stats.get('num_classification_ignored_queries', train_stats.get('stat_num_ignore_queries'))),
+        'num_unmatched_queries_after_filter': safe_float(train_stats.get('num_unmatched_queries_after_filter', train_stats.get('stat_num_valid_unmatched'))),
+        'train_gate_mean': safe_float(train_stats.get('gate_mean')),
+        'train_pos_thresh_mean': safe_float(train_stats.get('stat_pos_thresh_mean')),
+        'pseudo_positive_selection_ratio': safe_div(
+            train_stats.get('num_selected_pseudo_positive_queries', train_stats.get('stat_num_batch_selected_pos')),
+            train_stats.get('num_unmatched_queries_after_filter', train_stats.get('stat_num_valid_unmatched')),
+        ),
+        'pseudo_positive_accept_ratio': safe_div(
+            train_stats.get('num_selected_pseudo_positive_queries', train_stats.get('stat_num_batch_selected_pos')),
+            train_stats.get('num_pseudo_positive_candidates', train_stats.get('stat_num_pos_candidates')),
+        ),
+        'train_total_knownness_loss': sum_optional_floats(train_stats.get('raw_loss_unk_known'), train_stats.get('raw_loss_unk_pseudo')),
+    }
+
+
+def build_eval_epoch_record(epoch, eval_stats, num_trainable_parameters):
+    """构建评估 epoch 记录。"""
+    open_world_metrics = eval_stats.get('open_world_metrics', {}) if isinstance(eval_stats, dict) else {}
+    return {
+        'epoch': int(epoch),
+        'num_trainable_parameters': num_trainable_parameters,
+        'open_world_metrics': open_world_metrics,
+    }
+
+
+def write_eval_scalars_to_tensorboard(viz_ctx, eval_stats, epoch):
+    """把评估指标写入 tensorboard。"""
+    if viz_ctx is None or viz_ctx.tb_writer is None or not isinstance(eval_stats, dict):
+        return
+    for key, value in eval_stats.items():
+        if key == 'open_world_metrics' and isinstance(value, dict):
+            for metric_name, metric_value in value.items():
+                if isinstance(metric_value, (int, float)):
+                    tag = 'A-OSE' if metric_name == 'AOSA' else metric_name
+                    viz_ctx.tb_writer.add_scalar(f'eval/metrics/{tag}', metric_value, epoch)
+        elif isinstance(value, (int, float)):
+            viz_ctx.tb_writer.add_scalar(f'eval/{key}', value, epoch)

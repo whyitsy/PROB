@@ -1,14 +1,11 @@
-
 import util.misc as utils
-from util.visual.evaluation import compute_branch_correlation_metrics
+from util.visual.evaluation import collect_eval_visual_stats_aligned, compute_branch_correlation_metrics
+from util.visual.training import write_train_step_artifacts
 from visual.eval_visualizer import (
-    compute_branch_correlation_metrics,
     finalize_eval_visualizations,
     init_eval_visual_state as _init_eval_visual_state,
     save_eval_qualitative_cases,
 )
-from visual.postprocess_aligned_stats import collect_eval_visual_stats_aligned
-from visual.train_writer import write_train_step_artifacts
 
 
 def log_train_step_artifacts(
@@ -24,6 +21,7 @@ def log_train_step_artifacts(
     total_loss,
     reduced_loss_dict,
     reduced_weighted_loss_dict,
+    reduced_model_stat_dict=None,
     args=None,
 ):
     if viz_ctx is None or not viz_ctx.should_write_artifacts:
@@ -42,6 +40,7 @@ def log_train_step_artifacts(
         total_loss=total_loss,
         reduced_loss_dict=reduced_loss_dict,
         reduced_weighted_loss_dict=reduced_weighted_loss_dict,
+        reduced_model_stat_dict=reduced_model_stat_dict,
         viz_cfg=viz_ctx.viz_cfg,
         args=args,
     )
