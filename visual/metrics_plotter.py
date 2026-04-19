@@ -2,29 +2,26 @@
 import json
 from pathlib import Path
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import numpy as np
-
-PALETTE = {
-    'blue': '#0077BB',
-    'orange': '#EE7733',
-    'cyan': '#33BBEE',
-    'red': '#CC3311',
-    'green': '#009988',
-    'magenta': '#EE3377',
-    'yellow': '#EEDD44',
-    'purple': '#7A52A5',
-    'gray': '#6C757D',
-}
-
-
-def _safe_float(value):
-    try:
-        return float(value)
-    except Exception:
-        return None
+from util.visual.evaluation import (
+    plot_branch_correlation_trends,
+    plot_open_world_error_metrics,
+    plot_open_world_percentage_metrics,
+)
+from util.visual.training import (
+    plot_pseudo_mining_counts,
+    plot_pseudo_mining_efficiency,
+    plot_step_auxiliary_loss_trends,
+    plot_step_base_losses,
+    plot_step_open_world_losses,
+    plot_step_pseudo_mining_counts_bars,
+    plot_step_pseudo_mining_statistics,
+    plot_step_query_score_statistics,
+    plot_step_total_loss,
+    plot_training_base_loss_components,
+    plot_training_matched_objectness_loss_component,
+    plot_training_open_world_loss_components,
+    plot_training_total_loss,
+)
 
 
 def append_json_record(path: Path, record: dict):
@@ -33,7 +30,7 @@ def append_json_record(path: Path, record: dict):
         file.write(json.dumps(record, ensure_ascii=False) + '\n')
 
 
-class _JsonlSeriesReader:
+class JsonlSeriesReader:
     def __init__(self, jsonl_path: Path):
         self.jsonl_path = Path(jsonl_path)
 
@@ -50,21 +47,6 @@ class _JsonlSeriesReader:
             except Exception:
                 continue
         return rows
-
-
-def _ema(values, alpha=0.15):
-    smoothed = []
-    previous = None
-    for value in values:
-        if value is None:
-            smoothed.append(previous)
-            continue
-        if previous is None:
-            previous = value
-        else:
-            previous = alpha * value + (1.0 - alpha) * previous
-        smoothed.append(previous)
-    return smoothed
 
 
 class ExperimentMetricsPlotter:
@@ -85,87 +67,26 @@ class ExperimentMetricsPlotter:
         self.eval_plots_dir = self.output_dir / 'eval' / 'plots'
         self.train_plots_dir.mkdir(parents=True, exist_ok=True)
         self.eval_plots_dir.mkdir(parents=True, exist_ok=True)
-        self.train_epoch_rows = _JsonlSeriesReader(self.train_epoch_metrics_path).rows()
-        self.eval_epoch_rows = _JsonlSeriesReader(self.eval_epoch_metrics_path).rows()
-        self.train_step_rows = _JsonlSeriesReader(self.train_step_metrics_path).rows()
+        self.train_epoch_rows = JsonlSeriesReader(self.train_epoch_metrics_path).rows()
+        self.eval_epoch_rows = JsonlSeriesReader(self.eval_epoch_metrics_path).rows()
+        self.train_step_rows = JsonlSeriesReader(self.train_step_metrics_path).rows()
 
     def refresh_all(self):
-        self.plot_eval_open_world_metrics()
-        self.plot_epoch_training_losses()
-        self.plot_epoch_pseudo_statistics()
-        self.plot_epoch_branch_correlation_metrics()
-        self.plot_step_training_losses()
-        self.plot_step_pseudo_statistics()
-        self.plot_step_auxiliary_losses()
+        self.refresh_eval_plots()
+        self.refresh_epoch_training_plots()
+        self.refresh_epoch_pseudo_plots()
+        self.refresh_step_training_plots()
+        self.refresh_step_pseudo_plots()
+        self.refresh_step_auxiliary_plots()
 
-    def _save(self, figure, file_stem, split='train'):
-        output_dir = self.train_plots_dir if split == 'train' else self.eval_plots_dir
-        figure.savefig(output_dir / f'{file_stem}.svg', bbox_inches='tight')
-        plt.close(figure)
-
-    def plot_eval_open_world_metrics(self):
+    def refresh_eval_plots(self):
         if not self.eval_epoch_rows:
             return
-        history = []
-        for row in self.eval_epoch_rows:
-            epoch = row.get('epoch')
-            metrics = row.get('open_world_metrics') or row.get('test_metrics') or {}
-            if epoch is None:
-                continue
-            history.append({
-                'epoch': int(epoch),
-                'current_ap50': _safe_float(metrics.get('CK_AP50')),
-                'known_ap50': _safe_float(metrics.get('K_AP50')),
-                'unknown_recall50': _safe_float(metrics.get('U_R50')),
-                'wilderness_impact': _safe_float(metrics.get('WI')),
-                'absolute_open_set_error': _safe_float(metrics.get('AOSA', metrics.get('A-OSE'))),
-            })
-        if not history:
-            return
+        plot_open_world_percentage_metrics(self.eval_epoch_rows, self.eval_plots_dir / 'open_world_percentage_metrics.svg')
+        plot_open_world_error_metrics(self.eval_epoch_rows, self.eval_plots_dir / 'open_world_error_metrics.svg')
+        plot_branch_correlation_trends(self.eval_epoch_rows, self.eval_plots_dir / 'branch_correlation_trends.svg')
 
-        figure, axis = plt.subplots(figsize=(10, 6))
-        for label, key, color in [
-            ('Current AP50', 'current_ap50', PALETTE['blue']),
-            ('Known AP50', 'known_ap50', PALETTE['green']),
-            ('Unknown Recall50', 'unknown_recall50', PALETTE['magenta']),
-        ]:
-            xs = [item['epoch'] for item in history if item[key] is not None]
-            ys = [item[key] for item in history if item[key] is not None]
-            if xs:
-                axis.plot(xs, ys, marker='o', linewidth=2.2, color=color, label=label)
-        axis.set_xlabel('Epoch')
-        axis.set_ylabel('Percentage (%)')
-        axis.set_title('Open-World Detection Percentage Metrics')
-        axis.grid(True, alpha=0.25)
-        axis.legend(frameon=False)
-        self._save(figure, 'open_world_percentage_metrics', split='eval')
-
-        figure, left_axis = plt.subplots(figsize=(10, 6))
-        lines = []
-        labels = []
-        xs = [item['epoch'] for item in history if item['wilderness_impact'] is not None]
-        ys = [item['wilderness_impact'] for item in history if item['wilderness_impact'] is not None]
-        if xs:
-            line = left_axis.plot(xs, ys, marker='o', linewidth=2.2, color=PALETTE['orange'], label='WI@0.8')[0]
-            lines.append(line)
-            labels.append(line.get_label())
-        right_axis = left_axis.twinx()
-        xs = [item['epoch'] for item in history if item['absolute_open_set_error'] is not None]
-        ys = [item['absolute_open_set_error'] for item in history if item['absolute_open_set_error'] is not None]
-        if xs:
-            line = right_axis.plot(xs, ys, marker='s', linewidth=2.2, color=PALETTE['red'], label='A-OSE')[0]
-            lines.append(line)
-            labels.append(line.get_label())
-        left_axis.set_xlabel('Epoch')
-        left_axis.set_ylabel('Wilderness Impact')
-        right_axis.set_ylabel('Absolute Open-Set Error')
-        left_axis.set_title('Open-World Error Metrics')
-        left_axis.grid(True, alpha=0.25)
-        if lines:
-            left_axis.legend(lines, labels, frameon=False)
-        self._save(figure, 'open_world_error_metrics', split='eval')
-
-    def plot_epoch_training_losses(self):
+    def refresh_epoch_training_plots(self):
         if not self.train_epoch_rows:
             return
         epochs = [int(row['epoch']) for row in self.train_epoch_rows if row.get('epoch') is not None]
@@ -325,7 +246,7 @@ class ExperimentMetricsPlotter:
         else:
             plt.close(figure)
 
-    def plot_step_training_losses(self):
+    def refresh_step_training_plots(self):
         if not self.train_step_rows:
             return
         self._plot_step_group(
@@ -357,7 +278,7 @@ class ExperimentMetricsPlotter:
             ylabel='Value',
         )
 
-    def plot_step_pseudo_statistics(self):
+    def refresh_step_pseudo_plots(self):
         if not self.train_step_rows:
             return
         value_keys = [
@@ -385,7 +306,7 @@ class ExperimentMetricsPlotter:
         axis.legend(frameon=False, ncol=2)
         self._save(figure, 'step_pseudo_mining_counts_bars', split='train')
 
-    def plot_step_auxiliary_losses(self):
+    def refresh_step_auxiliary_plots(self):
         if not self.train_step_rows:
             return
         self._plot_step_auxiliary_family(

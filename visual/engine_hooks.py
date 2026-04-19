@@ -1,5 +1,6 @@
 
 import util.misc as utils
+from util.visual.evaluation import compute_branch_correlation_metrics
 from visual.eval_visualizer import (
     compute_branch_correlation_metrics,
     finalize_eval_visualizations,

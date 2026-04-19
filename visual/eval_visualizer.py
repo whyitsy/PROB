@@ -6,16 +6,31 @@ import importlib
 import importlib.util
 from pathlib import Path
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
 
 from util import box_ops
+from util.visual.cases import (
+    filter_prediction_display,
+    render_error_known_to_unknown,
+    render_error_unknown_to_known,
+    render_ground_truth,
+    render_known_predictions,
+    render_prediction_vs_gt,
+    render_unknown_predictions,
+    save_contact_sheet,
+)
+from util.visual.embeddings import plot_feature_embedding_views, plot_score_space_embedding_views
+from util.visual.evaluation import (
+    compute_branch_correlation_metrics,
+    plot_branch_correlation_heatmap,
+    plot_layer_prediction_summary,
+    plot_query_probability_histograms_by_group,
+    plot_query_relationship_scatter,
+)
+from util.visual.helper import cxcywh_to_abs_xyxy, ensure_parent, save_image, to_numpy_image
+
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -338,22 +353,22 @@ def _save_contact_sheet(image_paths, output_path, viz_cfg):
     tile_width = viz_cfg['panel_tile_width']
     tile_height = viz_cfg['panel_tile_height']
     cols = viz_cfg['panel_cols']
-    valid_images = []
-    for path in image_paths:
-        try:
-            image = Image.open(path).convert('RGB')
-            image = image.resize((tile_width, tile_height))
-            valid_images.append(image)
-        except Exception:
-            continue
-    if not valid_images:
-        return
-    rows = int(math.ceil(len(valid_images) / cols))
-    sheet = Image.new('RGB', (cols * tile_width, rows * tile_height), (20, 20, 20))
-    for index, image in enumerate(valid_images):
+    images = []
+    for image_np, title in images_with_titles:
+        image = Image.fromarray(image_np).convert('RGB').resize((tile_width, tile_height))
+        canvas = Image.new('RGB', (tile_width, tile_height), (20, 20, 20))
+        canvas.paste(image, (0, 0))
+        draw = ImageDraw.Draw(canvas)
+        font = _get_font(np.asarray(canvas), viz_cfg['font_size_scale'], viz_cfg['min_font_size'])
+        _draw_text_with_background(draw, (8, 8), title, font, (255, 255, 255))
+        images.append(canvas)
+    rows = int(math.ceil(len(images) / cols))
+    sheet = Image.new('RGB', (cols * tile_width, rows * tile_height), (15, 15, 15))
+    for index, image in enumerate(images):
         x = (index % cols) * tile_width
         y = (index // cols) * tile_height
         sheet.paste(image, (x, y))
+    ensure_parent(output_path)
     sheet.save(output_path)
 
 
@@ -880,10 +895,11 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
     for batch_index in range(len(targets)):
         if state['saved_case_count'] >= viz_cfg['max_qualitative_cases']:
             break
+
         image_hw = targets[batch_index]['size'].tolist()
-        image_np = _to_numpy_image(samples.tensors[batch_index], image_hw)
+        image_np = to_numpy_image(samples.tensors[batch_index], image_hw)
         image_id = int(targets[batch_index]['image_id'].item()) if 'image_id' in targets[batch_index] else state['saved_case_count']
-        ground_truth_boxes = _cxcywh_to_abs_xyxy(targets[batch_index]['boxes'], image_hw)
+        ground_truth_boxes = cxcywh_to_abs_xyxy(targets[batch_index]['boxes'], image_hw)
         ground_truth_labels = targets[batch_index]['labels'].detach().cpu().numpy()
 
         prediction = postprocessed_predictions[batch_index]
@@ -966,6 +982,12 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
 
             unknown_to_known_image = _draw_boxes(
                 image_np,
+                filtered_boxes,
+                filtered_labels,
+                filtered_scores,
+                ground_truth_boxes,
+                ground_truth_labels,
+                unknown_label,
                 viz_cfg,
                 prediction_boxes=prediction_boxes[u2k_pred] if len(u2k_pred) > 0 else None,
                 prediction_labels=prediction_labels[u2k_pred] if len(u2k_pred) > 0 else None,
@@ -976,6 +998,12 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
             )
             known_to_unknown_image = _draw_boxes(
                 image_np,
+                filtered_boxes,
+                filtered_labels,
+                filtered_scores,
+                ground_truth_boxes,
+                ground_truth_labels,
+                unknown_label,
                 viz_cfg,
                 prediction_boxes=prediction_boxes[k2u_pred] if len(k2u_pred) > 0 else None,
                 prediction_labels=prediction_labels[k2u_pred] if len(k2u_pred) > 0 else None,
