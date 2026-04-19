@@ -18,13 +18,14 @@ from util.visual.cases import (
 )
 from util.visual.embeddings import plot_feature_embedding_views, plot_score_space_embedding_views
 from util.visual.evaluation import (
+    FEATURE_METADATA_KEYS,
+    QUERY_METADATA_KEYS,
     plot_branch_correlation_heatmap,
     plot_layer_prediction_summary,
     plot_query_probability_histograms_by_group,
     plot_query_relationship_scatter,
 )
 from util.visual.helper import cxcywh_to_abs_xyxy, ensure_parent, to_numpy_image
-from visual.postprocess_aligned_stats import FEATURE_METADATA_KEYS, QUERY_METADATA_KEYS
 
 
 QUERY_STATS_COLUMNS = [
@@ -40,7 +41,6 @@ def _ensure_dir(path):
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
-
 def _get_font(pixel_reference, font_scale, min_size):
     if isinstance(pixel_reference, np.ndarray):
         ref = max(pixel_reference.shape[0], pixel_reference.shape[1])
@@ -53,13 +53,11 @@ def _get_font(pixel_reference, font_scale, min_size):
         return ImageFont.load_default()
 
 
-
 def _draw_text_with_background(draw, xy, text, font, fill, background_fill=(20, 20, 20)):
     bbox = draw.textbbox(xy, text, font=font)
     pad = 2
     draw.rectangle([bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad], fill=background_fill)
     draw.text(xy, text, font=font, fill=fill)
-
 
 
 def _draw_stage_boxes(image_np, viz_cfg, stage_boxes, title, color_rgb, stage_texts=None):
@@ -74,7 +72,6 @@ def _draw_stage_boxes(image_np, viz_cfg, stage_boxes, title, color_rgb, stage_te
             _draw_text_with_background(draw, (x1 + 2, y1 + 2), stage_texts[index], font, color_rgb)
     _draw_text_with_background(draw, (8, 6), title, font, (255, 255, 255))
     return np.array(image)
-
 
 
 def _save_panel(images_with_titles, output_path, viz_cfg):
@@ -98,7 +95,6 @@ def _save_panel(images_with_titles, output_path, viz_cfg):
         sheet.paste(tile, (x, y))
     ensure_parent(output_path)
     sheet.save(output_path)
-
 
 
 def init_eval_visual_state(viz_cfg):
@@ -137,7 +133,6 @@ def init_eval_visual_state(viz_cfg):
     return state
 
 
-
 def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictions, outputs, criterion, args, output_dir, viz_cfg, tb_writer=None, global_step=0, epoch=0):
     del tb_writer, global_step
     epoch = max(int(epoch), 0)
@@ -168,14 +163,7 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
         raw_boxes = prediction['boxes'].detach().cpu().numpy()
         raw_labels = prediction['labels'].detach().cpu().numpy()
         raw_scores = prediction['scores'].detach().cpu().numpy()
-        filtered_boxes, filtered_labels, filtered_scores = filter_prediction_display(
-            raw_boxes,
-            raw_labels,
-            raw_scores,
-            image_hw,
-            unknown_label,
-            viz_cfg,
-        )
+        filtered_boxes, filtered_labels, filtered_scores = filter_prediction_display(raw_boxes, raw_labels, raw_scores, image_hw, unknown_label, viz_cfg)
 
         case_prefix = f'{image_id:012d}__epoch_{epoch:04d}'
         prediction_vs_gt_path = os.path.join(final_dir, f'{case_prefix}__prediction_vs_gt.png')
@@ -183,17 +171,7 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
         unknown_predictions_path = os.path.join(final_dir, f'{case_prefix}__unknown_predictions.png')
         ground_truth_path = os.path.join(final_dir, f'{case_prefix}__ground_truth.png')
 
-        render_prediction_vs_gt(
-            image_np,
-            filtered_boxes,
-            filtered_labels,
-            filtered_scores,
-            ground_truth_boxes,
-            ground_truth_labels,
-            unknown_label,
-            viz_cfg,
-            prediction_vs_gt_path,
-        )
+        render_prediction_vs_gt(image_np, filtered_boxes, filtered_labels, filtered_scores, ground_truth_boxes, ground_truth_labels, unknown_label, viz_cfg, prediction_vs_gt_path)
         render_known_predictions(image_np, filtered_boxes, filtered_labels, filtered_scores, unknown_label, viz_cfg, known_predictions_path)
         render_unknown_predictions(image_np, filtered_boxes, filtered_labels, filtered_scores, unknown_label, viz_cfg, unknown_predictions_path)
         render_ground_truth(image_np, ground_truth_boxes, ground_truth_labels, unknown_label, viz_cfg, ground_truth_path)
@@ -219,28 +197,8 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
         if viz_cfg.get('save_error_panel', False):
             unknown_to_known_path = os.path.join(final_dir, f'{case_prefix}__error_unknown_to_known.png')
             known_to_unknown_path = os.path.join(final_dir, f'{case_prefix}__error_known_to_unknown.png')
-            _, num_u2k = render_error_unknown_to_known(
-                image_np,
-                filtered_boxes,
-                filtered_labels,
-                filtered_scores,
-                ground_truth_boxes,
-                ground_truth_labels,
-                unknown_label,
-                viz_cfg,
-                unknown_to_known_path,
-            )
-            _, num_k2u = render_error_known_to_unknown(
-                image_np,
-                filtered_boxes,
-                filtered_labels,
-                filtered_scores,
-                ground_truth_boxes,
-                ground_truth_labels,
-                unknown_label,
-                viz_cfg,
-                known_to_unknown_path,
-            )
+            _, num_u2k = render_error_unknown_to_known(image_np, filtered_boxes, filtered_labels, filtered_scores, ground_truth_boxes, ground_truth_labels, unknown_label, viz_cfg, unknown_to_known_path)
+            _, num_k2u = render_error_known_to_unknown(image_np, filtered_boxes, filtered_labels, filtered_scores, ground_truth_boxes, ground_truth_labels, unknown_label, viz_cfg, known_to_unknown_path)
             if num_u2k > 0:
                 state['saved_error_panels'].append(unknown_to_known_path)
             if num_k2u > 0:
@@ -271,7 +229,6 @@ def save_eval_qualitative_cases(state, samples, targets, postprocessed_predictio
             state['saved_stage_panels'].append(stage_panel_path)
 
         state['saved_case_count'] += 1
-
 
 
 def finalize_eval_visualizations(state, output_dir, epoch, viz_cfg, tb_writer=None):
