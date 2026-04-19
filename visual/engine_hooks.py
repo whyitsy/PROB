@@ -21,6 +21,7 @@ def log_train_step_artifacts(
     total_loss,
     reduced_loss_dict,
     reduced_weighted_loss_dict,
+    reduced_model_stat_dict=None,
     args=None,
 ):
     if viz_ctx is None or not viz_ctx.should_write_artifacts:
@@ -39,6 +40,7 @@ def log_train_step_artifacts(
         total_loss=total_loss,
         reduced_loss_dict=reduced_loss_dict,
         reduced_weighted_loss_dict=reduced_weighted_loss_dict,
+        reduced_model_stat_dict=reduced_model_stat_dict,
         viz_cfg=viz_ctx.viz_cfg,
         args=args,
     )
