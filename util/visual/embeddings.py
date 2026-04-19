@@ -11,6 +11,7 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
+from util.visual.evaluation import FEATURE_METADATA_KEYS, QUERY_METADATA_KEYS
 from util.visual.helper import save_svg_figure
 
 
@@ -44,6 +45,90 @@ def load_query_statistics(csv_path):
         'max_known_class_probability': np.asarray(max_known_class_probability, dtype=np.float32),
         'query_group': np.asarray(query_group, dtype=np.int64),
     }
+
+
+def load_query_statistics_full(csv_path):
+    """读取带 metadata 的 query_statistics.csv。"""
+    state = {
+        'objectness_probability': [],
+        'unknown_probability': [],
+        'max_known_class_probability': [],
+        'query_group': [],
+    }
+    for key in QUERY_METADATA_KEYS:
+        state[key] = []
+    with open(csv_path, 'r', encoding='utf-8') as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            state['objectness_probability'].append(float(row['objectness_probability']))
+            state['unknown_probability'].append(float(row['unknown_probability']))
+            state['max_known_class_probability'].append(float(row['max_known_class_probability']))
+            state['query_group'].append(int(row['query_group']))
+            for key in QUERY_METADATA_KEYS:
+                value = row.get(key, '')
+                state[key].append(int(value) if value not in {'', None} else -1)
+    for key in state:
+        dtype = np.float32 if key in {'objectness_probability', 'unknown_probability', 'max_known_class_probability'} else np.int64
+        state[key] = np.asarray(state[key], dtype=dtype)
+    return state
+
+
+def load_feature_samples(npz_path):
+    """读取 feature_samples.npz。"""
+    data = np.load(npz_path)
+    state = {
+        'objectness_features': data['objectness_features'].astype(np.float32),
+        'knownness_features': data['knownness_features'].astype(np.float32),
+        'classification_features': data['classification_features'].astype(np.float32),
+        'feature_groups': data['feature_groups'].astype(np.int64),
+    }
+    for key in FEATURE_METADATA_KEYS:
+        if key in data:
+            state[key] = data[key].astype(np.int64)
+        else:
+            state[key] = np.full((state['feature_groups'].shape[0],), -1, dtype=np.int64)
+    return state
+
+
+def load_eval_embedding_state(stats_dir):
+    """从 eval/stats 目录恢复离线 embedding 状态。"""
+    stats_dir = Path(stats_dir)
+    query_state = load_query_statistics_full(stats_dir / 'query_statistics.csv')
+    feature_state = load_feature_samples(stats_dir / 'feature_samples.npz')
+    state = {
+        'objectness_probability': query_state['objectness_probability'],
+        'unknown_probability': query_state['unknown_probability'],
+        'max_known_class_probability': query_state['max_known_class_probability'],
+        'query_group': query_state['query_group'],
+        'objectness_features': feature_state['objectness_features'],
+        'knownness_features': feature_state['knownness_features'],
+        'classification_features': feature_state['classification_features'],
+        'feature_groups': feature_state['feature_groups'],
+        'is_matched': query_state.get('is_matched', np.full_like(query_state['query_group'], -1)),
+        'matched_gt_is_unknown': query_state.get('matched_gt_is_unknown', np.full_like(query_state['query_group'], -1)),
+        'feature_is_matched': feature_state.get('feature_is_matched', np.full_like(feature_state['feature_groups'], -1)),
+        'feature_matched_gt_is_unknown': feature_state.get('feature_matched_gt_is_unknown', np.full_like(feature_state['feature_groups'], -1)),
+    }
+    for key in QUERY_METADATA_KEYS:
+        state[key] = query_state.get(key, np.full_like(query_state['query_group'], -1))
+    for key in FEATURE_METADATA_KEYS:
+        state[key] = feature_state.get(key, np.full_like(feature_state['feature_groups'], -1))
+    return state
+
+
+def render_saved_eval_embeddings(stats_dir, viz_cfg):
+    """基于已保存的 stats 离线绘制 embedding 图。"""
+    stats_dir = Path(stats_dir)
+    state = load_eval_embedding_state(stats_dir)
+    output_dirs = {
+        'feature_2d': stats_dir / 'embeddings' / 'feature' / '2d',
+        'feature_3d': stats_dir / 'embeddings' / 'feature' / '3d',
+        'score_2d': stats_dir / 'embeddings' / 'score_space' / '2d',
+        'score_3d': stats_dir / 'embeddings' / 'score_space' / '3d',
+    }
+    plot_feature_embedding_views(state, output_dirs, viz_cfg)
+    plot_score_space_embedding_views(state, output_dirs, viz_cfg)
+    return output_dirs
 
 
 def subsample(features, groups, max_points):
@@ -263,20 +348,20 @@ def write_embedding_error(output_dir, filename_stem, error, trace_text=None, ext
     output_dir.mkdir(parents=True, exist_ok=True)
     error_path = output_dir / f'{filename_stem}_error.txt'
     with error_path.open('w', encoding='utf-8') as file:
-        file.write(f'ERROR: {repr(error)}\\n\\n')
+        file.write(f'ERROR: {repr(error)}\n\n')
         if extra_info:
-            file.write('EXTRA INFO:\\n')
+            file.write('EXTRA INFO:\n')
             for key, value in extra_info.items():
-                file.write(f'- {key}: {value}\\n')
-            file.write('\\n')
+                file.write(f'- {key}: {value}\n')
+            file.write('\n')
         if trace_text:
-            file.write('TRACEBACK:\\n')
+            file.write('TRACEBACK:\n')
             file.write(trace_text)
 
 
 def plot_feature_embedding_views(state, output_dirs, viz_cfg):
     """批量绘制 feature embedding 视图。"""
-    if not state['feature_groups'] or not state['objectness_features']:
+    if len(state['feature_groups']) == 0 or len(state['objectness_features']) == 0:
         return
     feature_specs = [
         ('objectness_features', 'Objectness'),
@@ -304,11 +389,7 @@ def plot_feature_embedding_views(state, output_dirs, viz_cfg):
                     if masked_features.shape[0] < min_points or np.unique(labels).size < 2:
                         ax.set_axis_off()
                         continue
-                    masked_features, labels = subsample_evenly(
-                        masked_features,
-                        labels,
-                        select_embedding_max_points(method, dim, viz_cfg),
-                    )
+                    masked_features, labels = subsample_evenly(masked_features, labels, select_embedding_max_points(method, dim, viz_cfg))
                     try:
                         embedding = compute_embedding(masked_features, method, dim, viz_cfg)
                     except Exception as error:
@@ -335,14 +416,7 @@ def plot_feature_embedding_views(state, output_dirs, viz_cfg):
                     plotted_any = True
                 if plotted_any:
                     if legend_handles:
-                        fig.legend(
-                            legend_handles,
-                            legend_labels,
-                            loc='upper center',
-                            bbox_to_anchor=(0.5, 1.01),
-                            ncol=max(2, len(legend_labels)),
-                            frameon=False,
-                        )
+                        fig.legend(legend_handles, legend_labels, loc='upper center', bbox_to_anchor=(0.5, 1.01), ncol=max(2, len(legend_labels)), frameon=False)
                     fig.suptitle(f'{method.upper()} · {view["display_name"]}', y=1.04 if dim == 2 else 1.02)
                     save_svg_figure(fig, output_dir / f'{filename_stem}.{viz_cfg["figure_format"]}')
                 else:
@@ -351,7 +425,7 @@ def plot_feature_embedding_views(state, output_dirs, viz_cfg):
 
 def plot_score_space_embedding_views(state, output_dirs, viz_cfg):
     """批量绘制 score space embedding 视图。"""
-    if not state['objectness_probability']:
+    if len(state['objectness_probability']) == 0:
         return
     features = np.stack(
         [
@@ -375,11 +449,7 @@ def plot_score_space_embedding_views(state, output_dirs, viz_cfg):
                 filename_stem = f'score_space_{method}_{dim}d_{view["key"]}'
                 if masked_features.shape[0] < min_points or np.unique(labels).size < 2:
                     continue
-                masked_features, labels = subsample_evenly(
-                    masked_features,
-                    labels,
-                    select_embedding_max_points(method, dim, viz_cfg),
-                )
+                masked_features, labels = subsample_evenly(masked_features, labels, select_embedding_max_points(method, dim, viz_cfg))
                 try:
                     embedding = compute_embedding(masked_features, method, dim, viz_cfg)
                 except Exception as error:
@@ -404,12 +474,6 @@ def plot_score_space_embedding_views(state, output_dirs, viz_cfg):
                     fig, ax = plt.subplots(1, 1, figsize=(7.0, 5.8))
                 scatter_embedding(ax, embedding, labels, view['names'], view['colors'], dim)
                 ax.set_title('Score-space embedding')
-                ax.legend(
-                    frameon=False,
-                    fontsize=8,
-                    loc='upper center',
-                    bbox_to_anchor=(0.5, 1.10),
-                    ncol=max(2, len(view['names'])),
-                )
+                ax.legend(frameon=False, fontsize=8, loc='upper center', bbox_to_anchor=(0.5, 1.10), ncol=max(2, len(view['names'])))
                 fig.suptitle(f'{method.upper()} · {view["display_name"]}', y=1.02)
                 save_svg_figure(fig, output_dir / f'{filename_stem}.{viz_cfg["figure_format"]}')

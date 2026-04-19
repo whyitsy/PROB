@@ -62,7 +62,7 @@ DEFAULT_VIZ_CFG = {
     'save_feature_npz': True,
     'save_error_summary_csv': True,
     'save_query_distribution_plots': True,
-    'save_feature_embedding_plots': True,
+    'save_feature_embedding_plots': False, # 训练期 eval 默认不在线画 embedding，只存离线数据
 
     # =========================
     # Embedding / manifold 配置
