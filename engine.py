@@ -109,10 +109,14 @@ def train_one_epoch(
 ):
     model.train()
     criterion.train()
+
     metric_logger = utils.MetricLogger(delimiter='  ')
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     metric_logger.add_meter('grad_norm', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
+
+    model_stat_logger = utils.MetricLogger(delimiter='  ')
+
     header = f'Epoch: [{epoch}]'
     print_frequency = 10
 
@@ -138,7 +142,7 @@ def train_one_epoch(
         total_loss = sum(loss_dict[key] * weight_dict[key] for key in loss_dict.keys() if key in weight_dict)
         reduced_loss_dict = utils.reduce_dict(loss_dict)
 
-        reduced_stat_dict = {
+        reduced_model_stat_dict = {
             key: value
             for key, value in reduced_loss_dict.items()
             if key.startswith('stat_') or key.startswith('num_') or key == 'gate_mean'
@@ -183,23 +187,30 @@ def train_one_epoch(
             total_loss=total_loss_value,
             reduced_loss_dict=reduced_raw_loss_dict,
             reduced_weighted_loss_dict=reduced_weighted_loss_dict,
+            reduced_model_stat_dict=reduced_model_stat_dict,
             args=args,
         )
 
         metric_logger.update(loss=total_loss_value)
         metric_logger.update(**{f'weighted_{key}': value for key, value in reduced_weighted_loss_dict.items()})
         metric_logger.update(**{f'raw_{key}': value for key, value in reduced_raw_loss_dict.items()})
-        metric_logger.update(**reduced_stat_dict)
         if 'class_error' in reduced_loss_dict:
             metric_logger.update(class_error=reduced_loss_dict['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]['lr'])
         metric_logger.update(grad_norm=grad_total_norm)
 
+        if reduced_model_stat_dict:
+            model_stat_logger.update(**reduced_model_stat_dict)
+
         samples, targets = prefetcher.next()
 
     metric_logger.synchronize_between_processes()
+    model_stat_logger.synchronize_between_processes()
     logging.info('Averaged stats: %s', metric_logger)
-    return {key: meter.global_avg for key, meter in metric_logger.meters.items()}
+
+    stats = {key: meter.global_avg for key, meter in metric_logger.meters.items()}
+    stats.update({key: meter.global_avg for key, meter in model_stat_logger.meters.items()})
+    return stats
 
 
 @torch.inference_mode()
