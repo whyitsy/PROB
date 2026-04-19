@@ -2,7 +2,7 @@
 
 
 set -euo pipefail
-set -x
+# set -x
 
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -22,7 +22,7 @@ COMMON_EVAL_ARGS=(
   --dataset OWDETR
   --train_set owdetr_t1_train
   --test_set owdetr_test
-  --eval_batch_size 15
+  --eval_batch_size 20
 )
 
 CH3_ARGS=(
@@ -111,8 +111,6 @@ run_stage_offline_visualization() {
   latest_eval_dir="$(latest_eval_epoch_dir "${stage_out_dir}")"
   stats_dir="${latest_eval_dir}/stats"
 
-  run_python_module tools.plot_uod_manifold_3d_svg \
-    --stats_dir "${stats_dir}"
 
   run_python_module tools.mine_representative_cases_svg \
     --checkpoint "${checkpoint_path}" \

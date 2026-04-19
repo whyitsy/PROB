@@ -12,6 +12,7 @@ Backbone modules.
 """
 from collections import OrderedDict
 from torchvision.models.resnet import resnet50
+import logging
 
 import torch
 import torch.nn.functional as F
@@ -102,12 +103,12 @@ class Backbone(BackboneBase):
                  dilation: bool):
         norm_layer = FrozenBatchNorm2d
         if name == 'resnet50':
-            print("resnet50")
+            logging.info("resnet50")
             backbone = getattr(torchvision.models, name)(
                 replace_stride_with_dilation=[False, False, dilation],
                 pretrained=is_main_process(), norm_layer=norm_layer)
         else:
-            print("DINO resnet50")
+            logging.info("DINO resnet50")
             backbone = resnet50(pretrained=False, replace_stride_with_dilation=[False, False, dilation], norm_layer=norm_layer)
             if is_main_process():
                 state_dict = torch.load("/mnt/data/kky/checkpoint/dino_resnet50_pretrain.pth")

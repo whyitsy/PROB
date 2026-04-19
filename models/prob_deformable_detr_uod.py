@@ -8,6 +8,7 @@
 # ------------------------------------------------------------------------
 import copy
 import math
+import logging
 
 import torch
 import torch.nn.functional as F
@@ -89,7 +90,7 @@ def _compute_uod_fused_probabilities(pred_logits, pred_obj, pred_known, invalid_
         knownness_prob = _energy_to_prob(pred_known, known_temperature)
 
     unknown_prob = (1.0 - knownness_prob).clamp(min=0.0, max=1.0)
-    known_scores = obj_prob.unsqueeze(-1) * knownness_prob.unsqueeze(-1) * class_prob
+    known_scores = obj_prob.unsqueeze(-1) * class_prob * knownness_prob.unsqueeze(-1) 
     if class_prob.shape[-1] > 1:
         max_known_cls_prob = class_prob[:, :, :-1].max(dim=-1).values
     elif class_prob.shape[-1] > 0:
@@ -1207,6 +1208,7 @@ class PostProcess(nn.Module):
         return [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
 
 
+
 class ExemplarSelection(nn.Module):
     def __init__(self, args, num_classes, matcher, invalid_cls_logits, temperature=1):
         super().__init__()
@@ -1216,7 +1218,6 @@ class ExemplarSelection(nn.Module):
         self.invalid_cls_logits = invalid_cls_logits
         self.temperature = temperature
         self.args = args
-        print('running with exemplar_replay_selection')
 
     def calc_energy_per_image(self, outputs, targets, indices):
         fused = _compute_uod_fused_probabilities(
@@ -1245,7 +1246,7 @@ class ExemplarSelection(nn.Module):
 def build(args):
     num_classes = args.num_classes
     invalid_cls_logits = list(range(args.PREV_INTRODUCED_CLS + args.CUR_INTRODUCED_CLS, num_classes - 1))
-    print('Invalid class range: ' + str(invalid_cls_logits))
+    logging.info('Invalid class range: ' + str(invalid_cls_logits))
     device = torch.device(args.device)
 
     backbone = build_backbone(args)
@@ -1331,6 +1332,7 @@ def build(args):
         pred_per_im=args.num_queries,
         unknown_scale=float(getattr(args, 'uod_postprocess_unknown_scale', 15.0)),
     )}
+
     exemplar_selection = ExemplarSelection(args, num_classes, matcher, invalid_cls_logits,
                                            temperature=args.obj_temp / args.hidden_dim)
 

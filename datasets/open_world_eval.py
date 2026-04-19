@@ -49,8 +49,8 @@ class OWEvaluator:
             self.known_classes = self._class_names[:self.num_seen_classes]
 
             logger.info("Testing data details:")
-            logger.info(f"total classes: {self.total_num_class}, unknown index: {self.unknown_class_index}, known classe: {self.known_classes}")
-            logger.info(f"CLASS_NAMES: {self.voc_gt.CLASS_NAMES}")
+            logger.info("total classes: %s, unknown index: %s, known classes: %s", self.total_num_class, self.unknown_class_index, self.known_classes)
+            logger.info("CLASS_NAMES: %s", self.voc_gt.CLASS_NAMES)
     
 
     def update(self, predictions):
@@ -128,7 +128,7 @@ class OWEvaluator:
 
     def accumulate(self):
         unique_cls = set(self.lines_cls.tolist())
-        logger.info(f"Unique classes in predictions: {unique_cls}")
+        logger.info("Unique classes in predictions: %s", unique_cls)
         
         for class_label_ind, class_label in enumerate(self.voc_gt.CLASS_NAMES):
             lines_by_class = [l + '\n' for l, c in zip(self.lines, self.lines_cls.tolist()) if c == class_label_ind]
@@ -177,11 +177,11 @@ class OWEvaluator:
         # print("Precisions50: " + str(['%.1f' % x for x in self.precs[50]]))
         # print("Recall50: " + str(['%.1f' % x for x in self.recs[50]]))
         logger.info("========== Evaluation Results ==========")
-        logger.info(f"mAP50: {fmt.format(mAP50)}")
-        logger.info(f"mAP: {fmt.format(mAP)}")
-        logger.info(f"Total unknown objects: {total_num_unk}")
+        logger.info("mAP50: %s", fmt.format(mAP50))
+        logger.info("mAP: %s", fmt.format(mAP))
+        logger.info("Total unknown objects: %s", total_num_unk)
         for iou, ose in total_ose.items():
-            logger.info(f"Absolute OSE (IoU={iou}): {int(ose)}")
+            logger.info("Absolute OSE (IoU=%s): %s", iou, int(ose))
             
         # WI 表格
         recalls = sorted(wi.keys())

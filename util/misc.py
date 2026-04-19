@@ -361,7 +361,6 @@ class NestedTensor(object):
         self.mask = mask
 
     def to(self, device, non_blocking=False):
-        # type: (Device) -> NestedTensor # noqa
         cast_tensor = self.tensors.to(device, non_blocking=non_blocking)
         mask = self.mask
         if mask is not None:
@@ -394,7 +393,8 @@ def setup_for_distributed(is_master):
         force = kwargs.pop('force', False)
         if is_master or force:
             builtin_print(*args, **kwargs)
-
+    
+    globals()['print'] = print
     __builtin__.print = print
 
 

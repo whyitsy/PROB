@@ -10,6 +10,7 @@ import logging
 import random
 import time
 from pathlib import Path
+from pprint import pformat # 美化输出
 
 import numpy as np
 import torch
@@ -259,14 +260,11 @@ def main(args):
     utils.init_distributed_mode(args)
     viz_ctx = VizContext.from_args(args)
     output_dir = viz_ctx.output_dir
-    setup_logging(output=args.output_dir, distributed_rank=utils.get_rank(), abbrev_name='PROB')
-    logging.info('Arguments:\n%s', args)
-    logging.info('git:\n  %s\n', utils.get_sha())
+    setup_logging(output=args.output_dir, distributed_rank=utils.get_rank(), abbrev_name='UOD')
+    logging.info('Arguments:\n%s', pformat(vars(args), indent=2, width=100, compact=True, sort_dicts=False)) # vars() 将 Namespace 转为 dict
 
     if args.resume and args.pretrain:
         logging.warning('Both --resume and --pretrain are provided. The script will use --resume and ignore --pretrain.')
-
-    viz_ctx.add_args_text(args)
 
     try:
         device = torch.device(args.device)
@@ -280,7 +278,7 @@ def main(args):
         model_without_ddp = model
         logging.info('%s', model_without_ddp)
         num_trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-        logging.info('Number of trainable parameters: %s', num_trainable_parameters)
+        logging.info('Number of trainable parameters: %s', f'{num_trainable_parameters:,}')
 
         train_dataset, eval_dataset = build_datasets(args)
 
@@ -355,8 +353,8 @@ def main(args):
             logging.info('Initializing from pretrain checkpoint: %s', args.pretrain)
             checkpoint = torch.load(args.pretrain, map_location='cpu')
             load_message = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
-            logging.info('%s', load_message)
-            args.start_epoch = checkpoint.get('epoch', -1) + 1
+            logging.info('Load message: %s', load_message)
+            args.start_epoch = checkpoint['epoch'] + 1
 
         if args.freeze_prob_model and hasattr(model_without_ddp, 'prob_obj_head'):
             probability_head = model_without_ddp.prob_obj_head
@@ -384,106 +382,102 @@ def main(args):
                 eval_loader,
                 eval_dataset,
                 device,
-                args.output_dir,
                 args,
                 viz_ctx=viz_ctx,
-                epoch=max(int(args.start_epoch) - 1, 0),
+                epoch=args.start_epoch,
             )
             write_eval_scalars_to_tensorboard(viz_ctx, eval_stats, args.start_epoch)
-            return
+        else:
+            logging.info('Start training from epoch %s to %s', args.start_epoch, args.epochs)
+            training_start_time = time.time()
 
-        logging.info('Start training from epoch %s to %s', args.start_epoch, args.epochs)
-        training_start_time = time.time()
+            for epoch in range(args.start_epoch, args.epochs):
+                if args.distributed:
+                    train_sampler.set_epoch(epoch)
 
-        for epoch in range(args.start_epoch, args.epochs):
-            if args.distributed:
-                train_sampler.set_epoch(epoch)
+                train_stats = train_one_epoch(
+                    model,
+                    criterion,
+                    train_loader,
+                    optimizer,
+                    device,
+                    epoch,
+                    max_norm=args.clip_max_norm,
+                    viz_ctx=viz_ctx,
+                    args=args,
+                )
+                lr_scheduler.step()
 
-            train_stats = train_one_epoch(
-                model,
-                criterion,
-                train_loader,
-                optimizer,
-                device,
-                epoch,
-                max_norm=args.clip_max_norm,
-                viz_ctx=viz_ctx,
-                args=args,
-            )
-            lr_scheduler.step()
+                eval_stats = {}
+                eval_evaluator = None
+                checkpoint_paths = []
+                if output_dir is not None:
+                    checkpoint_paths.append(viz_ctx.checkpoint_dir / 'checkpoint_latest.pth')
+                    should_run_evaluation = ((epoch + 1) % args.lr_drop == 0) or (epoch == 0) or (epoch == 1) or ((epoch + 1) % args.eval_every == 0 or (epoch == args.epochs - 1))
+                    if should_run_evaluation:
+                        eval_stats, eval_evaluator = evaluate(
+                            model,
+                            criterion,
+                            postprocessors,
+                            eval_loader,
+                            eval_dataset,
+                            device,
+                            args,
+                            viz_ctx=viz_ctx,
+                            epoch=epoch,
+                        )
+                        write_eval_scalars_to_tensorboard(viz_ctx, eval_stats, epoch)
+                        checkpoint_paths.append(viz_ctx.checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pth')
+                    elif epoch > args.epochs - 6:
+                        checkpoint_paths.append(viz_ctx.checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pth')
 
-            eval_stats = {}
-            eval_evaluator = None
-            checkpoint_paths = []
-            if output_dir is not None:
-                checkpoint_paths.append(viz_ctx.checkpoint_dir / 'checkpoint_latest.pth')
-                should_run_evaluation = ((epoch + 1) % args.lr_drop == 0) or (epoch == 0) or (epoch == 1) or ((epoch + 1) % args.eval_every == 0 or (epoch == args.epochs - 1))
-                if should_run_evaluation:
-                    eval_stats, eval_evaluator = evaluate(
-                        model,
-                        criterion,
-                        postprocessors,
-                        eval_loader,
-                        eval_dataset,
-                        device,
-                        args.output_dir,
-                        args,
-                        viz_ctx=viz_ctx,
-                        epoch=epoch,
-                    )
-                    write_eval_scalars_to_tensorboard(viz_ctx, eval_stats, epoch)
-                    checkpoint_paths.append(viz_ctx.checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pth')
-                elif epoch > args.epochs - 6:
-                    checkpoint_paths.append(viz_ctx.checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pth')
+                    checkpoint_args = _sanitize_for_checkpoint(args) # 处理args中可能存在的不可序列化对象.
+                    for checkpoint_path in checkpoint_paths:
+                        utils.save_on_master({
+                            'model': model_without_ddp.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'lr_scheduler': lr_scheduler.state_dict(),
+                            'epoch': epoch,
+                            'args': checkpoint_args,
+                        }, checkpoint_path)
 
-                checkpoint_args = _sanitize_for_checkpoint(args)
-                for checkpoint_path in checkpoint_paths:
-                    utils.save_on_master({
-                        'model': model_without_ddp.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        'epoch': epoch,
-                        'args': checkpoint_args,
-                    }, checkpoint_path)
+                write_epoch_reports(
+                    viz_ctx=viz_ctx,
+                    epoch=epoch,
+                    train_stats=train_stats,
+                    eval_stats=eval_stats,
+                    num_trainable_parameters=num_trainable_parameters,
+                    eval_evaluator=eval_evaluator,
+                    args=args,
+                )
 
-            write_epoch_reports(
-                viz_ctx=viz_ctx,
-                epoch=epoch,
-                train_stats=train_stats,
-                eval_stats=eval_stats,
-                num_trainable_parameters=num_trainable_parameters,
-                eval_evaluator=eval_evaluator,
-                args=args,
-            )
+            # =========== [及时释放显存] ===========
+            logging.info("Training finished. Releasing training resources to free VRAM...")
 
-        # =========== [及时释放显存] ===========
-        logging.info("Training finished. Releasing training resources to free VRAM...")
+            # 1. 删除优化器和学习率调度器
+            if 'optimizer' in locals():
+                del optimizer
+            if 'lr_scheduler' in locals():
+                del lr_scheduler
 
-        # 1. 删除优化器和学习率调度器
-        if 'optimizer' in locals():
-            del optimizer
-        if 'lr_scheduler' in locals():
-            del lr_scheduler
+            # 2. loss_dict 或 outputs 可能包含大量中间张量
+            if 'outputs' in locals():
+                del outputs
+            if 'loss_dict' in locals():
+                del loss_dict
 
-        # 2. loss_dict 或 outputs 等大型 Tensor
-        if 'outputs' in locals():
-            del outputs
-        if 'loss_dict' in locals():
-            del loss_dict
+            # 3. 让 PyTorch 把闲置的显存真正还给 GPU
+            torch.cuda.empty_cache()
 
-        # 3. 最关键的一步：让 PyTorch 把闲置的显存真正还给 GPU
-        torch.cuda.empty_cache()
+            logging.info("Resources released. Proceeding to exemplar replay/evaluation.")
 
-        import gc
-        gc.collect()  # 强制 Python 进行一次垃圾回收
-        logging.info("Resources released. Proceeding to exemplar replay/evaluation.")
+            if args.exemplar_replay_selection:
+                logging.info('running with exemplar_replay_selection')
+                exemplar_scores = get_exemplar_replay(model, exemplar_selection, device, train_loader)
+                create_ft_dataset(args, exemplar_scores)
 
-        if args.exemplar_replay_selection:
-            exemplar_scores = get_exemplar_replay(model, exemplar_selection, device, train_loader)
-            create_ft_dataset(args, exemplar_scores)
-
-        total_training_time = time.time() - training_start_time
-        logging.info('Training time %s', str(datetime.timedelta(seconds=int(total_training_time))))
+            total_training_time = time.time() - training_start_time
+            logging.info('Training time %s', str(datetime.timedelta(seconds=int(total_training_time))))
     finally:
         viz_ctx.close()
 

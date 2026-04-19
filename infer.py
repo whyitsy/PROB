@@ -217,7 +217,7 @@ def run_inference(args):
 
     checkpoint, model_args = _load_checkpoint_args(args.checkpoint, args.device)
     vars(model_args).update({k: v for k, v in vars(args).items() if v is not None})
-    model, _, postprocessors, _ = build_model(model_args, mode=getattr(model_args, 'model_type', 'uod'))
+    model, _, postprocessors, _ = build_model(model_args, mode=getattr(model_args, 'model_type'))
     model.load_state_dict(checkpoint['model'], strict=False)
     model.to(torch.device(args.device))
     model.eval()
@@ -292,5 +292,7 @@ if __name__ == '__main__':
     parser.add_argument('--min_area_ratio', default=0.002, type=float)
     parser.add_argument('--min_side_ratio', default=0.03, type=float)
     parser.add_argument('--max_aspect_ratio', default=5.0, type=float)
+    parser.add_argument('--uod_postprocess_unknown_scale', default=10.0, type=float)
+    parser.add_argument('--uod_known_temp', default=8, type=float)
     parser.add_argument('--save_layer_debug', action='store_true')
     run_inference(parser.parse_args())
