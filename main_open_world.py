@@ -492,3 +492,11 @@ if __name__ == '__main__':
     except Exception as error:
         logging.error('An error occurred during execution: %s', error, exc_info=True)
         raise
+    finally:
+        import torch.distributed as dist
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+                logging.info('Distributed process group destroyed successfully.')
+        except Exception as cleanup_error:
+            logging.error('Failed to destroy process group cleanly: %s', cleanup_error, exc_info=True)
