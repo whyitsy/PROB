@@ -23,6 +23,20 @@ PALETTE = {
     'gray': '#6C757D',
 }
 
+MODEL_STAT_KEYS = {
+    'stat_num_dummy_pos': 'train/model_stats/num_dummy_pos',
+    'stat_num_dummy_neg': 'train/model_stats/num_dummy_neg',
+    'stat_num_ignore_queries': 'train/model_stats/num_ignore_queries',
+    'stat_num_valid_unmatched': 'train/model_stats/num_valid_unmatched',
+    'stat_num_pos_candidates': 'train/model_stats/num_pos_candidates',
+    'stat_num_neg_candidates': 'train/model_stats/num_neg_candidates',
+    'stat_num_batch_selected_pos': 'train/model_stats/num_batch_selected_pos',
+    'stat_pos_thresh_mean': 'train/model_stats/pos_thresh_mean',
+    'stat_cls_attn_mean': 'train/model_stats/cls_attn_mean',
+    'stat_num_cls_soft': 'train/model_stats/num_cls_soft',
+    'gate_mean': 'train/model_stats/gate_mean',
+}
+
 
 def safe_float(value):
     """把值转成 float。"""
@@ -444,7 +458,16 @@ def _add_numeric_items(record, prefix, values):
             record[f'{prefix}/{key}'] = numeric_value
 
 
-def write_train_step_artifacts(tb_writer, step_jsonl_path, global_step, epoch, local_step, optimizer, grad_total_norm, outputs, targets, criterion, total_loss, reduced_loss_dict, reduced_weighted_loss_dict, viz_cfg=None, args=None):
+def _add_model_stat_items(record, reduced_model_stat_dict):
+    """把模型中间统计写入记录。"""
+    reduced_model_stat_dict = reduced_model_stat_dict or {}
+    for source_key, record_key in MODEL_STAT_KEYS.items():
+        numeric_value = safe_float(reduced_model_stat_dict.get(source_key))
+        if numeric_value is not None:
+            record[record_key] = numeric_value
+
+
+def write_train_step_artifacts(tb_writer, step_jsonl_path, global_step, epoch, local_step, optimizer, grad_total_norm, outputs, targets, criterion, total_loss, reduced_loss_dict, reduced_weighted_loss_dict, reduced_model_stat_dict=None, viz_cfg=None, args=None):
     """写训练 step 的数值记录和 tensorboard 标量。"""
     record = {
         'global_step': int(global_step),
@@ -456,12 +479,14 @@ def write_train_step_artifacts(tb_writer, step_jsonl_path, global_step, epoch, l
     }
     _add_numeric_items(record, 'train/loss_raw', reduced_loss_dict)
     _add_numeric_items(record, 'train/loss_weighted', reduced_weighted_loss_dict)
+    _add_model_stat_items(record, reduced_model_stat_dict)
 
-    selected_count = reduced_loss_dict.get('num_selected_pseudo_positive_queries', reduced_loss_dict.get('stat_num_batch_selected_pos'))
-    candidate_count = reduced_loss_dict.get('num_pseudo_positive_candidates', reduced_loss_dict.get('stat_num_pos_candidates'))
-    unmatched_count = reduced_loss_dict.get('num_unmatched_queries_after_filter', reduced_loss_dict.get('stat_num_valid_unmatched'))
-    reliable_background_count = reduced_loss_dict.get('num_selected_reliable_background_queries', reduced_loss_dict.get('stat_num_dummy_neg'))
-    ignored_count = reduced_loss_dict.get('num_classification_ignored_queries', reduced_loss_dict.get('stat_num_ignore_queries'))
+    model_stats = reduced_model_stat_dict or {}
+    selected_count = reduced_loss_dict.get('num_selected_pseudo_positive_queries', model_stats.get('stat_num_batch_selected_pos'))
+    candidate_count = reduced_loss_dict.get('num_pseudo_positive_candidates', model_stats.get('stat_num_pos_candidates'))
+    unmatched_count = reduced_loss_dict.get('num_unmatched_queries_after_filter', model_stats.get('stat_num_valid_unmatched'))
+    reliable_background_count = reduced_loss_dict.get('num_selected_reliable_background_queries', model_stats.get('stat_num_dummy_neg'))
+    ignored_count = reduced_loss_dict.get('num_classification_ignored_queries', model_stats.get('stat_num_ignore_queries'))
     record['train/pseudo/selected_queries'] = safe_float(selected_count)
     record['train/pseudo/candidate_queries'] = safe_float(candidate_count)
     record['train/pseudo/valid_unmatched_queries'] = safe_float(unmatched_count)
@@ -525,6 +550,8 @@ def build_train_epoch_record(epoch, train_stats, num_trainable_parameters):
         'num_pseudo_positive_candidates': safe_float(train_stats.get('num_pseudo_positive_candidates', train_stats.get('stat_num_pos_candidates'))),
         'num_classification_ignored_queries': safe_float(train_stats.get('num_classification_ignored_queries', train_stats.get('stat_num_ignore_queries'))),
         'num_unmatched_queries_after_filter': safe_float(train_stats.get('num_unmatched_queries_after_filter', train_stats.get('stat_num_valid_unmatched'))),
+        'train_gate_mean': safe_float(train_stats.get('gate_mean')),
+        'train_pos_thresh_mean': safe_float(train_stats.get('stat_pos_thresh_mean')),
         'pseudo_positive_selection_ratio': safe_div(
             train_stats.get('num_selected_pseudo_positive_queries', train_stats.get('stat_num_batch_selected_pos')),
             train_stats.get('num_unmatched_queries_after_filter', train_stats.get('stat_num_valid_unmatched')),
