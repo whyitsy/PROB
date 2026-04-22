@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from datasets.coco import make_coco_transforms
 from datasets.torchvision_datasets.open_world import VOC_COCO_CLASS_NAMES
@@ -148,22 +148,63 @@ def _filter_detections(detections, image_size, args, unified_across_labels=False
 
 
 def _draw_detections(image: Image.Image, detections):
-    rendered = image.copy()
-    draw = ImageDraw.Draw(rendered)
+    rendered = image.convert('RGBA')
+    draw = ImageDraw.Draw(rendered, 'RGBA')
+    width, height = rendered.size
+
+    base_font_size = max(12, int(round(min(width, height) * 0.022)))
+    font = None
+    for font_name in ['DejaVuSans-Bold.ttf', 'DejaVuSans.ttf', 'Arial.ttf']:
+        try:
+            font = ImageFont.truetype(font_name, base_font_size)
+            break
+        except OSError:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+
+    text_stroke = max(1, base_font_size // 14)
+    box_width = max(2, base_font_size // 8)
+    pad_x = max(3, base_font_size // 4)
+    pad_y = max(2, base_font_size // 6)
+
     for det in detections:
         x1, y1, x2, y2 = [float(v) for v in det['box_xyxy']]
         is_unknown = bool(det['is_unknown'])
-        color = 'red' if is_unknown else 'lime'
+        box_color = (245, 64, 64, 255) if is_unknown else (80, 245, 120, 255)
+        tag_bg = (90, 18, 18, 220) if is_unknown else (16, 72, 28, 220)
         name = 'unknown' if is_unknown else det['label_name']
         text = f"{name}:{float(det['raw_score']):.2f}"
-        text_x = x1 + 2
-        text_y = max(0.0, y1 - 14)
 
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
-        text_bbox = draw.textbbox((text_x, text_y), text)
-        draw.rectangle(text_bbox, fill='black')
-        draw.text((text_x, text_y), text, fill=color)
-    return rendered
+        draw.rectangle([x1, y1, x2, y2], outline=box_color, width=box_width)
+
+        text_bbox = draw.textbbox((0, 0), text, font=font, stroke_width=text_stroke)
+        text_w = max(1, text_bbox[2] - text_bbox[0])
+        text_h = max(1, text_bbox[3] - text_bbox[1])
+        label_w = text_w + 2 * pad_x
+        label_h = text_h + 2 * pad_y
+
+        label_x = min(max(0.0, x1 + 1.0), max(0.0, float(width - label_w)))
+        preferred_top = y1 - label_h - 2.0
+        if preferred_top >= 0:
+            label_y = preferred_top
+        else:
+            label_y = min(max(0.0, y1 + 2.0), max(0.0, float(height - label_h)))
+
+        draw.rounded_rectangle(
+            [label_x, label_y, label_x + label_w, label_y + label_h],
+            radius=max(2, base_font_size // 5),
+            fill=tag_bg,
+        )
+        draw.text(
+            (label_x + pad_x, label_y + pad_y),
+            text,
+            fill=(255, 255, 255, 255),
+            font=font,
+            stroke_width=text_stroke,
+            stroke_fill=(0, 0, 0, 255),
+        )
+    return rendered.convert('RGB')
 
 
 def _split_detection_views(filtered_detections, all_detections_class_agnostic):
@@ -218,6 +259,7 @@ def run_inference(args):
 
     checkpoint, model_args = _load_checkpoint_args(args.checkpoint, args.device)
     vars(model_args).update({k: v for k, v in vars(args).items() if v is not None})
+    model_args.uod_postprocess_unknown_scale = args.unknown_score_scale
 
     model, _, postprocessors, _ = build_model(model_args, mode=model_args.model_type)
     model.load_state_dict(checkpoint['model'], strict=False)
@@ -286,4 +328,5 @@ if __name__ == '__main__':
     parser.add_argument('--min_box_area_ratio', default=0.002, type=float)
     parser.add_argument('--min_box_side_ratio', default=0.03, type=float)
     parser.add_argument('--max_box_aspect_ratio', default=5.0, type=float)
+    parser.add_argument('--unknown_score_scale', default=1.0, type=float)
     run_inference(parser.parse_args())

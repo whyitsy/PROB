@@ -97,7 +97,7 @@ def _compute_uod_fused_probabilities(pred_logits, pred_obj, pred_known, invalid_
         max_known_cls_prob = class_prob.squeeze(-1)
     else:
         max_known_cls_prob = torch.zeros_like(obj_prob)
-    unknown_score = obj_prob * unknown_prob * unknown_scale
+    unknown_score = obj_prob * unknown_prob * (1.0 - max_known_cls_prob) * unknown_scale
 
     fused = known_scores.clone()
     if fused.shape[-1] > 0:

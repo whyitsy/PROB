@@ -3,19 +3,19 @@ set -euo pipefail
 
 ROOT_DIR="/mnt/data/kky/output/PROB/exps/OUTPUTS"
 
-CHECKPOINT="/mnt/data/kky/output/PROB/exps/SOWODB/UOD_CH3_FULL/t1/train/checkpoints/checkpoint_latest.pth"
+CHECKPOINT="/mnt/data/kky/output/PROB/exps/SOWODB/UOD_CH3_FULL/t4_ft/train/checkpoints/checkpoint_latest.pth"
 INPUT_PATH="photos"
 OUTPUT_DIR="${ROOT_DIR}/infer_output"
 DEVICE="cuda"
 MODEL_TYPE="uod"
 
-KNOWN_SCORE_THRESHOLD=0.30
+KNOWN_SCORE_THRESHOLD=0.4
 UNKNOWN_SCORE_THRESHOLD=0.50
-NMS_IOU_THRESHOLD=0.10
+NMS_IOU_THRESHOLD=0.30
 MIN_BOX_AREA_RATIO=0.02
 MIN_BOX_SIDE_RATIO=0.03
 MAX_BOX_ASPECT_RATIO=5.0
-UNKNOWN_SCORE_SCALE=10
+UNKNOWN_SCORE_SCALE=2
 
 python infer.py \
   --checkpoint "${CHECKPOINT}" \
