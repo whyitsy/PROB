@@ -82,7 +82,7 @@ run_stage_eval() {
   torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
     "${ROOT_DIR}/main_open_world.py" \
     --output_dir "${stage_out_dir}" \
-    --resume "${checkpoint_path}" \
+    --eval_checkpoint "${checkpoint_path}" \
     "${COMMON_EVAL_ARGS[@]}" \
     "${CH3_ARGS[@]}"
 }

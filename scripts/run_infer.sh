@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -e
 
-ROOT_DIR="/mnt/data/kky/output/PROB/exps/OUTPUTS/Infer_OUTPUT"
+ROOT_DIR="/mnt/data/kky/output/PROB/exps/OUTPUTS/"
 
-# ====== 直接改这里 ======
+# ====== 修改的参数 ======
 CHECKPOINT="/mnt/data/kky/output/PROB/exps/SOWODB/UOD_CH3_FULL/t1/train/checkpoints/checkpoint_latest.pth"
 INPUT_PATH="photos"
 OUTPUT_DIR="${ROOT_DIR}/infer_output"

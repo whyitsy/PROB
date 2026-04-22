@@ -24,7 +24,7 @@ from .backbone import build_backbone
 from .deformable_transformer import build_deforamble_transformer
 from .matcher import build_matcher
 from .prob_deformable_detr import ProbObjectnessHead, sigmoid_focal_loss
-from .segmentation import DETRsegm, PostProcessPanoptic, PostProcessSegm, dice_loss
+from .segmentation import dice_loss
 from .segmentation import sigmoid_focal_loss as seg_sigmoid_focal_loss
 
 

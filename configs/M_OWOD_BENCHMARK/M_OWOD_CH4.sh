@@ -4,7 +4,7 @@ set -euo pipefail
 set -x
 
 
-BASE_EXP_DIR="/mnt/data/kky/output/PROB/exps/MOWODB/UOD_CH4_FULL"
+BASE_EXP_DIR="/mnt/data/kky/output/PROB/exps/MOWODB/UOD_CH4_0422"
 
 GPUS="${GPUS:-gpu}"
 

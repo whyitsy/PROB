@@ -5,7 +5,7 @@ set -x
 
 # "$@" 表示调用该脚本时传入的所有参数, 放在最后, 可以覆盖默认参数. 
 
-BASE_EXP_DIR="/mnt/data/kky/output/PROB/exps/MOWODB/UOD_CH3_FULL"
+BASE_EXP_DIR="/mnt/data/kky/output/PROB/exps/MOWODB/UOD_CH3_0422"
 
 COMMON_ARGS=(
   --dataset TOWOD
