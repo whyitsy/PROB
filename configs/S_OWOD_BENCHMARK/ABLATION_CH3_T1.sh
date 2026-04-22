@@ -37,33 +37,33 @@ run_stage() {
     "$@"
 }
 
-# run_stage "${BASE_EXP_DIR}/C3_1_UnknownOnly" \
-#   --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
-#   --train_set owdetr_t1_train \
-#   --lr_drop 31 \
-#   --resume '/mnt/data/kky/output/PROB/exps/SOWODB/UOD_ABL_T1_CH3/C3_1_UnknownOnly/train/checkpoints/checkpoint_latest.pth' \
-#   --uod_enable_unknown
+run_stage "${BASE_EXP_DIR}/C3_1_UnknownOnly" \
+  --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
+  --train_set owdetr_t1_train \
+  --lr_drop 31 \
+  --resume '/mnt/data/kky/output/PROB/exps/SOWODB/UOD_ABL_T1_CH3/C3_1_UnknownOnly/train/checkpoints/checkpoint_latest.pth' \
+  --uod_enable_unknown
 
-# sleep 5
+sleep 5
 
-# run_stage "${BASE_EXP_DIR}/C3_2_Unknown_StaticPseudo" \
-#   --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
-#   --train_set owdetr_t1_train \
-#   --lr_drop 31 \
-#   --uod_enable_unknown \
-#   --uod_enable_pseudo 
+run_stage "${BASE_EXP_DIR}/C3_2_Unknown_StaticPseudo" \
+  --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
+  --train_set owdetr_t1_train \
+  --lr_drop 31 \
+  --uod_enable_unknown \
+  --uod_enable_pseudo 
 
-# sleep 5
+sleep 5
 
-# run_stage "${BASE_EXP_DIR}/C3_3_BatchDynamic" \
-#   --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
-#   --train_set owdetr_t1_train \
-#   --lr_drop 31 \
-#   --uod_enable_unknown \
-#   --uod_enable_pseudo \
-#   --uod_enable_batch_dynamic 
+run_stage "${BASE_EXP_DIR}/C3_3_BatchDynamic" \
+  --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
+  --train_set owdetr_t1_train \
+  --lr_drop 31 \
+  --uod_enable_unknown \
+  --uod_enable_pseudo \
+  --uod_enable_batch_dynamic 
 
-# sleep 5
+sleep 5
 
 run_stage "${BASE_EXP_DIR}/C3_4_ClsSoftAttn" \
   --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
