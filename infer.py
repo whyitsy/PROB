@@ -5,18 +5,27 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from datasets.coco import make_coco_transforms
 from datasets.torchvision_datasets.open_world import VOC_COCO_CLASS_NAMES
 from models import build_model
 from util import box_ops
 from util.log import setup_logging
-from util.visual.cases import draw_detection_panel, filter_prediction_display
-from util.visual.helper import save_svg_image
-from visual.viz_config import build_viz_cfg
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+
+
+def build_viz_cfg():
+    return {
+        'display_known_score_thresh': 0.35,
+        'display_unknown_score_thresh': 0.20,
+        'display_nms_iou': 0.5,
+        'display_apply_geometry_filter': True,
+        'display_min_area_ratio': 0.002,
+        'display_min_side_ratio': 0.03,
+        'display_max_aspect_ratio': 5.0,
+    }
 
 
 def _load_checkpoint_args(checkpoint_path, device):
@@ -166,22 +175,22 @@ def _filter_export_detections(
 
 
 def _prepare_display_arrays(raw_detections, image_size, unknown_label, unknown_score_scale, viz_cfg):
-    if not raw_detections:
-        return (
-            np.zeros((0, 4), dtype=np.float32),
-            np.zeros((0,), dtype=np.int64),
-            np.zeros((0,), dtype=np.float32),
-        )
-
-    raw_boxes = np.asarray([det['box_xyxy'] for det in raw_detections], dtype=np.float32)
-    raw_labels = np.asarray([det['label'] for det in raw_detections], dtype=np.int64)
-    raw_scores = np.asarray([det['raw_score'] for det in raw_detections], dtype=np.float32)
-    image_hw = (int(image_size[1]), int(image_size[0]))
-    boxes, labels, scores = filter_prediction_display(raw_boxes, raw_labels, raw_scores, image_hw, unknown_label, viz_cfg)
-    display_scores = np.asarray(
-        [_display_score(score, label, unknown_label, unknown_score_scale) for score, label in zip(scores.tolist(), labels.tolist())],
-        dtype=np.float32,
-    ) if len(scores) > 0 else np.zeros((0,), dtype=np.float32)
+    filtered = _filter_export_detections(
+        raw_detections,
+        image_size=image_size,
+        known_score_thresh=float(viz_cfg['display_known_score_thresh']),
+        unknown_score_thresh=float(viz_cfg['display_unknown_score_thresh']),
+        nms_iou=float(viz_cfg['display_nms_iou']),
+        min_area_ratio=float(viz_cfg['display_min_area_ratio']),
+        min_side_ratio=float(viz_cfg['display_min_side_ratio']),
+        max_aspect_ratio=float(viz_cfg['display_max_aspect_ratio']),
+        unified_across_labels=False,
+    )
+    if not filtered:
+        return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.float32)
+    boxes = np.asarray([det['box_xyxy'] for det in filtered], dtype=np.float32)
+    labels = np.asarray([det['label'] for det in filtered], dtype=np.int64)
+    display_scores = np.asarray([det['display_score'] for det in filtered], dtype=np.float32)
     return boxes, labels, display_scores
 
 
@@ -246,30 +255,43 @@ def _subset_arrays(boxes, labels, scores, unknown_label, subset):
     return boxes[mask], labels[mask], scores[mask]
 
 
+def _save_rendered_detections(output_path, image_np, boxes, labels, scores, unknown_label):
+    image = Image.fromarray(image_np.copy())
+    draw = ImageDraw.Draw(image)
+    for box, label, score in zip(boxes, labels, scores):
+        x1, y1, x2, y2 = [float(v) for v in box]
+        is_unknown = int(label) == int(unknown_label)
+        color = 'red' if is_unknown else 'lime'
+        text = f"{'unk' if is_unknown else int(label)}:{float(score):.2f}"
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+        draw.text((x1 + 2, max(0.0, y1 - 12)), text, fill=color)
+    image.save(output_path)
+
+
 def _save_visualizations(output_dir, image_stem, image_np, boxes, labels, scores, unknown_label, viz_cfg):
+    del viz_cfg
     for subset in ['all', 'known', 'unknown']:
         subset_boxes, subset_labels, subset_scores = _subset_arrays(boxes, labels, scores, unknown_label, subset)
-        panel = draw_detection_panel(
+        _save_rendered_detections(
+            output_dir / 'vis' / f'{image_stem}_{subset}.png',
             image_np,
-            viz_cfg,
-            prediction_boxes=subset_boxes if len(subset_boxes) > 0 else None,
-            prediction_labels=subset_labels if len(subset_labels) > 0 else None,
-            prediction_scores=subset_scores if len(subset_scores) > 0 else None,
-            unknown_label=unknown_label,
+            subset_boxes,
+            subset_labels,
+            subset_scores,
+            unknown_label,
         )
-        save_svg_image(panel, output_dir / 'vis' / f'{image_stem}_{subset}.svg')
 
 
 def _save_unified_visualization(output_dir, image_stem, image_np, boxes, labels, scores, unknown_label, viz_cfg):
-    panel = draw_detection_panel(
+    del viz_cfg
+    _save_rendered_detections(
+        output_dir / 'vis' / f'{image_stem}_unified.png',
         image_np,
-        viz_cfg,
-        prediction_boxes=boxes if len(boxes) > 0 else None,
-        prediction_labels=labels if len(labels) > 0 else None,
-        prediction_scores=scores if len(scores) > 0 else None,
-        unknown_label=unknown_label,
+        boxes,
+        labels,
+        scores,
+        unknown_label,
     )
-    save_svg_image(panel, output_dir / 'vis' / f'{image_stem}_unified.svg')
 
 
 def _save_layer_summary_svg(output_path, vis_debug):
@@ -323,7 +345,7 @@ def run_inference(args):
     class_names = list(VOC_COCO_CLASS_NAMES[dataset_name])
     unknown_label = int(getattr(model_args, 'num_classes', len(class_names)) - 1)
     unknown_score_scale = float(getattr(model_args, 'uod_postprocess_unknown_scale', 15.0))
-    viz_cfg = build_viz_cfg(True)
+    viz_cfg = build_viz_cfg()
 
     with torch.no_grad():
         for image_path in image_paths:

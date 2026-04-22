@@ -9,12 +9,15 @@ import datetime
 import logging
 import random
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from pprint import pformat # 美化输出
+from typing import Optional
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 import datasets.samplers as samplers
 import util.misc as utils
@@ -23,8 +26,62 @@ from datasets.torchvision_datasets.open_world import OWDetection
 from engine import evaluate, get_exemplar_replay, train_one_epoch
 from models import build_model
 from util.log import setup_logging
-from visual.epoch_reporter import write_epoch_reports, write_eval_scalars_to_tensorboard
-from visual.viz_context import VizContext
+
+
+@dataclass
+class VizContext:
+    output_dir: Optional[Path]
+    tb_writer: Optional[SummaryWriter]
+    checkpoint_dir_name: str = 'train/checkpoints'
+    tensorboard_dir_name: str = 'train/tensorboard'
+
+    @classmethod
+    def from_args(cls, args):
+        output_dir = Path(args.output_dir) if getattr(args, 'output_dir', None) else None
+        viz_ctx = cls(output_dir=output_dir, tb_writer=None)
+        viz_ctx._build_output_structure()
+        if bool(getattr(args, 'viz', False)) and utils.is_main_process() and viz_ctx.tensorboard_dir is not None:
+            run_name = datetime.datetime.now().strftime('run_%Y%m%d_%H%M%S')
+            log_dir = viz_ctx.tensorboard_dir / run_name
+            log_dir.mkdir(parents=True, exist_ok=True)
+            viz_ctx.tb_writer = SummaryWriter(log_dir=str(log_dir))
+            logging.info('TensorBoard log dir: %s', log_dir)
+        return viz_ctx
+
+    @property
+    def checkpoint_dir(self):
+        return None if self.output_dir is None else self.output_dir / self.checkpoint_dir_name
+
+    @property
+    def tensorboard_dir(self):
+        return None if self.output_dir is None else self.output_dir / self.tensorboard_dir_name
+
+    def _build_output_structure(self):
+        if self.output_dir is None:
+            return
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if self.checkpoint_dir is not None:
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        if self.tensorboard_dir is not None:
+            self.tensorboard_dir.mkdir(parents=True, exist_ok=True)
+
+    def close(self):
+        if self.tb_writer is not None:
+            self.tb_writer.close()
+            self.tb_writer = None
+
+
+def write_eval_scalars_to_tensorboard(viz_ctx, eval_stats, epoch):
+    if viz_ctx is None or viz_ctx.tb_writer is None or not isinstance(eval_stats, dict):
+        return
+    for key, value in eval_stats.items():
+        if isinstance(value, (int, float)):
+            viz_ctx.tb_writer.add_scalar(f'eval/{key}', value, epoch)
+
+
+def write_epoch_reports(viz_ctx, epoch, train_stats, eval_stats, num_trainable_parameters, eval_evaluator=None, args=None):
+    del train_stats, num_trainable_parameters, eval_evaluator, args
+    write_eval_scalars_to_tensorboard(viz_ctx, eval_stats, epoch)
 
 
 def _sanitize_for_checkpoint(obj):
