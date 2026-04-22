@@ -155,8 +155,14 @@ def _draw_detections(image: Image.Image, detections):
         is_unknown = bool(det['is_unknown'])
         color = 'red' if is_unknown else 'lime'
         name = 'unknown' if is_unknown else det['label_name']
+        text = f"{name}:{float(det['raw_score']):.2f}"
+        text_x = x1 + 2
+        text_y = max(0.0, y1 - 14)
+
         draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
-        draw.text((x1 + 2, max(0.0, y1 - 12)), f"{name}:{float(det['raw_score']):.2f}", fill=color)
+        text_bbox = draw.textbbox((text_x, text_y), text)
+        draw.rectangle(text_bbox, fill='black')
+        draw.text((text_x, text_y), text, fill=color)
     return rendered
 
 
@@ -212,7 +218,6 @@ def run_inference(args):
 
     checkpoint, model_args = _load_checkpoint_args(args.checkpoint, args.device)
     vars(model_args).update({k: v for k, v in vars(args).items() if v is not None})
-    model_args.uod_postprocess_unknown_scale = args.unknown_score_scale
 
     model, _, postprocessors, _ = build_model(model_args, mode=model_args.model_type)
     model.load_state_dict(checkpoint['model'], strict=False)
@@ -258,8 +263,14 @@ def run_inference(args):
             )
             (json_dir / f'{image_path.stem}.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
-            rendered = _draw_detections(original_image, filtered_detections)
-            rendered.save(image_dir / f'{image_path.stem}.png')
+            rendered_mixed = _draw_detections(original_image, all_class_agnostic_detections)
+            rendered_mixed.save(image_dir / f'{image_path.stem}.png')
+
+            rendered_known_only = _draw_detections(original_image, known_only_detections)
+            rendered_known_only.save(image_dir / f'{image_path.stem}_known.png')
+
+            rendered_unknown_only = _draw_detections(original_image, unknown_only_detections)
+            rendered_unknown_only.save(image_dir / f'{image_path.stem}_unknown.png')
 
 
 if __name__ == '__main__':
@@ -275,5 +286,4 @@ if __name__ == '__main__':
     parser.add_argument('--min_box_area_ratio', default=0.002, type=float)
     parser.add_argument('--min_box_side_ratio', default=0.03, type=float)
     parser.add_argument('--max_box_aspect_ratio', default=5.0, type=float)
-    parser.add_argument('--unknown_score_scale', default=10.0, type=float)
     run_inference(parser.parse_args())
