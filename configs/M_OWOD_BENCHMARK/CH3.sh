@@ -13,6 +13,7 @@ COMMON_ARGS=(
   --model_type uod
   --with_box_refine
   --exemplar_replay_dir "UOD_CH3"
+  --viz
 )
 
 CH3_ARGS=(
@@ -33,9 +34,9 @@ run_stage() {
   torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
     main_open_world.py \
     --output_dir "${out_dir}" \
-    "$@" \
     "${COMMON_ARGS[@]}" \
-    "${CH3_ARGS[@]}"
+    "${CH3_ARGS[@]}" \
+    "$@"
 }
 
 # ----------------

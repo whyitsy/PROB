@@ -37,10 +37,9 @@ run_stage() {
   torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
     main_open_world.py \
     --output_dir "${out_dir}" \
-    "$@" \
     "${COMMON_ARGS[@]}" \
     "${CH4_ARGS[@]}" \
-    "${PY_ARGS[@]}"
+    "$@" 
 }
 
 # ----------------

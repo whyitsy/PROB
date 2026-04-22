@@ -14,6 +14,7 @@ COMMON_ARGS=(
   --model_type uod
   --with_box_refine
   --exemplar_replay_dir "UOD_CH4"
+  --viz
 )
 
 CH4_ARGS=(
@@ -40,10 +41,9 @@ run_stage() {
   torchrun --standalone --nnodes=1 --nproc-per-node="${GPUS}" \
     main_open_world.py \
     --output_dir "${out_dir}" \
-    "$@" \
     "${COMMON_ARGS[@]}" \
     "${CH4_ARGS[@]}" \
-    "${PY_ARGS[@]}"
+    "$@" 
 }
 
 run_stage "${BASE_EXP_DIR}/t1" \
