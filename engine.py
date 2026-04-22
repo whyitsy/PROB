@@ -70,8 +70,8 @@ def train_one_epoch(
     prefetcher = data_prefetcher(data_loader, device, prefetch=True)
     samples, targets = prefetcher.next()
 
-    pseudo_start_epoch = int(getattr(args, 'uod_start_epoch', 8))
-    reliable_background_warmup = int(getattr(args, 'uod_neg_warmup_epochs', 0))
+    pseudo_start_epoch = int(args.uod_start_epoch)
+    reliable_background_warmup = int(args.uod_neg_warmup_epochs)
 
     for local_step in metric_logger.log_every(range(len(data_loader)), print_frequency, header):
         outputs = model(samples)
@@ -121,7 +121,7 @@ def train_one_epoch(
         optimizer.step()
 
         global_step = epoch * len(data_loader) + local_step
-        if viz_ctx is not None and getattr(viz_ctx, 'tb_writer', None) is not None:
+        if viz_ctx is not None and viz_ctx.tb_writer is not None:
             viz_ctx.tb_writer.add_scalar('train/loss/total', total_loss_value, global_step)
             viz_ctx.tb_writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], global_step)
             viz_ctx.tb_writer.add_scalar('train/grad_norm', grad_total_norm, global_step)
