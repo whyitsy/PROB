@@ -128,9 +128,9 @@ class DeformableDETRUOD(nn.Module):
         self.aux_loss = aux_loss
         self.with_box_refine = with_box_refine
         self.two_stage = two_stage
-        self.enable_odqe = bool(getattr(args, 'uod_enable_odqe', False))
-        self.obj_temperature = float(getattr(args, 'obj_temp', 1.0)) / float(hidden_dim)
-        self.energy_temperature = float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / float(hidden_dim)
+        self.enable_odqe = bool(args.uod_enable_odqe)
+        self.obj_temperature = float(args.obj_temp) / float(hidden_dim)
+        self.energy_temperature = float(args.uod_known_temp) / float(hidden_dim)
         self.known_temperature = self.energy_temperature
 
         self.class_embed = nn.Linear(hidden_dim, num_classes)
@@ -246,8 +246,8 @@ class DeformableDETRUOD(nn.Module):
 
         # odqe decay should also be decoder-only
         if self.enable_odqe:
-            decay_min = float(getattr(args, 'uod_odqe_decay_min', 0.1))
-            decay_power = float(getattr(args, 'uod_odqe_decay_power', 1.0))
+            decay_min = float(args.uod_odqe_decay_min)
+            decay_power = float(args.uod_odqe_decay_power)
             if num_decoder_pred == 1:
                 decay = torch.ones(1)
             else:
@@ -399,36 +399,36 @@ class SetCriterion(nn.Module):
         self.min_obj = -hidden_dim * math.log(0.9)
         self.args = args
 
-        self.enable_unknown = bool(getattr(args, 'uod_enable_unknown', False))
-        self.enable_pseudo = bool(getattr(args, 'uod_enable_pseudo', False))
-        self.enable_batch_dynamic = bool(getattr(args, 'uod_enable_batch_dynamic', False))
-        self.enable_decorr = bool(getattr(args, 'uod_enable_decorr', False))
-        self.obj_temperature = float(getattr(args, 'obj_temp', 1.0)) / float(hidden_dim)
-        self.known_temperature = float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / float(hidden_dim)
-        self.num_aux_layers = max(int(getattr(args, 'dec_layers', 6)) - 1, 0)
+        self.enable_unknown = bool(args.uod_enable_unknown)
+        self.enable_pseudo = bool(args.uod_enable_pseudo)
+        self.enable_batch_dynamic = bool(args.uod_enable_batch_dynamic)
+        self.enable_decorr = bool(args.uod_enable_decorr)
+        self.obj_temperature = float(args.obj_temp) / float(hidden_dim)
+        self.known_temperature = float(args.uod_known_temp) / float(hidden_dim)
+        self.num_aux_layers = max(int(args.dec_layers) - 1, 0)
 
-        self.uod_start_epoch = int(getattr(args, 'uod_start_epoch', 8))
-        self.uod_neg_warmup_epochs = int(getattr(args, 'uod_neg_warmup_epochs', 3))
-        self.uod_min_pos_thresh = float(getattr(args, 'uod_min_pos_thresh', 0.08))
-        self.uod_known_reject_thresh = float(getattr(args, 'uod_known_reject_thresh', 0.15))
-        self.uod_neg_margin = float(getattr(args, 'uod_neg_margin', 0.8))
-        self.uod_pos_per_img_cap = int(getattr(args, 'uod_pos_per_img_cap', 1))
-        self.uod_neg_per_img = int(getattr(args, 'uod_neg_per_img', 1))
-        self.uod_batch_topk_max = int(getattr(args, 'uod_batch_topk_max', 8))
-        self.uod_batch_topk_ratio = float(getattr(args, 'uod_batch_topk_ratio', 0.25))
-        self.uod_max_iou = float(getattr(args, 'uod_max_iou', 0.2))
-        self.uod_max_iof = float(getattr(args, 'uod_max_iof', 0.4))
-        self.uod_min_area = float(getattr(args, 'uod_min_area', 0.002))
-        self.uod_min_side = float(getattr(args, 'uod_min_side', 0.05))
-        self.uod_max_aspect_ratio = float(getattr(args, 'uod_max_aspect_ratio', 4.0))
-        self.uod_candidate_nms_iou = float(getattr(args, 'uod_candidate_nms_iou', 0.6))
-        self.uod_pos_unk_min = float(getattr(args, 'uod_pos_unk_min', 0.05))
-        self.enable_cls_soft_attn = bool(getattr(args, 'uod_enable_cls_soft_attn', False))
-        self.uod_cls_soft_attn_alpha = float(getattr(args, 'uod_cls_soft_attn_alpha', 0.5))
-        self.uod_cls_soft_attn_min = float(getattr(args, 'uod_cls_soft_attn_min', 0.25))
-        self.uod_neg_max_pseudo_iou = float(getattr(args, 'uod_neg_max_pseudo_iou', 0.3))
-        self.uod_neg_known_max = float(getattr(args, 'uod_neg_known_max', 0.7))
-        self.uod_neg_unk_max = float(getattr(args, 'uod_neg_unk_max', 0.1))
+        self.uod_start_epoch = int(args.uod_start_epoch)
+        self.uod_neg_warmup_epochs = int(args.uod_neg_warmup_epochs)
+        self.uod_min_pos_thresh = float(args.uod_min_pos_thresh)
+        self.uod_known_reject_thresh = float(args.uod_known_reject_thresh)
+        self.uod_neg_margin = float(args.uod_neg_margin)
+        self.uod_pos_per_img_cap = int(args.uod_pos_per_img_cap)
+        self.uod_neg_per_img = int(args.uod_neg_per_img)
+        self.uod_batch_topk_max = int(args.uod_batch_topk_max)
+        self.uod_batch_topk_ratio = float(args.uod_batch_topk_ratio)
+        self.uod_max_iou = float(args.uod_max_iou)
+        self.uod_max_iof = float(args.uod_max_iof)
+        self.uod_min_area = float(args.uod_min_area)
+        self.uod_min_side = float(args.uod_min_side)
+        self.uod_max_aspect_ratio = float(args.uod_max_aspect_ratio)
+        self.uod_candidate_nms_iou = float(args.uod_candidate_nms_iou)
+        self.uod_pos_unk_min = float(args.uod_pos_unk_min)
+        self.enable_cls_soft_attn = bool(args.uod_enable_cls_soft_attn)
+        self.uod_cls_soft_attn_alpha = float(args.uod_cls_soft_attn_alpha)
+        self.uod_cls_soft_attn_min = float(args.uod_cls_soft_attn_min)
+        self.uod_neg_max_pseudo_iou = float(args.uod_neg_max_pseudo_iou)
+        self.uod_neg_known_max = float(args.uod_neg_known_max)
+        self.uod_neg_unk_max = float(args.uod_neg_unk_max)
 
     def _compute_fused_probabilities(self, outputs):
         return _compute_uod_fused_probabilities(
@@ -438,7 +438,7 @@ class SetCriterion(nn.Module):
             self.invalid_cls_logits,
             self.obj_temperature,
             self.known_temperature,
-            float(getattr(self.args, 'uod_postprocess_unknown_scale', 15.0)),
+            float(self.args.uod_postprocess_unknown_scale),
         )
 
     def _aux_stage(self, layer_idx):
@@ -1194,8 +1194,8 @@ class ExemplarSelection(nn.Module):
             outputs.get('pred_known', None),
             self.invalid_cls_logits,
             self.temperature,
-            float(getattr(self.args, 'uod_known_temp', getattr(self.args, 'obj_temp', 1.0))) / float(getattr(self.args, 'hidden_dim', 256)),
-            float(getattr(self.args, 'uod_postprocess_unknown_scale', 15.0)),
+            float(self.args.uod_known_temp) / float(self.args.hidden_dim),
+            float(self.args.uod_postprocess_unknown_scale),
         )
         image_sorted_scores = {}
         for i in range(len(targets)):
@@ -1240,21 +1240,21 @@ def build(args):
     }
     losses = ['labels', 'boxes', 'cardinality', 'obj_likelihood']
 
-    if getattr(args, 'uod_enable_unknown', False):
-        weight_dict['loss_unk_known'] = getattr(args, 'unk_loss_coef', 0.3)
+    if args.uod_enable_unknown:
+        weight_dict['loss_unk_known'] = args.unk_loss_coef
         losses.append('unk_known')
-    if getattr(args, 'uod_enable_pseudo', False):
-        weight_dict['loss_obj_pseudo'] = getattr(args, 'uod_pseudo_obj_loss_coef', 0.3)
-        weight_dict['loss_obj_neg'] = getattr(args, 'uod_obj_neg_loss_coef', 1.0)
-        if getattr(args, 'uod_enable_unknown', False):
-            weight_dict['loss_unk_pseudo'] = getattr(args, 'uod_pseudo_unk_loss_coef', 0.4)
-        weight_dict['loss_bbox_pseudo_cons'] = getattr(args, 'uod_pseudo_bbox_loss_coef', args.bbox_loss_coef * 0.5)
-        weight_dict['loss_giou_pseudo_cons'] = getattr(args, 'uod_pseudo_giou_loss_coef', args.giou_loss_coef * 0.25)
+    if args.uod_enable_pseudo:
+        weight_dict['loss_obj_pseudo'] = args.uod_pseudo_obj_loss_coef
+        weight_dict['loss_obj_neg'] = args.uod_obj_neg_loss_coef
+        if args.uod_enable_unknown:
+            weight_dict['loss_unk_pseudo'] = args.uod_pseudo_unk_loss_coef
+        weight_dict['loss_bbox_pseudo_cons'] = args.uod_pseudo_bbox_loss_coef
+        weight_dict['loss_giou_pseudo_cons'] = args.uod_pseudo_giou_loss_coef
         losses.extend(['obj_pseudo', 'obj_neg'])
-        if getattr(args, 'uod_enable_unknown', False):
+        if args.uod_enable_unknown:
             losses.append('unk_pseudo')
-    if getattr(args, 'uod_enable_decorr', False):
-        weight_dict['loss_decorr'] = getattr(args, 'uod_decorr_loss_coef', 0.05)
+    if args.uod_enable_decorr:
+        weight_dict['loss_decorr'] = args.uod_decorr_loss_coef
         losses.append('decorr')
 
 
@@ -1273,20 +1273,20 @@ def build(args):
                 aux_weight_dict[f'loss_unk_known_{i}'] = weight_dict['loss_unk_known']
             if 'loss_obj_pseudo' in weight_dict:
                 if stage == 'low':
-                    aux_weight_dict[f'loss_obj_pseudo_{i}'] = weight_dict['loss_obj_pseudo'] * float(getattr(args, 'uod_haux_low_obj_coef', 0.35))
+                    aux_weight_dict[f'loss_obj_pseudo_{i}'] = weight_dict['loss_obj_pseudo'] * float(args.uod_haux_low_obj_coef)
                 elif stage == 'mid':
-                    aux_weight_dict[f'loss_obj_pseudo_{i}'] = weight_dict['loss_obj_pseudo'] * float(getattr(args, 'uod_haux_mid_unknown_coef', 0.45))
+                    aux_weight_dict[f'loss_obj_pseudo_{i}'] = weight_dict['loss_obj_pseudo'] * float(args.uod_haux_mid_unknown_coef)
                 else:
-                    aux_weight_dict[f'loss_obj_pseudo_{i}'] = weight_dict['loss_obj_pseudo'] * float(getattr(args, 'uod_haux_high_unknown_coef', 0.7))
+                    aux_weight_dict[f'loss_obj_pseudo_{i}'] = weight_dict['loss_obj_pseudo'] * float(args.uod_haux_high_unknown_coef)
             if stage in ['mid', 'high'] and 'loss_unk_pseudo' in weight_dict:
-                coef = float(getattr(args, 'uod_haux_mid_unknown_coef', 0.45)) if stage == 'mid' else float(getattr(args, 'uod_haux_high_unknown_coef', 0.7))
+                coef = float(args.uod_haux_mid_unknown_coef) if stage == 'mid' else float(args.uod_haux_high_unknown_coef)
                 aux_weight_dict[f'loss_unk_pseudo_{i}'] = weight_dict['loss_unk_pseudo'] * coef
             if stage in ['mid', 'high'] and 'loss_bbox_pseudo_cons' in weight_dict:
-                coef = float(getattr(args, 'uod_haux_mid_unknown_coef', 0.45)) if stage == 'mid' else float(getattr(args, 'uod_haux_high_unknown_coef', 0.7))
+                coef = float(args.uod_haux_mid_unknown_coef) if stage == 'mid' else float(args.uod_haux_high_unknown_coef)
                 aux_weight_dict[f'loss_bbox_pseudo_cons_{i}'] = weight_dict['loss_bbox_pseudo_cons'] * coef
                 aux_weight_dict[f'loss_giou_pseudo_cons_{i}'] = weight_dict['loss_giou_pseudo_cons'] * coef
             if stage == 'high' and 'loss_decorr' in weight_dict:
-                aux_weight_dict[f'loss_decorr_{i}'] = weight_dict['loss_decorr'] * float(getattr(args, 'uod_haux_high_decorr_coef', 0.5))
+                aux_weight_dict[f'loss_decorr_{i}'] = weight_dict['loss_decorr'] * float(args.uod_haux_high_decorr_coef)
         aux_weight_dict.update({k + '_enc': v for k, v in weight_dict.items() if k in ['loss_ce', 'loss_bbox', 'loss_giou']})
         weight_dict.update(aux_weight_dict)
 
@@ -1296,9 +1296,9 @@ def build(args):
     postprocessors = {'bbox': PostProcess(
         invalid_cls_logits,
         obj_temperature=args.obj_temp / args.hidden_dim,
-        known_temperature=float(getattr(args, 'uod_known_temp', getattr(args, 'obj_temp', 1.0))) / args.hidden_dim,
+        known_temperature=float(args.uod_known_temp) / args.hidden_dim,
         pred_per_im=args.num_queries,
-        unknown_scale=float(getattr(args, 'uod_postprocess_unknown_scale', 15.0)),
+        unknown_scale=float(args.uod_postprocess_unknown_scale),
     )}
 
     exemplar_selection = ExemplarSelection(args, num_classes, matcher, invalid_cls_logits,

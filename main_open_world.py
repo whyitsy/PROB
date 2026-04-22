@@ -37,10 +37,10 @@ class VizContext:
 
     @classmethod
     def from_args(cls, args):
-        output_dir = Path(args.output_dir) if getattr(args, 'output_dir', None) else None
+        output_dir = Path(args.output_dir) if args.output_dir else None
         viz_ctx = cls(output_dir=output_dir, tb_writer=None)
         viz_ctx._build_output_structure()
-        if bool(getattr(args, 'viz', False)) and utils.is_main_process() and viz_ctx.tensorboard_dir is not None:
+        if args.viz and utils.is_main_process() and viz_ctx.tensorboard_dir is not None:
             run_name = datetime.datetime.now().strftime('run_%Y%m%d_%H%M%S')
             log_dir = viz_ctx.tensorboard_dir / run_name
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -233,6 +233,74 @@ def get_args_parser():
     return parser
 
 
+def validate_args(args):
+    required_fields = [
+        'model_type', 'device', 'epochs', 'start_epoch', 'lr_drop', 'eval_every',
+        'batch_size', 'eval_batch_size', 'num_queries', 'num_classes', 'hidden_dim',
+        'obj_temp', 'uod_known_temp', 'uod_postprocess_unknown_scale', 'unk_loss_coef',
+        'uod_start_epoch', 'uod_neg_warmup_epochs', 'uod_batch_topk_max', 'uod_batch_topk_ratio',
+    ]
+    missing = [name for name in required_fields if not hasattr(args, name)]
+    if missing:
+        raise ValueError(f'Missing required args: {missing}')
+
+    if args.model_type not in {'prob', 'uod'}:
+        raise ValueError(f'Unsupported model_type={args.model_type}')
+    if args.epochs <= 0:
+        raise ValueError('epochs must be > 0')
+    if args.start_epoch < 0 or args.start_epoch >= args.epochs:
+        raise ValueError('start_epoch must satisfy 0 <= start_epoch < epochs')
+    if args.lr_drop <= 0 or args.eval_every <= 0:
+        raise ValueError('lr_drop and eval_every must be > 0')
+    if args.batch_size <= 0 or args.eval_batch_size <= 0:
+        raise ValueError('batch_size and eval_batch_size must be > 0')
+    if args.num_queries <= 0 or args.num_classes <= 1:
+        raise ValueError('num_queries must be > 0 and num_classes must be > 1')
+    if args.hidden_dim <= 0:
+        raise ValueError('hidden_dim must be > 0')
+
+    for name in ['obj_temp', 'uod_known_temp', 'uod_postprocess_unknown_scale']:
+        if getattr(args, name) <= 0:
+            raise ValueError(f'{name} must be > 0')
+
+    for name in [
+        'obj_loss_coef', 'unk_loss_coef', 'uod_pseudo_unk_loss_coef', 'uod_pseudo_obj_loss_coef',
+        'uod_obj_neg_loss_coef', 'uod_decorr_loss_coef', 'uod_pseudo_bbox_loss_coef',
+        'uod_pseudo_giou_loss_coef', 'uod_haux_low_obj_coef', 'uod_haux_mid_unknown_coef',
+        'uod_haux_high_unknown_coef', 'uod_haux_high_decorr_coef',
+    ]:
+        if getattr(args, name) < 0:
+            raise ValueError(f'{name} must be >= 0')
+
+    for name in [
+        'uod_min_pos_thresh', 'uod_known_reject_thresh', 'uod_neg_margin',
+        'uod_neg_known_max', 'uod_neg_unk_max', 'uod_neg_max_pseudo_iou',
+        'uod_batch_topk_ratio', 'uod_max_iou', 'uod_max_iof',
+        'uod_min_area', 'uod_min_side', 'uod_candidate_nms_iou',
+        'uod_cls_soft_attn_alpha', 'uod_cls_soft_attn_min', 'uod_pos_unk_min',
+    ]:
+        value = getattr(args, name)
+        if not (0.0 <= value <= 1.0):
+            raise ValueError(f'{name} must be in [0, 1], got {value}')
+
+    if args.uod_max_aspect_ratio < 1.0:
+        raise ValueError('uod_max_aspect_ratio must be >= 1.0')
+    if args.uod_batch_topk_max <= 0:
+        raise ValueError('uod_batch_topk_max must be > 0')
+    if args.uod_start_epoch < 0 or args.uod_neg_warmup_epochs < 0:
+        raise ValueError('uod_start_epoch and uod_neg_warmup_epochs must be >= 0')
+    if args.uod_pos_per_img_cap < 0 or args.uod_neg_per_img < 0:
+        raise ValueError('uod_pos_per_img_cap and uod_neg_per_img must be >= 0')
+
+    if args.eval and not args.eval_checkpoint:
+        raise ValueError('eval mode requires --eval_checkpoint')
+    if args.exemplar_replay_selection and (not args.exemplar_replay_dir or not args.exemplar_replay_cur_file):
+        raise ValueError('exemplar_replay_selection requires --exemplar_replay_dir and --exemplar_replay_cur_file')
+
+    if args.uod_enable_cls_soft_attn and not args.uod_enable_unknown:
+        raise ValueError('uod_enable_cls_soft_attn requires uod_enable_unknown')
+
+
 def build_datasets(args):
     logging.info('Dataset: %s', args.dataset)
     train_dataset = OWDetection( args, args.data_root, image_set=args.train_set, transforms=make_coco_transforms(args.train_set), dataset=args.dataset)
@@ -315,6 +383,7 @@ def main(args):
         np.random.seed(seed)
         random.seed(seed)
 
+        validate_args(args)
         model, criterion, postprocessors, exemplar_selection = build_model(args, mode=args.model_type)
         model.to(device)
         model_without_ddp = model
@@ -495,6 +564,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('PROB / UOD training and evaluation script', parents=[get_args_parser()])
     parsed_args = parser.parse_args()
+    validate_args(parsed_args)
     if parsed_args.output_dir:
         Path(parsed_args.output_dir).mkdir(parents=True, exist_ok=True)
     try:

@@ -11,6 +11,7 @@ from datasets.coco import make_coco_transforms
 from datasets.torchvision_datasets.open_world import VOC_COCO_CLASS_NAMES
 from models import build_model
 from util import box_ops
+from main_open_world import get_args_parser
 from util.log import setup_logging
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
@@ -30,9 +31,11 @@ def build_viz_cfg():
 
 def _load_checkpoint_args(checkpoint_path, device):
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    parser_defaults = vars(get_args_parser().parse_args([]))
     saved_args = checkpoint.get('args', {}) or {}
-    saved_args['device'] = device
-    return checkpoint, argparse.Namespace(**saved_args)
+    parser_defaults.update(saved_args)
+    parser_defaults['device'] = device
+    return checkpoint, argparse.Namespace(**parser_defaults)
 
 
 def _collect_input_images(input_path):
@@ -333,7 +336,7 @@ def run_inference(args):
 
     checkpoint, model_args = _load_checkpoint_args(args.checkpoint, args.device)
     vars(model_args).update({k: v for k, v in vars(args).items() if v is not None})
-    model, _, postprocessors, _ = build_model(model_args, mode=getattr(model_args, 'model_type'))
+    model, _, postprocessors, _ = build_model(model_args, mode=model_args.model_type)
     model.load_state_dict(checkpoint['model'], strict=False)
     model.to(torch.device(args.device))
     model.eval()
@@ -341,10 +344,10 @@ def run_inference(args):
     image_paths = _collect_input_images(args.input)
     logging.info('Found %s image(s) for inference', len(image_paths))
 
-    dataset_name = getattr(model_args, 'dataset', 'OWDETR')
+    dataset_name = model_args.dataset
     class_names = list(VOC_COCO_CLASS_NAMES[dataset_name])
-    unknown_label = int(getattr(model_args, 'num_classes', len(class_names)) - 1)
-    unknown_score_scale = float(getattr(model_args, 'uod_postprocess_unknown_scale', 15.0))
+    unknown_label = int(model_args.num_classes - 1)
+    unknown_score_scale = float(model_args.uod_postprocess_unknown_scale)
     viz_cfg = build_viz_cfg()
 
     with torch.no_grad():
