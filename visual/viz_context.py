@@ -1,4 +1,3 @@
-
 import datetime
 import logging
 from dataclasses import dataclass
@@ -8,26 +7,21 @@ from typing import Optional
 from torch.utils.tensorboard import SummaryWriter
 
 import util.misc as utils
-from visual.viz_config import build_viz_cfg
 
 
 @dataclass
 class VizContext:
     output_dir: Optional[Path]
-    viz_cfg: Optional[dict]
     tb_writer: Optional[SummaryWriter]
-    train_epoch_metrics_file: str = 'train/metrics_epoch.jsonl'
-    eval_epoch_metrics_file: str = 'eval/metrics_epoch.jsonl'
     checkpoint_dir_name: str = 'train/checkpoints'
     tensorboard_dir_name: str = 'train/tensorboard'
 
     @classmethod
     def from_args(cls, args):
         output_dir = Path(args.output_dir) if getattr(args, 'output_dir', None) else None
-        viz_cfg = build_viz_cfg(bool(getattr(args, 'viz', False)))
-        viz_ctx = cls(output_dir=output_dir, viz_cfg=viz_cfg, tb_writer=None)
+        viz_ctx = cls(output_dir=output_dir, tb_writer=None)
         viz_ctx._build_output_structure()
-        viz_ctx.tb_writer = viz_ctx._create_tensorboard_writer()
+        viz_ctx.tb_writer = viz_ctx._create_tensorboard_writer(enable_tensorboard=bool(getattr(args, 'viz', False)))
         return viz_ctx
 
     @property
@@ -36,23 +30,11 @@ class VizContext:
 
     @property
     def visualization_enabled(self) -> bool:
-        return self.enabled and self.viz_cfg is not None
+        return self.tb_writer is not None
 
     @property
     def should_write_artifacts(self) -> bool:
         return self.enabled and utils.is_main_process()
-
-    @property
-    def train_epoch_metrics_path(self) -> Optional[Path]:
-        if self.output_dir is None:
-            return None
-        return self.output_dir / self.train_epoch_metrics_file
-
-    @property
-    def eval_epoch_metrics_path(self) -> Optional[Path]:
-        if self.output_dir is None:
-            return None
-        return self.output_dir / self.eval_epoch_metrics_file
 
     @property
     def checkpoint_dir(self) -> Optional[Path]:
@@ -66,17 +48,6 @@ class VizContext:
             return None
         return self.output_dir / self.tensorboard_dir_name
 
-    def eval_visualization_dir(self, epoch: int) -> Optional[Path]:
-        if self.output_dir is None:
-            return None
-        return self.output_dir / 'eval' / 'visualizations' / f'epoch_{int(epoch):04d}'
-
-    @property
-    def bbox_eval_dir(self) -> Optional[Path]:
-        if self.output_dir is None:
-            return None
-        return self.output_dir / 'eval' / 'bbox_eval'
-
     def close(self):
         if self.tb_writer is None:
             return
@@ -87,8 +58,6 @@ class VizContext:
         if self.output_dir is None:
             return
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        (self.output_dir / 'train').mkdir(parents=True, exist_ok=True)
-        (self.output_dir / 'eval').mkdir(parents=True, exist_ok=True)
         checkpoint_dir = self.checkpoint_dir
         if checkpoint_dir is not None:
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -96,8 +65,8 @@ class VizContext:
         if tensorboard_dir is not None:
             tensorboard_dir.mkdir(parents=True, exist_ok=True)
 
-    def _create_tensorboard_writer(self):
-        if not self.visualization_enabled or not utils.is_main_process():
+    def _create_tensorboard_writer(self, enable_tensorboard: bool):
+        if not enable_tensorboard or not utils.is_main_process():
             return None
         tensorboard_dir = self.tensorboard_dir
         if tensorboard_dir is None:
