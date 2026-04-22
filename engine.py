@@ -17,29 +17,6 @@ from visual.engine_hooks import (
 )
 
 
-def _get_output(outputs, *keys):
-    for key in keys:
-        if key in outputs and outputs[key] is not None:
-            return outputs[key]
-    return None
-
-
-def _call_criterion(criterion, outputs, targets, epoch):
-    try:
-        return criterion(outputs, targets, epoch)
-    except TypeError:
-        return criterion(outputs, targets)
-
-
-def _forward_model_for_evaluation(model, samples, enable_visual_debug):
-    if not enable_visual_debug:
-        return model(samples)
-    try:
-        return model(samples, return_vis_debug=True)
-    except TypeError:
-        return model(samples)
-
-
 def _rescale_postprocessed_results(results, from_sizes, to_sizes):
     if results is None:
         return None
@@ -128,7 +105,7 @@ def train_one_epoch(
 
     for local_step in metric_logger.log_every(range(len(data_loader)), print_frequency, header):
         outputs = model(samples)
-        loss_dict = _call_criterion(criterion, outputs, targets, epoch)
+        loss_dict = criterion(outputs, targets, epoch)
         weight_dict = deepcopy(criterion.weight_dict)
 
         if epoch < pseudo_start_epoch:
@@ -237,7 +214,7 @@ def evaluate(
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
         targets = [{key: value.to(device) for key, value in target.items()} for target in targets]
-        outputs = _forward_model_for_evaluation(model, samples, enable_visual_debug=(visual_state is not None))
+        outputs = model(samples, return_vis_debug=(visual_state is not None))
 
         original_sizes = torch.stack([target['orig_size'] for target in targets], dim=0)
         visual_sizes = torch.stack([target['size'] for target in targets], dim=0)

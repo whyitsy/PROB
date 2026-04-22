@@ -178,20 +178,8 @@ def get_args_parser():
 
 def build_datasets(args):
     logging.info('Dataset: %s', args.dataset)
-    train_dataset = OWDetection(
-        args,
-        args.data_root,
-        image_set=args.train_set,
-        transforms=make_coco_transforms(args.train_set),
-        dataset=args.dataset,
-    )
-    eval_dataset = OWDetection(
-        args,
-        args.data_root,
-        image_set=args.test_set,
-        transforms=make_coco_transforms(args.test_set),
-        dataset=args.dataset,
-    )
+    train_dataset = OWDetection( args, args.data_root, image_set=args.train_set, transforms=make_coco_transforms(args.train_set), dataset=args.dataset)
+    eval_dataset = OWDetection( args, args.data_root, image_set=args.test_set, transforms=make_coco_transforms(args.test_set), dataset=args.dataset)
     logging.info('Train split: %s', args.train_set)
     logging.info('Eval split: %s', args.test_set)
     return train_dataset, eval_dataset
@@ -356,17 +344,7 @@ def main(args):
             if 'epoch' in checkpoint:
                 args.start_epoch = checkpoint['epoch'] + 1
 
-            eval_stats, _ = evaluate(
-                model,
-                criterion,
-                postprocessors,
-                eval_loader,
-                eval_dataset,
-                device,
-                args,
-                viz_ctx=viz_ctx,
-                epoch=args.start_epoch,
-            )
+            eval_stats, _ = evaluate(model, criterion, postprocessors, eval_loader, eval_dataset, device, args, viz_ctx=viz_ctx, epoch=args.start_epoch)
             write_eval_scalars_to_tensorboard(viz_ctx, eval_stats, args.start_epoch)
         else:
             if args.resume:
@@ -400,17 +378,7 @@ def main(args):
                 if args.distributed:
                     train_sampler.set_epoch(epoch)
 
-                train_stats = train_one_epoch(
-                    model,
-                    criterion,
-                    train_loader,
-                    optimizer,
-                    device,
-                    epoch,
-                    max_norm=args.clip_max_norm,
-                    viz_ctx=viz_ctx,
-                    args=args,
-                )
+                train_stats = train_one_epoch(model, criterion, train_loader, optimizer, device, epoch,  max_norm=args.clip_max_norm, viz_ctx=viz_ctx, args=args)
                 lr_scheduler.step()
 
                 eval_stats = {}
@@ -420,17 +388,7 @@ def main(args):
                     checkpoint_paths.append(viz_ctx.checkpoint_dir / 'checkpoint_latest.pth')
                     should_run_evaluation = ((epoch + 1) % args.lr_drop == 0) or (epoch == 0) or (epoch == 1) or ((epoch + 1) % args.eval_every == 0 or (epoch == args.epochs - 1))
                     if should_run_evaluation:
-                        eval_stats, eval_evaluator = evaluate(
-                            model,
-                            criterion,
-                            postprocessors,
-                            eval_loader,
-                            eval_dataset,
-                            device,
-                            args,
-                            viz_ctx=viz_ctx,
-                            epoch=epoch,
-                        )
+                        eval_stats, eval_evaluator = evaluate(model, criterion, postprocessors, eval_loader, eval_dataset, device, args, viz_ctx=viz_ctx, epoch=epoch)
                         write_eval_scalars_to_tensorboard(viz_ctx, eval_stats, epoch)
                         checkpoint_paths.append(viz_ctx.checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pth')
                     elif epoch > args.epochs - 6:
@@ -446,32 +404,22 @@ def main(args):
                             'args': checkpoint_args,
                         }, checkpoint_path)
 
-                write_epoch_reports(
-                    viz_ctx=viz_ctx,
-                    epoch=epoch,
-                    train_stats=train_stats,
-                    eval_stats=eval_stats,
-                    num_trainable_parameters=num_trainable_parameters,
-                    eval_evaluator=eval_evaluator,
-                    args=args,
-                )
+                write_epoch_reports(viz_ctx=viz_ctx, epoch=epoch, train_stats=train_stats, eval_stats=eval_stats, 
+                                    num_trainable_parameters=num_trainable_parameters,
+                                    eval_evaluator=eval_evaluator, args=args)
 
-            # =========== [及时释放显存] ===========
             logging.info("Training finished. Releasing training resources to free VRAM...")
 
-            # 1. 删除优化器和学习率调度器
             if 'optimizer' in locals():
                 del optimizer
             if 'lr_scheduler' in locals():
                 del lr_scheduler
-
-            # 2. loss_dict 或 outputs 可能包含大量中间张量
+                
             if 'outputs' in locals():
                 del outputs
             if 'loss_dict' in locals():
                 del loss_dict
 
-            # 3. 让 PyTorch 把闲置的显存真正还给 GPU
             torch.cuda.empty_cache()
 
             logging.info("Resources released. Proceeding to exemplar replay/evaluation.")
