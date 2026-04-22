@@ -5,15 +5,17 @@ import argparse
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from PIL import Image
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib import patches
+from matplotlib.lines import Line2D
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 from util import box_ops
@@ -25,7 +27,7 @@ BACKGROUND_COLOR = '#b0b0b0'
 ERROR_COLOR = '#f1c40f'
 STAGE_COLOR = '#ff5a36'
 QUERY_COLOR = '#00d5ff'
-LEVEL_COLORS = ['#ff595e', '#ffca3a', '#8ac926', '#1982c4']
+LEVEL_COLORS = ['#ff595e', '#ffca3a', '#8ac926', '#1982c4', '#6a4c93', '#1982c4']
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,8 +46,9 @@ def build_parser() -> argparse.ArgumentParser:
     overlay = subparsers.add_parser('overlay')
     add_dump_arg(overlay)
     add_image_selection_args(overlay)
-    overlay.add_argument('--score_thr', type=float, default=0.15)
-    overlay.add_argument('--max_det', type=int, default=30)
+    overlay.add_argument('--score_thr', type=float, default=0.30)
+    overlay.add_argument('--max_det', type=int, default=15)
+    overlay.add_argument('--max_error_det', type=int, default=5)
     overlay.add_argument('--iou_thr', type=float, default=0.5)
 
     mining = subparsers.add_parser('mining')
@@ -55,6 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
     hist = subparsers.add_parser('histograms')
     add_dump_arg(hist)
     hist.add_argument('--bins', type=int, default=40)
+    hist.add_argument('--assign_iou_thr', type=float, default=0.3)
+    hist.add_argument('--background_iou_thr', type=float, default=0.1)
 
     evolution = subparsers.add_parser('box_evolution')
     add_dump_arg(evolution)
@@ -113,8 +118,9 @@ def load_entry(dump_dir: Path, image_id: int) -> Dict[str, Any]:
     return torch.load(dump_dir / 'per_image' / f'{image_id}.pt', map_location='cpu')
 
 
-def load_global_stats(dump_dir: Path) -> Dict[str, torch.Tensor]:
-    return torch.load(dump_dir / 'global_stats.pt', map_location='cpu')
+def iter_entries(dump_dir: Path, manifest: Dict[str, Any]):
+    for record in manifest.get('saved_records', []):
+        yield load_entry(dump_dir, int(record['image_id']))
 
 
 def ensure_output_dir(path: Path) -> None:
@@ -128,6 +134,7 @@ def compute_entry_probs(entry: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     pred_known = entry['outputs'].get('pred_known', None)
     if pred_known is not None:
         pred_known = pred_known.unsqueeze(0)
+
     invalid = meta['invalid_cls_logits']
     logits = pred_logits.clone()
     if len(invalid) > 0:
@@ -137,6 +144,7 @@ def compute_entry_probs(entry: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         class_prob[:, :, invalid] = 0.0
     if class_prob.shape[-1] > 0:
         class_prob[:, :, -1] = 0.0
+
     obj_prob = torch.exp(-meta['obj_temperature'] * pred_obj).clamp(min=1e-6, max=1.0)
     if pred_known is None:
         knownness_prob = torch.ones_like(obj_prob)
@@ -171,12 +179,47 @@ def open_image(entry: Dict[str, Any]) -> np.ndarray:
     return np.array(Image.open(entry['image_path']).convert('RGB'))
 
 
+def clamp_box_xyxy(box_xyxy: Sequence[float], img_w: int, img_h: int) -> np.ndarray:
+    x1, y1, x2, y2 = [float(v) for v in box_xyxy]
+    x1 = min(max(x1, 0.0), float(img_w - 1))
+    y1 = min(max(y1, 0.0), float(img_h - 1))
+    x2 = min(max(x2, 0.0), float(img_w - 1))
+    y2 = min(max(y2, 0.0), float(img_h - 1))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+
+def is_displayable_box(box_xyxy: Sequence[float], img_w: int, img_h: int) -> bool:
+    box = clamp_box_xyxy(box_xyxy, img_w, img_h)
+    w = float(box[2] - box[0])
+    h = float(box[3] - box[1])
+    if w < 12 or h < 12:
+        return False
+    aspect = max(w / max(h, 1e-6), h / max(w, 1e-6))
+    if aspect > 6.0:
+        return False
+    area_frac = (w * h) / max(float(img_w * img_h), 1.0)
+    if area_frac < 0.002 or area_frac > 0.75:
+        return False
+    cx = 0.5 * (box[0] + box[2])
+    cy = 0.5 * (box[1] + box[3])
+    if cx < 0.02 * img_w or cx > 0.98 * img_w:
+        return False
+    if cy < 0.02 * img_h or cy > 0.98 * img_h:
+        return False
+    return True
+
+
 def draw_box(ax, box_xyxy, color: str, label: Optional[str] = None, linewidth: float = 2.5, alpha: float = 1.0):
     x1, y1, x2, y2 = [float(v) for v in box_xyxy]
     rect = patches.Rectangle((x1, y1), max(1.0, x2 - x1), max(1.0, y2 - y1), fill=False, edgecolor=color, linewidth=linewidth, alpha=alpha)
     ax.add_patch(rect)
     if label:
-        ax.text(x1, max(2, y1 - 3), label, color='white', fontsize=8, bbox=dict(boxstyle='round,pad=0.2', fc=color, ec='none', alpha=0.85))
+        ax.text(x1, max(2, y1 - 3), label, color='white', fontsize=8,
+                bbox=dict(boxstyle='round,pad=0.2', fc=color, ec='none', alpha=0.85))
 
 
 def classify_detections(entry: Dict[str, Any], score_thr: float, max_det: int, iou_thr: float) -> List[Dict[str, Any]]:
@@ -189,6 +232,7 @@ def classify_detections(entry: Dict[str, Any], score_thr: float, max_det: int, i
     gt_labels = gt['labels']
     num_classes = int(entry['config_meta']['num_classes'])
     unknown_label = num_classes - 1
+
     order = torch.argsort(scores, descending=True)
     used_gt = set()
     records: List[Dict[str, Any]] = []
@@ -207,21 +251,85 @@ def classify_detections(entry: Dict[str, Any], score_thr: float, max_det: int, i
             best_iou, best_gt_tensor = ious.max(dim=0)
             best_iou = float(best_iou.item())
             best_gt = int(best_gt_tensor.item())
-        is_match = False
         kind = 'error'
         if best_gt >= 0 and best_iou >= iou_thr and best_gt not in used_gt and label == int(gt_labels[best_gt].item()):
-            is_match = True
             used_gt.add(best_gt)
             kind = 'unknown' if label == unknown_label else 'known'
-        records.append({'box': box, 'label': label, 'score': score, 'kind': kind, 'is_match': is_match})
+        records.append({'box': box, 'label': label, 'score': score, 'kind': kind})
     return records
 
 
-def auto_query_index(entry: Dict[str, Any], prefer_pseudo: bool = True) -> int:
-    pseudo_pos = entry['pseudo_mining'].get('selected_pseudo_pos', [])
-    if prefer_pseudo and len(pseudo_pos) > 0:
-        return int(pseudo_pos[0])
+def categorize_entry_queries(
+    entry: Dict[str, Any],
+    assign_iou_thr: float = 0.3,
+    background_iou_thr: float = 0.1,
+) -> torch.Tensor:
+    pred_boxes_abs = to_abs_xyxy(entry['outputs']['pred_boxes'], entry['orig_size_hw'])
+    gt_boxes = entry['targets_raw_abs']['boxes_abs_xyxy']
+    gt_labels = entry['targets_raw_abs']['labels']
+    num_queries = pred_boxes_abs.shape[0]
+    categories = torch.full((num_queries,), -1, dtype=torch.int64)
+    if gt_boxes.numel() == 0:
+        categories[:] = 2
+        return categories
+    num_classes = int(entry['config_meta']['num_classes'])
+    unknown_label = num_classes - 1
+    ious = box_ops.box_iou(pred_boxes_abs, gt_boxes)[0]
+    max_iou_all, _ = ious.max(dim=1)
+
+    known_mask = gt_labels != unknown_label
+    unknown_mask = gt_labels == unknown_label
+
+    max_iou_known = torch.zeros(num_queries, dtype=torch.float32)
+    max_iou_unknown = torch.zeros(num_queries, dtype=torch.float32)
+    if known_mask.any():
+        max_iou_known = ious[:, known_mask].max(dim=1).values
+    if unknown_mask.any():
+        max_iou_unknown = ious[:, unknown_mask].max(dim=1).values
+
+    unknown_q = (max_iou_unknown >= assign_iou_thr) & (max_iou_unknown >= max_iou_known)
+    known_q = (max_iou_known >= assign_iou_thr) & (~unknown_q)
+    background_q = (max_iou_all < background_iou_thr)
+
+    categories[unknown_q] = 1
+    categories[known_q] = 0
+    categories[(categories < 0) & background_q] = 2
+    return categories
+
+
+def legend_patches(items: Sequence[Tuple[str, str]]) -> List[Any]:
+    return [patches.Patch(facecolor='none', edgecolor=color, label=label, linewidth=2.0) for label, color in items]
+
+
+def auto_query_index(entry: Dict[str, Any]) -> int:
     probs = compute_entry_probs(entry)
+    final_boxes = to_abs_xyxy(entry['outputs']['pred_boxes'], entry['orig_size_hw']).numpy()
+    img_h, img_w = [int(v) for v in entry['orig_size_hw'].tolist()]
+    categories = categorize_entry_queries(entry).numpy()
+    valid = np.array([is_displayable_box(final_boxes[i], img_w, img_h) for i in range(final_boxes.shape[0])], dtype=bool)
+
+    unknown_candidates = np.where((categories == 1) & valid)[0]
+    if len(unknown_candidates) > 0:
+        scores = probs['unknown_score'][unknown_candidates]
+        return int(unknown_candidates[int(torch.argmax(scores).item())])
+
+    known_candidates = np.where((categories == 0) & valid)[0]
+    if len(known_candidates) > 0:
+        scores = probs['obj_prob'][known_candidates] * probs['max_known_cls_prob'][known_candidates]
+        return int(known_candidates[int(torch.argmax(scores).item())])
+
+    pseudo_pos = [int(q) for q in entry['pseudo_mining'].get('selected_pseudo_pos', []) if q < len(valid) and valid[q]]
+    if len(pseudo_pos) > 0:
+        pseudo_tensor = torch.as_tensor(pseudo_pos, dtype=torch.long)
+        scores = probs['unknown_score'][pseudo_tensor]
+        return int(pseudo_pos[int(torch.argmax(scores).item())])
+
+    valid_indices = np.where(valid)[0]
+    if len(valid_indices) > 0:
+        valid_tensor = torch.as_tensor(valid_indices, dtype=torch.long)
+        scores = probs['unknown_score'][valid_tensor]
+        return int(valid_indices[int(torch.argmax(scores).item())])
+
     return int(torch.argmax(probs['unknown_score']).item())
 
 
@@ -235,18 +343,20 @@ def render_overlay(args) -> None:
         entry = load_entry(dump_dir, image_id)
         image = open_image(entry)
         dets = classify_detections(entry, score_thr=args.score_thr, max_det=args.max_det, iou_thr=args.iou_thr)
+        matched = [det for det in dets if det['kind'] != 'error']
+        errors = [det for det in dets if det['kind'] == 'error'][: max(0, int(args.max_error_det))]
         fig, ax = plt.subplots(figsize=(10, 8))
         ax.imshow(image)
         ax.axis('off')
-        for det in dets:
-            if det['kind'] == 'known':
-                color = KNOWN_COLOR
-            elif det['kind'] == 'unknown':
-                color = UNKNOWN_COLOR
-            else:
-                color = ERROR_COLOR
+        for det in matched + errors:
+            color = KNOWN_COLOR if det['kind'] == 'known' else UNKNOWN_COLOR if det['kind'] == 'unknown' else ERROR_COLOR
             label_text = f"{det['label']}:{det['score']:.2f}"
             draw_box(ax, det['box'], color=color, label=label_text)
+        ax.legend(handles=legend_patches([
+            ('Correct known detection', KNOWN_COLOR),
+            ('Correct unknown detection', UNKNOWN_COLOR),
+            ('High-score error', ERROR_COLOR),
+        ]), loc='upper right', framealpha=0.9)
         ax.set_title(f'image_id={image_id}')
         fig.tight_layout()
         fig.savefig(output_dir / f'{image_id}_overlay.png', dpi=200, bbox_inches='tight')
@@ -275,18 +385,46 @@ def render_mining(args) -> None:
             ax.axis('off')
             for query_idx in indices:
                 draw_box(ax, pred_boxes_abs[query_idx], color=STAGE_COLOR, label=None, linewidth=2.0, alpha=0.95)
+            ax.legend(handles=legend_patches([('Stage candidate boxes', STAGE_COLOR)]), loc='upper right', framealpha=0.9)
             ax.set_title(f'{title}\ncount={len(indices)}')
         fig.tight_layout()
         fig.savefig(output_dir / f'{image_id}_mining_panel.png', dpi=200, bbox_inches='tight')
         plt.close(fig)
 
 
+def aggregate_per_image_stats(dump_dir: Path, manifest: Dict[str, Any], assign_iou_thr: float, background_iou_thr: float) -> Dict[str, np.ndarray]:
+    obj_values = []
+    unk_values = []
+    cls_values = []
+    groups = []
+    for entry in iter_entries(dump_dir, manifest):
+        probs = compute_entry_probs(entry)
+        categories = categorize_entry_queries(entry, assign_iou_thr=assign_iou_thr, background_iou_thr=background_iou_thr)
+        valid = categories >= 0
+        if not valid.any():
+            continue
+        obj_values.append(probs['obj_prob'][valid].cpu().numpy())
+        unk_values.append(probs['unknown_prob'][valid].cpu().numpy())
+        cls_values.append(probs['max_known_cls_prob'][valid].cpu().numpy())
+        groups.append(categories[valid].cpu().numpy())
+    if len(groups) == 0:
+        empty = np.zeros((0,), dtype=np.float32)
+        return {'obj_prob': empty, 'unknown_prob': empty, 'max_known_cls_prob': empty, 'group': np.zeros((0,), dtype=np.int64)}
+    return {
+        'obj_prob': np.concatenate(obj_values, axis=0),
+        'unknown_prob': np.concatenate(unk_values, axis=0),
+        'max_known_cls_prob': np.concatenate(cls_values, axis=0),
+        'group': np.concatenate(groups, axis=0).astype(np.int64),
+    }
+
+
 def render_histograms(args) -> None:
     dump_dir = Path(args.dump_dir)
     output_dir = Path(args.output_dir)
     ensure_output_dir(output_dir)
-    stats = load_global_stats(dump_dir)
-    group = stats['group'].numpy().astype(np.int64)
+    manifest = read_manifest(dump_dir)
+    stats = aggregate_per_image_stats(dump_dir, manifest, float(args.assign_iou_thr), float(args.background_iou_thr))
+    group = stats['group']
     metrics = [
         ('obj_prob', 'Objectness probability'),
         ('unknown_prob', 'Unknown probability'),
@@ -294,14 +432,14 @@ def render_histograms(args) -> None:
     ]
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     for ax, (key, title) in zip(axes, metrics):
-        values = stats[key].numpy()
+        values = stats[key]
         ax.hist(values[group == 0], bins=args.bins, density=True, alpha=0.75, label='Known', color=KNOWN_COLOR)
         ax.hist(values[group == 1], bins=args.bins, density=True, alpha=0.75, label='Unknown', color=UNKNOWN_COLOR)
         ax.hist(values[group == 2], bins=args.bins, density=True, alpha=0.75, label='Background', color=BACKGROUND_COLOR)
         ax.set_title(title)
         ax.set_xlabel(key)
         ax.set_ylabel('Density')
-        ax.legend()
+        ax.legend(loc='upper right')
     fig.tight_layout()
     fig.savefig(output_dir / 'ch3_histograms.png', dpi=220, bbox_inches='tight')
     plt.close(fig)
@@ -316,20 +454,23 @@ def render_box_evolution(args) -> None:
     for image_id in image_ids:
         entry = load_entry(dump_dir, image_id)
         image = open_image(entry)
+        img_h, img_w = image.shape[:2]
         query_idx = int(args.query_index) if args.query_index is not None else auto_query_index(entry)
         aux_outputs = entry['aux_outputs']
-        layers = []
-        for aux in aux_outputs:
-            layers.append(aux['pred_boxes'][query_idx])
+        layers = [aux['pred_boxes'][query_idx] for aux in aux_outputs]
         layers.append(entry['outputs']['pred_boxes'][query_idx])
-        abs_boxes = [to_abs_xyxy(box.unsqueeze(0), entry['orig_size_hw'])[0] for box in layers]
+        abs_boxes = [clamp_box_xyxy(to_abs_xyxy(box.unsqueeze(0), entry['orig_size_hw'])[0], img_w, img_h) for box in layers]
         fig, ax = plt.subplots(figsize=(10, 8))
         ax.imshow(image)
         ax.axis('off')
+        legend_handles = []
         for layer_index, box in enumerate(abs_boxes):
             color = LEVEL_COLORS[layer_index % len(LEVEL_COLORS)]
             lw = 1.5 + 0.4 * layer_index
-            draw_box(ax, box, color=color, label=f'L{layer_index + 1}', linewidth=lw, alpha=0.95)
+            if (box[2] - box[0]) >= 2 and (box[3] - box[1]) >= 2:
+                draw_box(ax, box, color=color, label=f'L{layer_index + 1}', linewidth=lw, alpha=0.95)
+            legend_handles.append(Line2D([0], [0], color=color, lw=lw, label=f'Decoder L{layer_index + 1}'))
+        ax.legend(handles=legend_handles, loc='upper right', framealpha=0.9)
         ax.set_title(f'Query {query_idx} box evolution')
         fig.tight_layout()
         fig.savefig(output_dir / f'{image_id}_query{query_idx}_box_evolution.png', dpi=220, bbox_inches='tight')
@@ -384,8 +525,7 @@ def render_odqe_sampling(args) -> None:
         image = open_image(entry)
         layer_count = len(entry['odqe_hooks']['layers'])
         layer_index = layer_count - 1 if int(args.layer_index) < 0 else int(args.layer_index)
-        probs = compute_entry_probs(entry)
-        query_idx = int(args.query_index) if args.query_index is not None else int(torch.argmax(probs['unknown_score']).item())
+        query_idx = int(args.query_index) if args.query_index is not None else auto_query_index(entry)
         points_xy, attn, centroids, spreads = _sampling_locations_from_layer(entry, layer_index, query_idx)
         flat_points = points_xy.reshape(-1, 2)
         flat_weights = attn.reshape(-1)
@@ -407,8 +547,13 @@ def render_odqe_sampling(args) -> None:
             axes[0].scatter([centroid[0]], [centroid[1]], s=90, color=color, marker='o')
             axes[0].annotate('', xy=centroid, xytext=(qx, qy), arrowprops=dict(arrowstyle='->', color=color, lw=2.0))
             spread = spreads[lvl]
-            ellipse = patches.Ellipse((centroid[0], centroid[1]), width=max(8.0, spread[0] * 4), height=max(8.0, spread[1] * 4), fill=False, edgecolor=color, linewidth=1.5, alpha=0.9)
+            ellipse = patches.Ellipse((centroid[0], centroid[1]), width=max(8.0, spread[0] * 4), height=max(8.0, spread[1] * 4),
+                                      fill=False, edgecolor=color, linewidth=1.5, alpha=0.9)
             axes[0].add_patch(ellipse)
+        axes[0].legend(handles=[
+            Line2D([0], [0], color=QUERY_COLOR, lw=2.5, label='Selected query box'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor=LEVEL_COLORS[0], markersize=8, label='Per-level centroid'),
+        ], loc='upper right', framealpha=0.9)
         axes[0].set_title(f'Layer {layer_index + 1} aggregated context sampling')
 
         x1, y1, x2, y2 = query_box
@@ -417,9 +562,15 @@ def render_odqe_sampling(args) -> None:
         axes[1].set_xlim(max(0, x1 - margin_x), min(image.shape[1], x2 + margin_x))
         axes[1].set_ylim(min(image.shape[0], y2 + margin_y), max(0, y1 - margin_y))
         sizes = 40 + 400 * (top_weights / max(top_weights.max(), 1e-6))
-        axes[1].scatter(top_points[:, 0], top_points[:, 1], s=sizes, c=top_weights, cmap='magma', alpha=0.8, edgecolors='white', linewidths=0.6)
+        scatter = axes[1].scatter(top_points[:, 0], top_points[:, 1], s=sizes, c=top_weights, cmap='magma', alpha=0.8,
+                                  edgecolors='white', linewidths=0.6)
         axes[1].scatter([qx], [qy], s=100, color=QUERY_COLOR, marker='x')
+        axes[1].legend(handles=[
+            Line2D([0], [0], marker='x', color=QUERY_COLOR, lw=0, markersize=9, label='Query center'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='#ff884d', markersize=8, label='Top weighted sampling points'),
+        ], loc='upper right', framealpha=0.9)
         axes[1].set_title('Zoomed top-weighted sampling points')
+        fig.colorbar(scatter, ax=axes[1], fraction=0.046, pad=0.04, label='Attention weight')
         fig.tight_layout()
         fig.savefig(output_dir / f'{image_id}_layer{layer_index + 1}_query{query_idx}_odqe_sampling.png', dpi=220, bbox_inches='tight')
         plt.close(fig)
@@ -465,6 +616,9 @@ def render_gate_gain(args) -> None:
             color = plt.cm.viridis(1.0 - cmap_val)
             label = f'Q{query_idx}:{gain[query_idx]:.2f}'
             draw_box(axes[0], abs_boxes[query_idx], color=color, label=label, linewidth=2.2)
+        axes[0].legend(handles=[
+            patches.Patch(facecolor='none', edgecolor=plt.cm.viridis(1.0), linewidth=2.2, label='Top-gain query boxes')
+        ], loc='upper right', framealpha=0.9)
         axes[0].set_title(f'Layer {layer_index + 1} top-{topk} context gains')
         axes[1].bar(np.arange(topk), gain[order])
         axes[1].set_xticks(np.arange(topk))
@@ -476,26 +630,22 @@ def render_gate_gain(args) -> None:
         plt.close(fig)
 
 
-def sample_global_points(stats: Dict[str, torch.Tensor], max_points: int) -> Dict[str, np.ndarray]:
+def sample_global_points(stats: Dict[str, np.ndarray], max_points: int) -> Dict[str, np.ndarray]:
     total = int(stats['group'].shape[0])
     if total <= max_points:
         indices = np.arange(total)
     else:
         rng = np.random.default_rng(0)
         indices = rng.choice(total, size=max_points, replace=False)
-    return {
-        'obj_prob': stats['obj_prob'].numpy()[indices],
-        'unknown_prob': stats['unknown_prob'].numpy()[indices],
-        'max_known_cls_prob': stats['max_known_cls_prob'].numpy()[indices],
-        'group': stats['group'].numpy().astype(np.int64)[indices],
-    }
+    return {key: value[indices] for key, value in stats.items()}
 
 
 def render_decorr(args) -> None:
     dump_dir = Path(args.dump_dir)
     output_dir = Path(args.output_dir)
     ensure_output_dir(output_dir)
-    stats = load_global_stats(dump_dir)
+    manifest = read_manifest(dump_dir)
+    stats = aggregate_per_image_stats(dump_dir, manifest, assign_iou_thr=0.3, background_iou_thr=0.1)
     sampled = sample_global_points(stats, max_points=int(args.max_points))
     colors = {0: KNOWN_COLOR, 1: UNKNOWN_COLOR, 2: BACKGROUND_COLOR}
     labels = {0: 'Known', 1: 'Unknown', 2: 'Background'}
@@ -512,7 +662,8 @@ def render_decorr(args) -> None:
         ax.set_xlabel(x_key)
         ax.set_ylabel(y_key)
         ax.set_title(title)
-    data_mat = np.stack([stats['max_known_cls_prob'].numpy(), stats['obj_prob'].numpy(), stats['unknown_prob'].numpy()], axis=0)
+        ax.legend(loc='upper right')
+    data_mat = np.stack([stats['max_known_cls_prob'], stats['obj_prob'], stats['unknown_prob']], axis=0)
     corr = np.corrcoef(data_mat)
     im = axes[1, 1].imshow(corr, vmin=-1, vmax=1, cmap='coolwarm')
     axes[1, 1].set_xticks(range(3))
@@ -523,10 +674,8 @@ def render_decorr(args) -> None:
     for i in range(3):
         for j in range(3):
             axes[1, 1].text(j, i, f'{corr[i, j]:.2f}', ha='center', va='center', color='black')
-    handles, handle_labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles[:3], handle_labels[:3], loc='upper center', ncol=3)
     fig.colorbar(im, ax=axes[1, 1], fraction=0.046, pad=0.04)
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.tight_layout()
     fig.savefig(output_dir / 'decorr_2d_heatmap.png', dpi=220, bbox_inches='tight')
     plt.close(fig)
 
@@ -534,7 +683,8 @@ def render_decorr(args) -> None:
     ax = fig.add_subplot(111, projection='3d')
     for group_id in [0, 1, 2]:
         mask = sampled['group'] == group_id
-        ax.scatter(sampled['obj_prob'][mask], sampled['unknown_prob'][mask], sampled['max_known_cls_prob'][mask], s=8, alpha=0.4, color=colors[group_id], label=labels[group_id])
+        ax.scatter(sampled['obj_prob'][mask], sampled['unknown_prob'][mask], sampled['max_known_cls_prob'][mask], s=8,
+                   alpha=0.4, color=colors[group_id], label=labels[group_id])
     ax.set_xlabel('obj_prob')
     ax.set_ylabel('unknown_prob')
     ax.set_zlabel('cls_max')
@@ -590,7 +740,8 @@ def render_manifold(args) -> None:
     dump_dir = Path(args.dump_dir)
     output_dir = Path(args.output_dir)
     ensure_output_dir(output_dir)
-    stats = load_global_stats(dump_dir)
+    manifest = read_manifest(dump_dir)
+    stats = aggregate_per_image_stats(dump_dir, manifest, assign_iou_thr=0.3, background_iou_thr=0.1)
     sampled = sample_global_points(stats, max_points=int(args.max_points))
     points = np.stack([sampled['obj_prob'], sampled['unknown_prob'], sampled['max_known_cls_prob']], axis=1)
     groups = sampled['group']
