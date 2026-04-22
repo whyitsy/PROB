@@ -116,6 +116,7 @@ def _filter_export_detections(
     min_area_ratio,
     min_side_ratio,
     max_aspect_ratio,
+    unified_across_labels=False,
 ):
     if not detections:
         return []
@@ -140,6 +141,14 @@ def _filter_export_detections(
 
     if not filtered:
         return []
+
+    if unified_across_labels:
+        boxes_t = torch.as_tensor([det['box_xyxy'] for det in filtered], dtype=torch.float32)
+        display_scores_t = torch.as_tensor([det['display_score'] for det in filtered], dtype=torch.float32)
+        kept = _nms_xyxy(boxes_t, display_scores_t, iou_threshold=nms_iou)
+        final_keep = [filtered[index] for index in kept.tolist()]
+        final_keep.sort(key=lambda item: item['display_score'], reverse=True)
+        return final_keep
 
     final_keep = []
     for select_unknown in [False, True]:
@@ -176,6 +185,55 @@ def _prepare_display_arrays(raw_detections, image_size, unknown_label, unknown_s
     return boxes, labels, display_scores
 
 
+def _prepare_unified_display_arrays(raw_detections, image_size, unknown_label, unknown_score_scale, viz_cfg):
+    if not raw_detections:
+        return (
+            np.zeros((0, 4), dtype=np.float32),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.float32),
+        )
+
+    width, height = image_size
+    kept = []
+    for det in raw_detections:
+        raw_score = float(det['raw_score'])
+        label = int(det['label'])
+        threshold = float(viz_cfg['display_unknown_score_thresh']) if label == int(unknown_label) else float(viz_cfg['display_known_score_thresh'])
+        if raw_score < threshold:
+            continue
+        if viz_cfg['display_apply_geometry_filter'] and not _is_valid_geometry_xyxy(
+            det['box_xyxy'],
+            width,
+            height,
+            min_area_ratio=float(viz_cfg['display_min_area_ratio']),
+            min_side_ratio=float(viz_cfg['display_min_side_ratio']),
+            max_aspect_ratio=float(viz_cfg['display_max_aspect_ratio']),
+        ):
+            continue
+        kept.append(det)
+
+    if not kept:
+        return (
+            np.zeros((0, 4), dtype=np.float32),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.float32),
+        )
+
+    boxes = np.asarray([det['box_xyxy'] for det in kept], dtype=np.float32)
+    labels = np.asarray([det['label'] for det in kept], dtype=np.int64)
+    display_scores = np.asarray([det['display_score'] for det in kept], dtype=np.float32)
+    kept_indices = _nms_xyxy(torch.as_tensor(boxes, dtype=torch.float32), torch.as_tensor(display_scores, dtype=torch.float32), iou_threshold=float(viz_cfg['display_nms_iou']))
+    kept_indices = kept_indices.detach().cpu().numpy().astype(np.int64) if kept_indices.numel() > 0 else np.zeros((0,), dtype=np.int64)
+    if kept_indices.size == 0:
+        return (
+            np.zeros((0, 4), dtype=np.float32),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.float32),
+        )
+    kept_indices = kept_indices[np.argsort(-display_scores[kept_indices])]
+    return boxes[kept_indices], labels[kept_indices], display_scores[kept_indices]
+
+
 def _subset_arrays(boxes, labels, scores, unknown_label, subset):
     if len(labels) == 0:
         return boxes, labels, scores
@@ -200,6 +258,18 @@ def _save_visualizations(output_dir, image_stem, image_np, boxes, labels, scores
             unknown_label=unknown_label,
         )
         save_svg_image(panel, output_dir / 'vis' / f'{image_stem}_{subset}.svg')
+
+
+def _save_unified_visualization(output_dir, image_stem, image_np, boxes, labels, scores, unknown_label, viz_cfg):
+    panel = draw_detection_panel(
+        image_np,
+        viz_cfg,
+        prediction_boxes=boxes if len(boxes) > 0 else None,
+        prediction_labels=labels if len(labels) > 0 else None,
+        prediction_scores=scores if len(scores) > 0 else None,
+        unknown_label=unknown_label,
+    )
+    save_svg_image(panel, output_dir / 'vis' / f'{image_stem}_unified.svg')
 
 
 def _save_layer_summary_svg(output_path, vis_debug):
@@ -277,6 +347,18 @@ def run_inference(args):
                 min_area_ratio=args.min_area_ratio,
                 min_side_ratio=args.min_side_ratio,
                 max_aspect_ratio=args.max_aspect_ratio,
+                unified_across_labels=False,
+            )
+            unified_export_detections = _filter_export_detections(
+                raw_detections,
+                image_size=original_image.size,
+                known_score_thresh=args.known_score_thresh,
+                unknown_score_thresh=args.unknown_score_thresh,
+                nms_iou=args.nms_iou,
+                min_area_ratio=args.min_area_ratio,
+                min_side_ratio=args.min_side_ratio,
+                max_aspect_ratio=args.max_aspect_ratio,
+                unified_across_labels=True,
             )
 
             display_boxes, display_labels, display_scores = _prepare_display_arrays(
@@ -286,14 +368,26 @@ def run_inference(args):
                 unknown_score_scale=unknown_score_scale,
                 viz_cfg=viz_cfg,
             )
+            unified_boxes, unified_labels, unified_scores = _prepare_unified_display_arrays(
+                raw_detections,
+                image_size=original_image.size,
+                unknown_label=unknown_label,
+                unknown_score_scale=unknown_score_scale,
+                viz_cfg=viz_cfg,
+            )
             _save_visualizations(output_dir, image_path.stem, image_np, display_boxes, display_labels, display_scores, unknown_label, viz_cfg)
+            _save_unified_visualization(output_dir, image_path.stem, image_np, unified_boxes, unified_labels, unified_scores, unknown_label, viz_cfg)
 
             summary = {
                 'num_raw': len(raw_detections),
                 'num_exported': len(export_detections),
+                'num_unified_exported': len(unified_export_detections),
                 'num_displayed': int(len(display_labels)),
+                'num_unified_displayed': int(len(unified_labels)),
                 'num_known_exported': int(sum(0 if det['is_unknown'] else 1 for det in export_detections)),
                 'num_unknown_exported': int(sum(1 if det['is_unknown'] else 0 for det in export_detections)),
+                'num_known_unified_exported': int(sum(0 if det['is_unknown'] else 1 for det in unified_export_detections)),
+                'num_unknown_unified_exported': int(sum(1 if det['is_unknown'] else 0 for det in unified_export_detections)),
             }
             payload = {
                 'image': str(image_path),
@@ -318,6 +412,7 @@ def run_inference(args):
                 },
                 'summary': summary,
                 'predictions': export_detections,
+                'unified_predictions': unified_export_detections,
             }
             (output_dir / 'json' / f'{image_path.stem}.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
             (output_dir / 'json' / f'{image_path.stem}_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')

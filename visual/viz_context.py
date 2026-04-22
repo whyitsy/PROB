@@ -17,7 +17,6 @@ class VizContext:
     viz_cfg: Optional[dict]
     tb_writer: Optional[SummaryWriter]
     train_epoch_metrics_file: str = 'train/metrics_epoch.jsonl'
-    train_step_metrics_file: str = 'train/metrics_step.jsonl'
     eval_epoch_metrics_file: str = 'eval/metrics_epoch.jsonl'
     checkpoint_dir_name: str = 'train/checkpoints'
     tensorboard_dir_name: str = 'train/tensorboard'
@@ -48,12 +47,6 @@ class VizContext:
         if self.output_dir is None:
             return None
         return self.output_dir / self.train_epoch_metrics_file
-
-    @property
-    def train_step_metrics_path(self) -> Optional[Path]:
-        if self.output_dir is None:
-            return None
-        return self.output_dir / self.train_step_metrics_file
 
     @property
     def eval_epoch_metrics_path(self) -> Optional[Path]:
