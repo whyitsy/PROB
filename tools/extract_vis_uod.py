@@ -13,6 +13,13 @@ for debugging/visualization, and writes:
 The dump is later consumed by tools/render_vis_uod.py.
 """
 
+import sys
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 import argparse
 import json
 import logging
@@ -661,7 +668,7 @@ def main() -> None:
     if unexpected_keys:
         logging.info('Unexpected keys while loading checkpoint: %s', unexpected_keys)
 
-    _train_dataset, eval_dataset = build_datasets(args)
+    _, eval_dataset = build_datasets(args)
     eval_loader = DataLoader(
         eval_dataset,
         batch_size=args.eval_batch_size,

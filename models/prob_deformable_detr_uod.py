@@ -263,7 +263,7 @@ class DeformableDETRUOD(nn.Module):
             return ref_sig[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[:, None]
         return ref_sig[:, :, None] * valid_ratios[:, None]
 
-    def forward(self, samples: NestedTensor, return_vis_debug: bool = False):
+    def forward(self, samples: NestedTensor):
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(samples)
@@ -354,7 +354,6 @@ class DeformableDETRUOD(nn.Module):
             'proj_unk': outputs_known_feats[-1],
             'proj_cls': outputs_cls_feats[-1],
         }
-        del return_vis_debug
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(
                 outputs_class, outputs_coord, outputs_objectness, outputs_known,
