@@ -8,11 +8,4 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 CH3_CONFIG_PATH="configs/EVAL/S_OWODB/CH3_EVAL.sh"
 source "${CH3_CONFIG_PATH}"
 
-RERUN_EVAL=1 run_visual_pipeline t4_ft
-
-
-
-# CH4_CONFIG_PATH="configs/EVAL/S_OWODB/CH4_EVAL.sh"
-# source "${CH4_CONFIG_PATH}"
-
-# RERUN_EVAL=1 run_visual_pipeline
+run_eval_pipeline t4_ft
