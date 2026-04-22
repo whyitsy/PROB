@@ -77,14 +77,7 @@ def _is_valid_geometry_xyxy(box, width, height, min_area_ratio=0.002, min_side_r
     return aspect <= float(max_aspect_ratio)
 
 
-def _display_score(raw_score, label, unknown_label, unknown_score_scale):
-    raw_score = float(raw_score)
-    if int(label) == int(unknown_label):
-        return raw_score / max(float(unknown_score_scale), 1e-6)
-    return raw_score
-
-
-def _build_detection_records(predictions, class_names, unknown_label, unknown_score_scale):
+def _build_detection_records(predictions, class_names, unknown_label):
     boxes = predictions['boxes'].detach().cpu().tolist()
     labels = predictions['labels'].detach().cpu().tolist()
     raw_scores = predictions['scores'].detach().cpu().tolist()
@@ -101,7 +94,6 @@ def _build_detection_records(predictions, class_names, unknown_label, unknown_sc
                 'label_name': label_name,
                 'box_xyxy': [float(v) for v in box_xyxy],
                 'raw_score': raw_score,
-                'display_score': _display_score(raw_score, label, unknown_label, unknown_score_scale),
                 'is_unknown': is_unknown,
             }
         )
@@ -115,7 +107,7 @@ def _filter_detections(detections, image_size, args, unified_across_labels=False
     width, height = image_size
     filtered = []
     for det in detections:
-        score = float(det['display_score'])
+        score = float(det['raw_score'])
         threshold = float(args.unknown_score_threshold) if det['is_unknown'] else float(args.known_score_threshold)
         if score < threshold:
             continue
@@ -135,10 +127,10 @@ def _filter_detections(detections, image_size, args, unified_across_labels=False
 
     if unified_across_labels:
         boxes_t = torch.as_tensor([det['box_xyxy'] for det in filtered], dtype=torch.float32)
-        scores_t = torch.as_tensor([det['display_score'] for det in filtered], dtype=torch.float32)
+        scores_t = torch.as_tensor([det['raw_score'] for det in filtered], dtype=torch.float32)
         kept = _nms_xyxy(boxes_t, scores_t, iou_threshold=args.nms_iou_threshold)
         final_keep = [filtered[index] for index in kept.tolist()]
-        final_keep.sort(key=lambda item: item['display_score'], reverse=True)
+        final_keep.sort(key=lambda item: item['raw_score'], reverse=True)
         return final_keep
 
     final_keep = []
@@ -164,17 +156,31 @@ def _draw_detections(image: Image.Image, detections):
         color = 'red' if is_unknown else 'lime'
         name = 'unknown' if is_unknown else det['label_name']
         draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
-        draw.text((x1 + 2, max(0.0, y1 - 12)), f"{name}:{float(det['display_score']):.2f}", fill=color)
+        draw.text((x1 + 2, max(0.0, y1 - 12)), f"{name}:{float(det['raw_score']):.2f}", fill=color)
     return rendered
 
 
-def _build_payload(image_path, image_size, args, unknown_label, raw_count, detections, unified_detections):
+def _split_detection_views(filtered_detections, all_detections_class_agnostic):
+    known_only_detections = [det for det in filtered_detections if not det['is_unknown']]
+    unknown_only_detections = [det for det in filtered_detections if det['is_unknown']]
+    return known_only_detections, unknown_only_detections, all_detections_class_agnostic
+
+
+def _build_payload(
+    image_path,
+    image_size,
+    args,
+    unknown_label,
+    raw_count,
+    known_predictions,
+    unknown_predictions,
+    all_predictions_class_agnostic,
+):
     summary = {
         'num_raw': int(raw_count),
-        'num_exported': int(len(detections)),
-        'num_unified_exported': int(len(unified_detections)),
-        'num_known_exported': int(sum(0 if det['is_unknown'] else 1 for det in detections)),
-        'num_unknown_exported': int(sum(1 if det['is_unknown'] else 0 for det in detections)),
+        'num_known_predictions': int(len(known_predictions)),
+        'num_unknown_predictions': int(len(unknown_predictions)),
+        'num_all_predictions_class_agnostic': int(len(all_predictions_class_agnostic)),
     }
     return {
         'image': str(image_path),
@@ -189,8 +195,9 @@ def _build_payload(image_path, image_size, args, unknown_label, raw_count, detec
             'max_box_aspect_ratio': float(args.max_box_aspect_ratio),
         },
         'summary': summary,
-        'predictions': detections,
-        'unified_predictions': unified_detections,
+        'known_predictions': known_predictions,
+        'unknown_predictions': unknown_predictions,
+        'all_predictions_class_agnostic': all_predictions_class_agnostic,
     }
 
 
@@ -217,8 +224,6 @@ def run_inference(args):
 
     class_names = list(VOC_COCO_CLASS_NAMES[model_args.dataset])
     unknown_label = int(model_args.num_classes - 1)
-    unknown_score_scale = float(args.unknown_score_scale)
-
     with torch.no_grad():
         for image_path in image_paths:
             original_image, image_tensor, target = _prepare_image(image_path)
@@ -228,9 +233,18 @@ def run_inference(args):
             target_sizes = target['orig_size'].unsqueeze(0).to(torch.device(args.device))
             predictions = postprocessors['bbox'](outputs, target_sizes)[0]
 
-            raw_detections = _build_detection_records(predictions, class_names, unknown_label, unknown_score_scale)
-            export_detections = _filter_detections(raw_detections, image_size=original_image.size, args=args, unified_across_labels=False)
-            unified_export_detections = _filter_detections(raw_detections, image_size=original_image.size, args=args, unified_across_labels=True)
+            raw_detections = _build_detection_records(predictions, class_names, unknown_label)
+            filtered_detections = _filter_detections(raw_detections, image_size=original_image.size, args=args, unified_across_labels=False)
+            all_class_agnostic_detections = _filter_detections(
+                raw_detections,
+                image_size=original_image.size,
+                args=args,
+                unified_across_labels=True,
+            )
+            known_only_detections, unknown_only_detections, all_class_agnostic_detections = _split_detection_views(
+                filtered_detections=filtered_detections,
+                all_detections_class_agnostic=all_class_agnostic_detections,
+            )
 
             payload = _build_payload(
                 image_path=image_path,
@@ -238,12 +252,13 @@ def run_inference(args):
                 args=args,
                 unknown_label=unknown_label,
                 raw_count=len(raw_detections),
-                detections=export_detections,
-                unified_detections=unified_export_detections,
+                known_predictions=known_only_detections,
+                unknown_predictions=unknown_only_detections,
+                all_predictions_class_agnostic=all_class_agnostic_detections,
             )
             (json_dir / f'{image_path.stem}.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
-            rendered = _draw_detections(original_image, export_detections)
+            rendered = _draw_detections(original_image, filtered_detections)
             rendered.save(image_dir / f'{image_path.stem}.png')
 
 
