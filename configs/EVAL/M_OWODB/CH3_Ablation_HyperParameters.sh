@@ -49,7 +49,7 @@ run_eval() {
     --output_dir "${BASE_EXP_DIR}/${stage}/${uod_postprocess_unknown_scale}/${obj_temp}" \
     --PREV_INTRODUCED_CLS 0 \
     --CUR_INTRODUCED_CLS 20 \
-    --pretrain "${BASE_EXP_DIR}/$stage/checkpoint.pth" \
+    --eval_checkpoint "${BASE_EXP_DIR}/$stage/checkpoint.pth" \
     --uod_postprocess_unknown_scale "$uod_postprocess_unknown_scale" \
     --obj_temp "$obj_temp" \
     --num_workers 12 \

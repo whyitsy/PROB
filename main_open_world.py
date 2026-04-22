@@ -10,7 +10,7 @@ import logging
 import random
 import time
 from pathlib import Path
-from pprint import pformat
+from pprint import pformat # 美化输出
 
 import numpy as np
 import torch
@@ -95,7 +95,7 @@ def get_args_parser():
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--resume', help='resume full training state from checkpoint')
-    parser.add_argument('--eval_checkpoint', help='load model weights from checkpoint for evaluation')
+    parser.add_argument('--eval_checkpoint', help='checkpoint path used only for eval mode (model weights only)')
     parser.add_argument('--start_epoch', default=0, type=int)
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--viz', action='store_true', help='enable TensorBoard and qualitative/statistical visualization')
@@ -261,7 +261,7 @@ def main(args):
     viz_ctx = VizContext.from_args(args)
     output_dir = viz_ctx.output_dir
     setup_logging(output=args.output_dir, distributed_rank=utils.get_rank(), abbrev_name='UOD')
-    logging.info('Arguments:\n%s', pformat(vars(args), indent=2, width=100, compact=True, sort_dicts=False))
+    logging.info('Arguments:\n%s', pformat(vars(args), indent=2, width=100, compact=True, sort_dicts=False)) # vars() 将 Namespace 转为 dict
 
     try:
         device = torch.device(args.device)
@@ -292,4 +292,216 @@ def main(args):
 
         train_batch_sampler = torch.utils.data.BatchSampler(train_sampler, args.batch_size, drop_last=True)
         train_loader = DataLoader(train_dataset, batch_sampler=train_batch_sampler, collate_fn=utils.collate_fn, num_workers=args.num_workers, pin_memory=True)
-        eval_loader = DataLoader(eval_dataset, args.eval_batch_size, sampler=eval_sampler, drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers
+        eval_loader = DataLoader(eval_dataset, args.eval_batch_size, sampler=eval_sampler, drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers, pin_memory=True)
+
+        def match_name_keywords(parameter_name, keyword_list):
+            return any(keyword in parameter_name for keyword in keyword_list)
+
+        parameter_groups = [
+            {
+                'params': [parameter for name, parameter in model_without_ddp.named_parameters() if not match_name_keywords(name, args.lr_backbone_names) and not match_name_keywords(name, args.lr_linear_proj_names) and parameter.requires_grad],
+                'lr': args.lr,
+            },
+            {
+                'params': [parameter for name, parameter in model_without_ddp.named_parameters() if match_name_keywords(name, args.lr_backbone_names) and parameter.requires_grad],
+                'lr': args.lr_backbone,
+            },
+            {
+                'params': [parameter for name, parameter in model_without_ddp.named_parameters() if match_name_keywords(name, args.lr_linear_proj_names) and parameter.requires_grad],
+                'lr': args.lr * args.lr_linear_proj_mult,
+            },
+        ]
+
+        if args.sgd:
+            optimizer = torch.optim.SGD(parameter_groups, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
+        else:
+            optimizer = torch.optim.AdamW(parameter_groups, lr=args.lr, weight_decay=args.weight_decay)
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+
+        if args.distributed:
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+            model_without_ddp = model.module
+
+        if args.freeze_prob_model and hasattr(model_without_ddp, 'prob_obj_head'):
+            probability_head = model_without_ddp.prob_obj_head
+            if isinstance(probability_head, torch.nn.ModuleList):
+                for module in probability_head:
+                    if hasattr(module, 'freeze_prob_model'):
+                        module.freeze_prob_model()
+            elif hasattr(probability_head, 'freeze_prob_model'):
+                probability_head.freeze_prob_model()
+
+            if hasattr(model_without_ddp, 'known_energy_head'):
+                knownness_head = model_without_ddp.known_energy_head
+                if isinstance(knownness_head, torch.nn.ModuleList):
+                    for module in knownness_head:
+                        if hasattr(module, 'freeze_prob_model'):
+                            module.freeze_prob_model()
+                elif hasattr(knownness_head, 'freeze_prob_model'):
+                    knownness_head.freeze_prob_model()
+
+        if args.eval:
+            logging.info('Evaluating from checkpoint: %s', args.eval_checkpoint)
+            checkpoint = (
+                torch.hub.load_state_dict_from_url(args.eval_checkpoint, map_location='cpu', check_hash=True)
+                if isinstance(args.eval_checkpoint, str) and args.eval_checkpoint.startswith('https')
+                else torch.load(args.eval_checkpoint, map_location='cpu')
+            )
+            missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+            unexpected_keys = [key for key in unexpected_keys if not (key.endswith('total_params') or key.endswith('total_ops'))]
+            if missing_keys:
+                logging.info('Missing keys while loading eval checkpoint: %s', missing_keys)
+            if unexpected_keys:
+                logging.info('Unexpected keys while loading eval checkpoint: %s', unexpected_keys)
+            if 'epoch' in checkpoint:
+                args.start_epoch = checkpoint['epoch'] + 1
+
+            eval_stats, _ = evaluate(
+                model,
+                criterion,
+                postprocessors,
+                eval_loader,
+                eval_dataset,
+                device,
+                args,
+                viz_ctx=viz_ctx,
+                epoch=args.start_epoch,
+            )
+            write_eval_scalars_to_tensorboard(viz_ctx, eval_stats, args.start_epoch)
+        else:
+            if args.resume:
+                logging.info('Resuming from checkpoint: %s', args.resume)
+                checkpoint = torch.hub.load_state_dict_from_url(args.resume, map_location='cpu', check_hash=True) if args.resume.startswith('https') else torch.load(args.resume, map_location='cpu')
+                missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+                unexpected_keys = [key for key in unexpected_keys if not (key.endswith('total_params') or key.endswith('total_ops'))]
+                if missing_keys:
+                    logging.info('Missing keys while resuming: %s', missing_keys)
+                if unexpected_keys:
+                    logging.info('Unexpected keys while resuming: %s', unexpected_keys)
+
+                logging.info('epoch resumed from %d', checkpoint['epoch'])
+                args.start_epoch = checkpoint['epoch'] + 1
+                if 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+                    import copy
+                    optimizer_param_groups = copy.deepcopy(optimizer.param_groups)
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                    for current_group, original_group in zip(optimizer.param_groups, optimizer_param_groups):
+                        current_group['lr'] = original_group['lr']
+                        current_group['initial_lr'] = original_group['initial_lr']
+                    lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+                    lr_scheduler.step_size = args.lr_drop
+                    lr_scheduler.base_lrs = [group['initial_lr'] for group in optimizer.param_groups]
+                    lr_scheduler.step(lr_scheduler.last_epoch)
+
+            logging.info('Start training from epoch %s to %s', args.start_epoch, args.epochs)
+            training_start_time = time.time()
+
+            for epoch in range(args.start_epoch, args.epochs):
+                if args.distributed:
+                    train_sampler.set_epoch(epoch)
+
+                train_stats = train_one_epoch(
+                    model,
+                    criterion,
+                    train_loader,
+                    optimizer,
+                    device,
+                    epoch,
+                    max_norm=args.clip_max_norm,
+                    viz_ctx=viz_ctx,
+                    args=args,
+                )
+                lr_scheduler.step()
+
+                eval_stats = {}
+                eval_evaluator = None
+                checkpoint_paths = []
+                if output_dir is not None:
+                    checkpoint_paths.append(viz_ctx.checkpoint_dir / 'checkpoint_latest.pth')
+                    should_run_evaluation = ((epoch + 1) % args.lr_drop == 0) or (epoch == 0) or (epoch == 1) or ((epoch + 1) % args.eval_every == 0 or (epoch == args.epochs - 1))
+                    if should_run_evaluation:
+                        eval_stats, eval_evaluator = evaluate(
+                            model,
+                            criterion,
+                            postprocessors,
+                            eval_loader,
+                            eval_dataset,
+                            device,
+                            args,
+                            viz_ctx=viz_ctx,
+                            epoch=epoch,
+                        )
+                        write_eval_scalars_to_tensorboard(viz_ctx, eval_stats, epoch)
+                        checkpoint_paths.append(viz_ctx.checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pth')
+                    elif epoch > args.epochs - 6:
+                        checkpoint_paths.append(viz_ctx.checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pth')
+
+                    checkpoint_args = _sanitize_for_checkpoint(args) # 处理args中可能存在的不可序列化对象.
+                    for checkpoint_path in checkpoint_paths:
+                        utils.save_on_master({
+                            'model': model_without_ddp.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'lr_scheduler': lr_scheduler.state_dict(),
+                            'epoch': epoch,
+                            'args': checkpoint_args,
+                        }, checkpoint_path)
+
+                write_epoch_reports(
+                    viz_ctx=viz_ctx,
+                    epoch=epoch,
+                    train_stats=train_stats,
+                    eval_stats=eval_stats,
+                    num_trainable_parameters=num_trainable_parameters,
+                    eval_evaluator=eval_evaluator,
+                    args=args,
+                )
+
+            # =========== [及时释放显存] ===========
+            logging.info("Training finished. Releasing training resources to free VRAM...")
+
+            # 1. 删除优化器和学习率调度器
+            if 'optimizer' in locals():
+                del optimizer
+            if 'lr_scheduler' in locals():
+                del lr_scheduler
+
+            # 2. loss_dict 或 outputs 可能包含大量中间张量
+            if 'outputs' in locals():
+                del outputs
+            if 'loss_dict' in locals():
+                del loss_dict
+
+            # 3. 让 PyTorch 把闲置的显存真正还给 GPU
+            torch.cuda.empty_cache()
+
+            logging.info("Resources released. Proceeding to exemplar replay/evaluation.")
+
+            if args.exemplar_replay_selection:
+                logging.info('running with exemplar_replay_selection')
+                exemplar_scores = get_exemplar_replay(model, exemplar_selection, device, train_loader)
+                create_ft_dataset(args, exemplar_scores)
+
+            total_training_time = time.time() - training_start_time
+            logging.info('Training time %s', str(datetime.timedelta(seconds=int(total_training_time))))
+    finally:
+        viz_ctx.close()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser('PROB / UOD training and evaluation script', parents=[get_args_parser()])
+    parsed_args = parser.parse_args()
+    if parsed_args.output_dir:
+        Path(parsed_args.output_dir).mkdir(parents=True, exist_ok=True)
+    try:
+        main(parsed_args)
+    except Exception as error:
+        logging.error('An error occurred during execution: %s', error, exc_info=True)
+        raise
+    finally:
+        import torch.distributed as dist
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+                logging.info('Distributed process group destroyed successfully.')
+        except Exception as cleanup_error:
+            logging.error('Failed to destroy process group cleanly: %s', cleanup_error, exc_info=True)

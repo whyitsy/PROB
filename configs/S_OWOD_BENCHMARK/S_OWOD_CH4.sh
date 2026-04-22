@@ -71,7 +71,7 @@ run_stage "${BASE_EXP_DIR}/t2" \
   --exemplar_replay_max_length 1679 \
   --exemplar_replay_prev_file learned_owdetr_t1_ft.txt \
   --exemplar_replay_cur_file learned_owdetr_t2_ft.txt \
-  --pretrain "${BASE_EXP_DIR}/t1/train/checkpoints/checkpoint_latest.pth" \
+  --resume "${BASE_EXP_DIR}/t1/train/checkpoints/checkpoint_latest.pth" \
   --lr 2e-5
 
 sleep 5
@@ -81,7 +81,7 @@ run_stage "${BASE_EXP_DIR}/t2_ft" \
   --train_set "${REPLAY_DIR}/learned_owdetr_t2_ft" \
   --epochs 121 \
   --lr_drop 50 \
-  --pretrain "${BASE_EXP_DIR}/t2/train/checkpoints/checkpoint_latest.pth"
+  --resume "${BASE_EXP_DIR}/t2/train/checkpoints/checkpoint_latest.pth"
 
 sleep 5
 
@@ -98,7 +98,7 @@ run_stage "${BASE_EXP_DIR}/t3" \
   --exemplar_replay_max_length 2345 \
   --exemplar_replay_prev_file learned_owdetr_t2_ft.txt \
   --exemplar_replay_cur_file learned_owdetr_t3_ft.txt \
-  --pretrain "${BASE_EXP_DIR}/t2_ft/train/checkpoints/checkpoint_latest.pth" \
+  --resume "${BASE_EXP_DIR}/t2_ft/train/checkpoints/checkpoint_latest.pth" \
   --lr 2e-5
 
 sleep 5
@@ -108,7 +108,7 @@ run_stage "${BASE_EXP_DIR}/t3_ft" \
   --train_set "${REPLAY_DIR}/learned_owdetr_t3_ft" \
   --epochs 201 \
   --lr_drop 50 \
-  --pretrain "${BASE_EXP_DIR}/t3/train/checkpoints/checkpoint_latest.pth"
+  --resume "${BASE_EXP_DIR}/t3/train/checkpoints/checkpoint_latest.pth"
 
 sleep 5
 
@@ -126,7 +126,7 @@ run_stage "${BASE_EXP_DIR}/t4" \
   --exemplar_replay_prev_file learned_owdetr_t3_ft.txt \
   --exemplar_replay_cur_file learned_owdetr_t4_ft.txt \
   --num_inst_per_class 40 \
-  --pretrain "${BASE_EXP_DIR}/t3_ft/train/checkpoints/checkpoint_latest.pth" \
+  --resume "${BASE_EXP_DIR}/t3_ft/train/checkpoints/checkpoint_latest.pth" \
   --lr 2e-5
 
 sleep 5
@@ -136,6 +136,6 @@ run_stage "${BASE_EXP_DIR}/t4_ft" \
   --train_set "${REPLAY_DIR}/learned_owdetr_t4_ft" \
   --epochs 301 \
   --lr_drop 50 \
-  --pretrain "${BASE_EXP_DIR}/t4/train/checkpoints/checkpoint_latest.pth"
+  --resume "${BASE_EXP_DIR}/t4/train/checkpoints/checkpoint_latest.pth"
 
 sleep 5
