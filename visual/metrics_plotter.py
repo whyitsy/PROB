@@ -1,3 +1,4 @@
+
 import json
 from pathlib import Path
 
@@ -7,7 +8,6 @@ from util.visual.evaluation import (
     plot_open_world_percentage_metrics,
 )
 from util.visual.training import (
-    append_json_record,
     plot_pseudo_mining_counts,
     plot_pseudo_mining_efficiency,
     plot_step_auxiliary_loss_trends,
@@ -49,27 +49,21 @@ class ExperimentMetricsPlotter:
         output_dir: Path,
         train_epoch_metrics_file='train/metrics_epoch.jsonl',
         eval_epoch_metrics_file='eval/metrics_epoch.jsonl',
-        train_step_metrics_file='train/metrics_step.jsonl',
     ):
         self.output_dir = Path(output_dir)
         self.train_epoch_metrics_path = self.output_dir / train_epoch_metrics_file
         self.eval_epoch_metrics_path = self.output_dir / eval_epoch_metrics_file
-        self.train_step_metrics_path = self.output_dir / train_step_metrics_file
         self.train_plots_dir = self.output_dir / 'train' / 'plots'
         self.eval_plots_dir = self.output_dir / 'eval' / 'plots'
         self.train_plots_dir.mkdir(parents=True, exist_ok=True)
         self.eval_plots_dir.mkdir(parents=True, exist_ok=True)
         self.train_epoch_rows = JsonlSeriesReader(self.train_epoch_metrics_path).rows()
         self.eval_epoch_rows = JsonlSeriesReader(self.eval_epoch_metrics_path).rows()
-        self.train_step_rows = JsonlSeriesReader(self.train_step_metrics_path).rows()
 
     def refresh_all(self):
         self.refresh_eval_plots()
         self.refresh_epoch_training_plots()
         self.refresh_epoch_pseudo_plots()
-        self.refresh_step_training_plots()
-        self.refresh_step_pseudo_plots()
-        self.refresh_step_auxiliary_plots()
 
     def refresh_eval_plots(self):
         if not self.eval_epoch_rows:
@@ -116,11 +110,9 @@ def refresh_metric_plots(
     output_dir: Path,
     train_epoch_metrics_file='train/metrics_epoch.jsonl',
     eval_epoch_metrics_file='eval/metrics_epoch.jsonl',
-    train_step_metrics_file='train/metrics_step.jsonl',
 ):
     ExperimentMetricsPlotter(
         Path(output_dir),
         train_epoch_metrics_file=train_epoch_metrics_file,
         eval_epoch_metrics_file=eval_epoch_metrics_file,
-        train_step_metrics_file=train_step_metrics_file,
     ).refresh_all()
