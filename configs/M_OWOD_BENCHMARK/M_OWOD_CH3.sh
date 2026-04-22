@@ -13,7 +13,6 @@ COMMON_ARGS=(
   --model_type uod
   --with_box_refine
   --exemplar_replay_dir "UOD_CH3"
-  --viz
 )
 
 CH3_ARGS=(

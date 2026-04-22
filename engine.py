@@ -9,36 +9,6 @@ import torch
 import util.misc as utils
 from datasets.data_prefetcher import data_prefetcher
 from datasets.open_world_eval import OWEvaluator
-from visual.engine_hooks import (
-    collect_eval_visuals,
-    finalize_eval_visuals,
-    init_eval_visual_state,
-    log_train_step_artifacts,
-)
-
-
-def _rescale_postprocessed_results(results, from_sizes, to_sizes):
-    if results is None:
-        return None
-    scaled_results = []
-    for result, from_size, to_size in zip(results, from_sizes, to_sizes):
-        scaled_result = {
-            'scores': result['scores'],
-            'labels': result['labels'],
-            'boxes': result['boxes'].clone(),
-        }
-        from_h, from_w = [float(v) for v in from_size.tolist()]
-        to_h, to_w = [float(v) for v in to_size.tolist()]
-        scale = scaled_result['boxes'].new_tensor([
-            to_w / max(from_w, 1e-6),
-            to_h / max(from_h, 1e-6),
-            to_w / max(from_w, 1e-6),
-            to_h / max(from_h, 1e-6),
-        ])
-        scaled_result['boxes'] = scaled_result['boxes'] * scale.unsqueeze(0)
-        scaled_results.append(scaled_result)
-    return scaled_results
-
 
 @torch.inference_mode()
 def get_exemplar_replay(model, exemplar_selection, device, data_loader):
@@ -151,22 +121,14 @@ def train_one_epoch(
         optimizer.step()
 
         global_step = epoch * len(data_loader) + local_step
-        log_train_step_artifacts(
-            viz_ctx=viz_ctx,
-            global_step=global_step,
-            epoch=epoch,
-            local_step=local_step,
-            optimizer=optimizer,
-            grad_total_norm=grad_total_norm,
-            outputs=outputs,
-            targets=targets,
-            criterion=criterion,
-            total_loss=total_loss_value,
-            reduced_loss_dict=reduced_raw_loss_dict,
-            reduced_weighted_loss_dict=reduced_weighted_loss_dict,
-            reduced_model_stat_dict=reduced_model_stat_dict,
-            args=args,
-        )
+        if viz_ctx is not None and getattr(viz_ctx, 'tb_writer', None) is not None:
+            viz_ctx.tb_writer.add_scalar('train/loss/total', total_loss_value, global_step)
+            viz_ctx.tb_writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], global_step)
+            viz_ctx.tb_writer.add_scalar('train/grad_norm', grad_total_norm, global_step)
+            for key, value in reduced_raw_loss_dict.items():
+                viz_ctx.tb_writer.add_scalar(f'train/loss_raw/{key}', value, global_step)
+            for key, value in reduced_weighted_loss_dict.items():
+                viz_ctx.tb_writer.add_scalar(f'train/loss_weighted/{key}', value, global_step)
 
         metric_logger.update(loss=total_loss_value)
         metric_logger.update(**{f'weighted_{key}': value for key, value in reduced_weighted_loss_dict.items()})
@@ -209,33 +171,15 @@ def evaluate(
     iou_types = ('bbox',)
     evaluator = OWEvaluator(base_dataset, iou_types, args=args)
 
-    visual_state = init_eval_visual_state(viz_ctx)
-
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
         targets = [{key: value.to(device) for key, value in target.items()} for target in targets]
-        outputs = model(samples, return_vis_debug=(visual_state is not None))
+        outputs = model(samples)
 
         original_sizes = torch.stack([target['orig_size'] for target in targets], dim=0)
-        visual_sizes = torch.stack([target['size'] for target in targets], dim=0)
-
         results = postprocessors['bbox'](outputs, original_sizes)
-        visual_results = _rescale_postprocessed_results(results, original_sizes, visual_sizes) if visual_state is not None else None
-
         result_by_image_id = {target['image_id'].item(): output for target, output in zip(targets, results)}
         evaluator.update(result_by_image_id)
-
-        collect_eval_visuals(
-            viz_ctx=viz_ctx,
-            visual_state=visual_state,
-            samples=samples,
-            targets=targets,
-            visual_results=visual_results,
-            outputs=outputs,
-            criterion=criterion,
-            args=args,
-            epoch=epoch,
-        )
 
     metric_logger.synchronize_between_processes()
     evaluator.synchronize_between_processes()
@@ -244,9 +188,6 @@ def evaluate(
 
     stats = {key: meter.global_avg for key, meter in metric_logger.meters.items()}
     stats['open_world_metrics'] = dict(open_world_metrics) if isinstance(open_world_metrics, dict) else {}
-
-    for key, value in finalize_eval_visuals(viz_ctx=viz_ctx, visual_state=visual_state, epoch=epoch).items():
-        stats['open_world_metrics'][key] = value
 
     if 'bbox' in postprocessors:
         stats['coco_eval_bbox'] = evaluator.coco_eval['bbox'].stats.tolist()

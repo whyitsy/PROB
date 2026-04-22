@@ -299,7 +299,6 @@ class DeformableDETRUOD(nn.Module):
         outputs_classes, outputs_coords = [], []
         outputs_objectness, outputs_known = [], []
         outputs_obj_feats, outputs_known_feats, outputs_cls_feats = [], [], []
-        gate_means = []
 
         for lvl in range(hs.shape[0]):
             reference = init_reference if lvl == 0 else inter_references[lvl - 1]
@@ -311,7 +310,6 @@ class DeformableDETRUOD(nn.Module):
                 g_q = torch.sigmoid(self.gate_mlp[lvl](torch.cat([q, c_q], dim=-1)))
                 layer_decay = self.odqe_layer_decay[min(lvl, len(self.odqe_layer_decay) - 1)].to(q.dtype)
                 q_tilde = q + layer_decay * g_q * c_q
-                gate_means.append((layer_decay * g_q).mean())
                 obj_feat = self.ffn_obj[lvl](q_tilde)
                 known_feat = self.ffn_known[lvl](q_tilde)
                 cls_feat = self.ffn_cls[lvl](q_tilde)
@@ -344,8 +342,6 @@ class DeformableDETRUOD(nn.Module):
         outputs_coord = torch.stack(outputs_coords)
         outputs_objectness = torch.stack(outputs_objectness)
         outputs_known = torch.stack(outputs_known)
-        gate_mean_per_layer = torch.stack(gate_means) if gate_means else None
-
         pred_unk_compat = _unknown_logit_from_known_energy(outputs_known[-1], self.energy_temperature)
         out = {
             'pred_logits': outputs_class[-1],
@@ -358,20 +354,7 @@ class DeformableDETRUOD(nn.Module):
             'proj_unk': outputs_known_feats[-1],
             'proj_cls': outputs_cls_feats[-1],
         }
-        if gate_mean_per_layer is not None:
-            out['gate_mean_per_layer'] = gate_mean_per_layer
-            out['gate_mean'] = gate_mean_per_layer.mean()
-        if return_vis_debug:
-            cls_prob_layers = outputs_class.detach().sigmoid()
-            if cls_prob_layers.shape[-1] > 0:
-                cls_prob_layers[..., -1] = 0.0
-            out['vis_debug'] = {
-                'layer_obj_prob': _energy_to_prob(outputs_objectness.detach(), self.obj_temperature),
-                'layer_knownness_prob': _energy_to_prob(outputs_known.detach(), self.known_temperature),
-                'layer_unknown_prob': (1.0 - _energy_to_prob(outputs_known.detach(), self.known_temperature)).clamp(min=0.0, max=1.0),
-                'layer_cls_max': cls_prob_layers[..., :-1].max(dim=-1).values if cls_prob_layers.shape[-1] > 1 else cls_prob_layers.squeeze(-1),
-                'gate_mean_per_layer': gate_mean_per_layer.detach() if gate_mean_per_layer is not None else None,
-            }
+        del return_vis_debug
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(
                 outputs_class, outputs_coord, outputs_objectness, outputs_known,
@@ -1147,21 +1130,6 @@ class SetCriterion(nn.Module):
                 mine_stats['cls_attn_mean'] = 1.0
                 mine_stats['num_cls_soft'] = 0.0
 
-        device = outputs['pred_logits'].device
-        gate_mean = outputs.get('gate_mean', None)
-        losses.update({
-            'stat_num_dummy_pos': torch.tensor(float(mine_stats.get('num_dummy_pos', 0.0)), device=device),
-            'stat_num_dummy_neg': torch.tensor(float(mine_stats.get('num_dummy_neg', 0.0)), device=device),
-            'stat_num_ignore_queries': torch.tensor(float(mine_stats.get('num_ignore_queries', 0.0)), device=device),
-            'stat_num_valid_unmatched': torch.tensor(float(mine_stats.get('num_valid_unmatched', 0.0)), device=device),
-            'stat_num_pos_candidates': torch.tensor(float(mine_stats.get('num_pos_candidates', 0.0)), device=device),
-            'stat_num_neg_candidates': torch.tensor(float(mine_stats.get('num_neg_candidates', 0.0)), device=device),
-            'stat_num_batch_selected_pos': torch.tensor(float(mine_stats.get('num_batch_selected_pos', 0.0)), device=device),
-            'stat_pos_thresh_mean': torch.tensor(float(mine_stats.get('pos_thresh_sum', 0.0)) / max(float(mine_stats.get('num_thresh', 0.0)), 1.0), device=device),
-            'stat_cls_attn_mean': torch.tensor(float(mine_stats.get('cls_attn_mean', 1.0)), device=device),
-            'stat_num_cls_soft': torch.tensor(float(mine_stats.get('num_cls_soft', 0.0)), device=device),
-            'gate_mean': gate_mean if gate_mean is not None else torch.tensor(0.0, device=device),
-        })
         return losses
 
 
