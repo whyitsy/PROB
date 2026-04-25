@@ -28,9 +28,9 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from util import box_ops
 
 
-KNOWN_COLOR = '#2ecc71'
-UNKNOWN_COLOR = '#e74c3c'
-BACKGROUND_COLOR = '#b0b0b0'
+KNOWN_COLOR = '#00b050'
+UNKNOWN_COLOR = '#ff1744'
+BACKGROUND_COLOR = '#616161'
 ERROR_COLOR = '#f1c40f'
 STAGE_COLOR = '#ff5a36'
 QUERY_COLOR = '#00d5ff'
@@ -440,9 +440,9 @@ def render_histograms(args) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     for ax, (key, title) in zip(axes, metrics):
         values = stats[key]
-        ax.hist(values[group == 0], bins=args.bins, density=True, alpha=0.75, label='Known', color=KNOWN_COLOR)
-        ax.hist(values[group == 1], bins=args.bins, density=True, alpha=0.75, label='Unknown', color=UNKNOWN_COLOR)
-        ax.hist(values[group == 2], bins=args.bins, density=True, alpha=0.75, label='Background', color=BACKGROUND_COLOR)
+        ax.hist(values[group == 0], bins=args.bins, density=True, alpha=0.9, label='Known', color=KNOWN_COLOR)
+        ax.hist(values[group == 1], bins=args.bins, density=True, alpha=0.9, label='Unknown', color=UNKNOWN_COLOR)
+        ax.hist(values[group == 2], bins=args.bins, density=True, alpha=0.9, label='Background', color=BACKGROUND_COLOR)
         ax.set_title(title)
         ax.set_xlabel(key)
         ax.set_ylabel('Density')
@@ -759,7 +759,7 @@ def render_manifold(args) -> None:
     ax = fig.add_subplot(111, projection='3d')
     for group_id in [0, 1, 2]:
         mask = groups == group_id
-        ax.scatter(points[mask, 0], points[mask, 1], points[mask, 2], s=8, alpha=0.35, color=colors[group_id], label=labels[group_id])
+        ax.scatter(points[mask, 0], points[mask, 1], points[mask, 2], s=8, color=colors[group_id], label=labels[group_id])
     ax.set_xlabel('obj_prob')
     ax.set_ylabel('unknown_prob')
     ax.set_zlabel('cls_max')
@@ -776,12 +776,12 @@ def render_manifold(args) -> None:
         _mu, _cov, ellipsoid = _mahalanobis_ellipsoid(known_points, quantile=float(args.ellipsoid_quantile))
         fig = plt.figure(figsize=(10, 8))
         ax = fig.add_subplot(111, projection='3d')
-        ax.plot_wireframe(ellipsoid[:, :, 0], ellipsoid[:, :, 1], ellipsoid[:, :, 2], color=KNOWN_COLOR, linewidth=0.7, alpha=0.45)
+        ax.plot_wireframe(ellipsoid[:, :, 0], ellipsoid[:, :, 1], ellipsoid[:, :, 2], color=KNOWN_COLOR, linewidth=0.7)
         ax.scatter(known_points[:, 0], known_points[:, 1], known_points[:, 2], s=6, alpha=0.25, color=KNOWN_COLOR, label='Known')
         if len(unknown_points) > 0:
-            ax.scatter(unknown_points[:, 0], unknown_points[:, 1], unknown_points[:, 2], s=8, alpha=0.45, color=UNKNOWN_COLOR, label='Unknown')
+            ax.scatter(unknown_points[:, 0], unknown_points[:, 1], unknown_points[:, 2], s=8, color=UNKNOWN_COLOR, label='Unknown')
         if len(background_points) > 0:
-            ax.scatter(background_points[:, 0], background_points[:, 1], background_points[:, 2], s=6, alpha=0.2, color=BACKGROUND_COLOR, label='Background')
+            ax.scatter(background_points[:, 0], background_points[:, 1], background_points[:, 2], s=6, color=BACKGROUND_COLOR, label='Background')
         ax.set_xlabel('obj_prob')
         ax.set_ylabel('unknown_prob')
         ax.set_zlabel('cls_max')

@@ -390,7 +390,7 @@ def main(args):
             checkpoint = (
                 torch.hub.load_state_dict_from_url(args.eval_checkpoint, map_location='cpu', check_hash=True)
                 if isinstance(args.eval_checkpoint, str) and args.eval_checkpoint.startswith('https')
-                else torch.load(args.eval_checkpoint, map_location='cpu')
+                else torch.load(args.eval_checkpoint, map_location='cpu', weights_only=False)
             )
             missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
             unexpected_keys = [key for key in unexpected_keys if not (key.endswith('total_params') or key.endswith('total_ops'))]
