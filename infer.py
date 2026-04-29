@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from datasets.coco import make_coco_transforms
 from datasets.torchvision_datasets.open_world import VOC_COCO_CLASS_NAMES
-from main_open_world import get_args_parser
+from main_open_world import build_datasets, get_args_parser
 from models import build_model
 from util import box_ops
 from util.log import setup_logging
@@ -30,6 +30,45 @@ def _collect_input_images(input_path):
     if input_path.is_file():
         return [input_path]
     return [path for path in sorted(input_path.rglob('*')) if path.suffix.lower() in IMAGE_EXTENSIONS]
+
+
+def _collect_testset_images(model_args, every_n, start_index=0, max_images=0):
+    _, eval_dataset = build_datasets(model_args)
+    stride = max(1, int(every_n))
+    start_index = max(0, int(start_index))
+    selected_indices = list(range(start_index, len(eval_dataset), stride))
+    if int(max_images) > 0:
+        selected_indices = selected_indices[: int(max_images)]
+    items = []
+    for dataset_index in selected_indices:
+        items.append(
+            {
+                'image_path': Path(eval_dataset.images[dataset_index]),
+                'dataset_index': int(dataset_index),
+                'image_id': int(eval_dataset.imgids[dataset_index]),
+                'source_mode': 'test_set',
+            }
+        )
+    return items
+
+
+def _resolve_inference_items(args, model_args):
+    if args.use_test_set:
+        return _collect_testset_images(
+            model_args,
+            every_n=args.every_n,
+            start_index=args.start_index,
+            max_images=args.max_images,
+        )
+    return [
+        {
+            'image_path': path,
+            'dataset_index': None,
+            'image_id': None,
+            'source_mode': 'input',
+        }
+        for path in _collect_input_images(args.input)
+    ]
 
 
 def _prepare_image(image_path):
@@ -217,6 +256,8 @@ def _build_payload(
     image_path,
     image_size,
     args,
+    model_args,
+    source_item,
     unknown_label,
     raw_count,
     known_predictions,
@@ -229,9 +270,25 @@ def _build_payload(
         'num_unknown_predictions': int(len(unknown_predictions)),
         'num_all_predictions_class_agnostic': int(len(all_predictions_class_agnostic)),
     }
+    source_info = {
+        'mode': source_item['source_mode'],
+        'dataset_index': source_item['dataset_index'],
+        'image_id': source_item['image_id'],
+    }
+    if args.use_test_set:
+        source_info.update(
+            {
+                'dataset': model_args.dataset,
+                'test_set': model_args.test_set,
+                'every_n': int(args.every_n),
+                'start_index': int(args.start_index),
+                'max_images': int(args.max_images),
+            }
+        )
     return {
         'image': str(image_path),
         'image_size': {'width': int(image_size[0]), 'height': int(image_size[1])},
+        'source': source_info,
         'unknown_label': int(unknown_label),
         'inference_filter': {
             'known_score_threshold': float(args.known_score_threshold),
@@ -246,6 +303,13 @@ def _build_payload(
         'unknown_predictions': unknown_predictions,
         'all_predictions_class_agnostic': all_predictions_class_agnostic,
     }
+
+
+def _build_output_stem(source_item):
+    image_path = Path(source_item['image_path'])
+    if source_item['dataset_index'] is not None and source_item['image_id'] is not None:
+        return f"{int(source_item['dataset_index']):06d}_{int(source_item['image_id'])}_{image_path.stem}"
+    return image_path.stem
 
 
 def run_inference(args):
@@ -266,13 +330,23 @@ def run_inference(args):
     model.to(torch.device(args.device))
     model.eval()
 
-    image_paths = _collect_input_images(args.input)
-    logging.info('Found %s image(s) for inference', len(image_paths))
+    inference_items = _resolve_inference_items(args, model_args)
+    logging.info('Found %s image(s) for inference', len(inference_items))
+    if args.use_test_set:
+        logging.info(
+            'Using test-set sampling: dataset=%s test_set=%s every_n=%s start_index=%s max_images=%s',
+            model_args.dataset,
+            model_args.test_set,
+            args.every_n,
+            args.start_index,
+            args.max_images,
+        )
 
     class_names = list(VOC_COCO_CLASS_NAMES[model_args.dataset])
     unknown_label = int(model_args.num_classes - 1)
     with torch.no_grad():
-        for image_path in image_paths:
+        for source_item in inference_items:
+            image_path = Path(source_item['image_path'])
             original_image, image_tensor, target = _prepare_image(image_path)
             image_tensor = image_tensor.to(torch.device(args.device))
 
@@ -297,28 +371,31 @@ def run_inference(args):
                 image_path=image_path,
                 image_size=original_image.size,
                 args=args,
+                model_args=model_args,
+                source_item=source_item,
                 unknown_label=unknown_label,
                 raw_count=len(raw_detections),
                 known_predictions=known_only_detections,
                 unknown_predictions=unknown_only_detections,
                 all_predictions_class_agnostic=all_class_agnostic_detections,
             )
-            (json_dir / f'{image_path.stem}.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+            output_stem = _build_output_stem(source_item)
+            (json_dir / f'{output_stem}.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
             rendered_mixed = _draw_detections(original_image, all_class_agnostic_detections)
-            rendered_mixed.save(image_dir / f'{image_path.stem}.png')
+            rendered_mixed.save(image_dir / f'{output_stem}.png')
 
             rendered_known_only = _draw_detections(original_image, known_only_detections)
-            rendered_known_only.save(image_dir / f'{image_path.stem}_known.png')
+            rendered_known_only.save(image_dir / f'{output_stem}_known.png')
 
             rendered_unknown_only = _draw_detections(original_image, unknown_only_detections)
-            rendered_unknown_only.save(image_dir / f'{image_path.stem}_unknown.png')
+            rendered_unknown_only.save(image_dir / f'{output_stem}_unknown.png')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Standalone inference for PROB / UOD checkpoints')
     parser.add_argument('--checkpoint', required=True, type=str)
-    parser.add_argument('--input', required=True, type=str, help='single image path or directory of images')
+    parser.add_argument('--input', default=None, type=str, help='single image path or directory of images')
     parser.add_argument('--output_dir', required=True, type=str)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--model_type', default='uod', type=str)
@@ -329,4 +406,14 @@ if __name__ == '__main__':
     parser.add_argument('--min_box_side_ratio', default=0.03, type=float)
     parser.add_argument('--max_box_aspect_ratio', default=5.0, type=float)
     parser.add_argument('--unknown_score_scale', default=1.0, type=float)
-    run_inference(parser.parse_args())
+    parser.add_argument('--use_test_set', action='store_true', help='run inference on the configured test split instead of --input')
+    parser.add_argument('--data_root', default=None, type=str, help='optional override for checkpoint data_root when using --use_test_set')
+    parser.add_argument('--dataset', default=None, type=str, help='optional override for checkpoint dataset when using --use_test_set')
+    parser.add_argument('--test_set', default=None, type=str, help='optional override for checkpoint test_set when using --use_test_set')
+    parser.add_argument('--every_n', default=1, type=int, help='when using --use_test_set, run inference on every N-th test image')
+    parser.add_argument('--start_index', default=0, type=int, help='starting test-set index used together with --use_test_set')
+    parser.add_argument('--max_images', default=0, type=int, help='optional cap on the number of sampled test-set images; 0 means no cap')
+    parsed_args = parser.parse_args()
+    if not parsed_args.use_test_set and not parsed_args.input:
+        parser.error('--input is required unless --use_test_set is enabled')
+    run_inference(parsed_args)
