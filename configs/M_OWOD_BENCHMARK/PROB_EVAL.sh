@@ -3,16 +3,14 @@
 set -euo pipefail
 set -x
 
-BASE_EXP_DIR="/mnt/data/kky/output/PROB/exps/MOWODB/PROB"
+BASE_EXP_DIR="/mnt/data/kky/output/PROB/exps/OUTPUTS/PROB_EVAL/MOWODB"
 
-REPLAY_DIR="prob"
 
 COMMON_ARGS=(
   --model_type prob
-  --with_box_refine
-  --exemplar_replay_dir "${REPLAY_DIR}"
   --viz
   --eval
+  --eval_batch_size 20
 )
 
 run_stage() {
@@ -30,25 +28,16 @@ run_stage() {
 # ----------------
 run_stage "${BASE_EXP_DIR}/t1" \
   --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 20 \
-  --train_set owod_t1_train \
+  --eval_checkpoint "/mnt/data/kky/output/PROB/exps/PROB/MOWODB/t1.pth" 
 
 run_stage "${BASE_EXP_DIR}/t2_ft" \
   --PREV_INTRODUCED_CLS 20 --CUR_INTRODUCED_CLS 20 \
-  --train_set "${REPLAY_DIR}/learned_owod_t2_ft" \
-  --epochs 111 \
-  --lr_drop 40 \
-  --resume "${BASE_EXP_DIR}/t2/train/checkpoints/checkpoint_latest.pth"
+  --eval_checkpoint "/mnt/data/kky/output/PROB/exps/PROB/MOWODB/t2.pth"
 
 run_stage "${BASE_EXP_DIR}/t3_ft" \
   --PREV_INTRODUCED_CLS 40 --CUR_INTRODUCED_CLS 20 \
-  --train_set "${REPLAY_DIR}/learned_owod_t3_ft" \
-  --epochs 181 \
-  --lr_drop 35 \
-  --resume "${BASE_EXP_DIR}/t3/train/checkpoints/checkpoint_latest.pth"
+  --eval_checkpoint "/mnt/data/kky/output/PROB/exps/PROB/MOWODB/t3.pth"
 
 run_stage "${BASE_EXP_DIR}/t4_ft" \
   --PREV_INTRODUCED_CLS 60 --CUR_INTRODUCED_CLS 20 \
-  --train_set "${REPLAY_DIR}/learned_owod_t4_ft" \
-  --epochs 261 \
-  --lr_drop 50 \
-  --resume "${BASE_EXP_DIR}/t4/train/checkpoints/checkpoint_latest.pth"
+  --eval_checkpoint "/mnt/data/kky/output/PROB/exps/PROB/MOWODB/t4.pth"

@@ -2,9 +2,9 @@
 set -euo pipefail
 set -x
 
-BASE_EXP_DIR="${1:-/mnt/data/kky/output/PROB/exps/SOWODB/UOD_CH4_FULL}"
+BASE_EXP_DIR="${1:-/mnt/data/kky/output/PROB/exps/SOWODB/UOD_CH4_RERUN_0425}"
 
-REPLAY_DIR="UOD_CH4"
+REPLAY_DIR="UOD_CH4_RERUN_0425"
 
 COMMON_ARGS=(
   --dataset OWDETR
@@ -22,6 +22,7 @@ CH4_ARGS=(
   --uod_enable_cls_soft_attn
   --uod_enable_odqe
   --uod_enable_decorr
+  --uod_decorr_loss_coef 1
   --uod_pseudo_bbox_loss_coef 3
   --uod_pseudo_giou_loss_coef 1
   --uod_pseudo_obj_loss_coef 1.5

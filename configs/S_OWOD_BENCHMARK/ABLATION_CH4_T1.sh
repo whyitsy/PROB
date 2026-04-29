@@ -43,7 +43,8 @@ run_stage "${BASE_EXP_DIR}/C4_1_ODQE" \
   --PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19 \
   --train_set owdetr_t1_train \
   --lr_drop 31 \
-  --uod_enable_odqe 
+  --uod_enable_odqe \
+  --resume '/mnt/data/kky/output/PROB/exps/SOWODB/UOD_ABL_T1_CH4/C4_1_ODQE/train/checkpoints/checkpoint_latest.pth' 
 
 sleep 5
 

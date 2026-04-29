@@ -35,32 +35,33 @@ run_stage() {
     "$@"
 }
 
-run_stage "${BASE_EXP_DIR}/C3_1_UnknownOnly" \
-  --uod_enable_unknown
+# run_stage "${BASE_EXP_DIR}/C3_1_UnknownOnly" \
+#   --uod_enable_unknown
 
-sleep 5
+# sleep 5
 
-run_stage "${BASE_EXP_DIR}/C3_2_UnknownStaticPseudo" \
-  --uod_enable_unknown \
-  --uod_enable_pseudo
+# run_stage "${BASE_EXP_DIR}/C3_2_UnknownStaticPseudo" \
+#   --uod_enable_unknown \
+#   --uod_enable_pseudo
 
-sleep 5
+# sleep 5
 
 run_stage "${BASE_EXP_DIR}/C3_3_BatchDynamic" \
   --uod_enable_unknown \
   --uod_enable_pseudo \
-  --uod_enable_batch_dynamic
+  --uod_enable_batch_dynamic \
+  --resume "/mnt/data/kky/output/PROB/exps/MOWODB/UOD_ABL_T1_CH3/C3_3_BatchDynamic/train/checkpoints/checkpoint_latest.pth"
 
 sleep 5
 
-run_stage "${BASE_EXP_DIR}/C3_4_ClsSoftAttn" \
-  --uod_enable_unknown \
-  --uod_enable_pseudo \
-  --uod_enable_batch_dynamic \
-  --uod_enable_cls_soft_attn
+# run_stage "${BASE_EXP_DIR}/C3_4_ClsSoftAttn" \
+#   --uod_enable_unknown \
+#   --uod_enable_pseudo \
+#   --uod_enable_batch_dynamic \
+#   --uod_enable_cls_soft_attn
 
 
-# 最好的指标：59.54、21.41、7031.0、0.0657
+# 最好的指标：59.54、21.41、7031、0.0657
 # torchrun --standalone --nnodes=1 --nproc-per-node=gpu \
 #   main_open_world.py \
 #   --output_dir "${BASE_EXP_DIR}/C3_5_ClsSoftAttn_04_02" \
